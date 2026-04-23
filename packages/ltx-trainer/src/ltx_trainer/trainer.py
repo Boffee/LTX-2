@@ -719,6 +719,7 @@ class LtxvTrainer:
                 model=self._transformer,
                 target_device=self._accelerator.device,
                 blocks_to_swap=blocks_to_swap,
+                layers_attr="transformer_blocks",
             )
 
         if self._block_offloader is not None:

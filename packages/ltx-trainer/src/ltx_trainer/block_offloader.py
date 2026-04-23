@@ -20,7 +20,7 @@ import functools
 import logging
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, ClassVar
+from typing import Any
 
 import torch
 from torch import nn
@@ -42,6 +42,13 @@ def _resolve_attr(module: nn.Module, dotted_path: str) -> nn.ModuleList:
         obj = getattr(obj, part)
     if not isinstance(obj, nn.ModuleList):
         raise TypeError(f"Expected nn.ModuleList at '{dotted_path}', got {type(obj).__name__}")
+    return obj
+
+
+def _resolve_dotted(module: nn.Module, dotted_path: str) -> nn.Module:
+    obj: Any = module
+    for part in dotted_path.split("."):
+        obj = getattr(obj, part)
     return obj
 
 
@@ -277,7 +284,7 @@ class _BlockPinnedStore:
 
     def __init__(
         self,
-        layers: nn.ModuleList,
+        layers: list[nn.Module] | nn.ModuleList,
         num_gpu_slots: int = 0,
         device: torch.device | None = None,
     ) -> None:
@@ -323,7 +330,31 @@ class _BlockPinnedStore:
         self._pool: _GpuPool | None = None
         self._block_to_slot: dict[int, int] = {}
         if num_gpu_slots > 0 and device is not None and len(self._param_bufs) > 0:
-            self._pool = _GpuPool(self._param_bufs[0], self._module_bufs[0], num_gpu_slots, device)
+            if self._blocks_are_homogeneous():
+                self._pool = _GpuPool(self._param_bufs[0], self._module_bufs[0], num_gpu_slots, device)
+            else:
+                logger.info("Blocks have heterogeneous structure; using per-load GPU allocation")
+
+    def _blocks_are_homogeneous(self) -> bool:
+        if len(self._param_bufs) <= 1:
+            return True
+        ref_params = [(b.name, b.pinned_data.shape, b.pinned_data.dtype, b.is_quanto,
+                        b.pinned_scale.shape if b.pinned_scale is not None else None)
+                       for b in self._param_bufs[0]]
+        ref_bufs = [(k, v.shape) for k, v in self._module_bufs[0].items()]
+        for i in range(1, len(self._param_bufs)):
+            block_bufs = self._param_bufs[i]
+            if len(block_bufs) != len(ref_params):
+                return False
+            for (rn, rs, rd, rq, rss), b in zip(ref_params, block_bufs, strict=True):
+                if b.name != rn or b.pinned_data.shape != rs or b.pinned_data.dtype != rd or b.is_quanto != rq:
+                    return False
+                if rss is not None and (b.pinned_scale is None or b.pinned_scale.shape != rss):
+                    return False
+            mod_bufs = [(k, v.shape) for k, v in self._module_bufs[i].items()]
+            if mod_bufs != ref_bufs:
+                return False
+        return True
 
     # -- load / evict ---------------------------------------------------------
 
@@ -466,37 +497,36 @@ class TrainingBlockOffloader:
     Parameters
     ----------
     model:
-        The model containing the block list (may be PEFT-wrapped).
+        The model containing the block list(s) (may be PEFT-wrapped).
     target_device:
         The GPU device to use for compute.
     blocks_to_swap:
         Number of blocks to keep offloaded on CPU. Must be < total blocks.
     layers_attr:
-        Auto-detected if not provided.
+        Dotted attribute path(s) to ``nn.ModuleList`` block lists in the model.
+        A single string for models with one block list (e.g. ``"transformer_blocks"``),
+        or a list for models with multiple (e.g. ``["transformer_blocks",
+        "single_transformer_blocks"]``). For PEFT-wrapped models, include the
+        prefix (e.g. ``"base_model.model.transformer_blocks"``).
     prefetch_count:
         How many blocks ahead to prefetch on a background thread.
     """
-
-    _LAYERS_ATTR_CANDIDATES: ClassVar[list[str]] = [
-        "base_model.model.transformer_blocks",
-        "transformer_blocks",
-    ]
 
     def __init__(
         self,
         model: nn.Module,
         target_device: torch.device,
         blocks_to_swap: int,
-        layers_attr: str | None = None,
+        layers_attr: str | list[str],
         prefetch_count: int = 3,
     ) -> None:
         self._model = model
-        self._layers_attr = layers_attr or self._detect_layers_attr(model)
         self._target_device = target_device
         self._blocks_to_swap = blocks_to_swap
         self._prefetch_count = prefetch_count
+        self._layers_attrs = [layers_attr] if isinstance(layers_attr, str) else list(layers_attr)
 
-        self._layers: nn.ModuleList | None = None
+        self._layers: list[nn.Module] | None = None
         self._tracker: _BlockTracker | None = None
         self._store: _BlockPinnedStore | None = None
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
@@ -508,16 +538,6 @@ class TrainingBlockOffloader:
 
         self.setup()
 
-    @classmethod
-    def _detect_layers_attr(cls, model: nn.Module) -> str:
-        for path in cls._LAYERS_ATTR_CANDIDATES:
-            try:
-                _resolve_attr(model, path)
-                return path
-            except (AttributeError, TypeError):
-                continue
-        raise ValueError(f"Could not find transformer blocks at any of: {cls._LAYERS_ATTR_CANDIDATES}")
-
     # ------------------------------------------------------------------
     # Setup / teardown
     # ------------------------------------------------------------------
@@ -527,7 +547,7 @@ class TrainingBlockOffloader:
         if self._tracker is not None or self._hooks:
             self.teardown()
 
-        self._layers = _resolve_attr(self._model, self._layers_attr)
+        self._layers, block_leaf_names = self._resolve_all_layers()
         num_layers = len(self._layers)
         if self._blocks_to_swap >= num_layers:
             raise ValueError(f"blocks_to_swap ({self._blocks_to_swap}) must be < num_layers ({num_layers})")
@@ -541,14 +561,15 @@ class TrainingBlockOffloader:
         self._last_idx = -1
 
         # Move non-block modules to GPU
-        layers_attr_parts = self._layers_attr.split(".")
-        parent: Any = self._model
-        for part in layers_attr_parts[:-1]:
-            parent = getattr(parent, part)
-        layers_leaf = layers_attr_parts[-1]
-        for name, child in parent.named_children():
-            if name != layers_leaf:
-                child.to(self._target_device)
+        parent_paths: set[str] = set()
+        for attr_path in self._layers_attrs:
+            parts = attr_path.split(".")
+            parent_paths.add(".".join(parts[:-1]) if len(parts) > 1 else "")
+        for parent_path in parent_paths:
+            parent = _resolve_dotted(self._model, parent_path) if parent_path else self._model
+            for name, child in parent.named_children():
+                if name not in block_leaf_names:
+                    child.to(self._target_device)
 
         # Move all blocks to CPU (LoRA stays on GPU)
         for layer in self._layers:
@@ -571,6 +592,15 @@ class TrainingBlockOffloader:
             f"{num_resident} resident on GPU, prefetch={self._prefetch_count}, "
             f"gpu_pool_slots={num_gpu_slots}"
         )
+
+    def _resolve_all_layers(self) -> tuple[list[nn.Module], set[str]]:
+        flat: list[nn.Module] = []
+        leaf_names: set[str] = set()
+        for attr_path in self._layers_attrs:
+            module_list = _resolve_attr(self._model, attr_path)
+            flat.extend(module_list)
+            leaf_names.add(attr_path.split(".")[-1])
+        return flat, leaf_names
 
     def teardown(self) -> None:
         """Remove hooks, wait for pending work, evict all blocks to CPU."""
