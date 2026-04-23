@@ -137,8 +137,6 @@ class _BlockTracker:
         self._on_gpu.add(idx)
         self._lru.pop(idx, None)
         self._lru[idx] = None
-        if len(self._on_gpu) > self.peak_gpu_blocks:
-            self.peak_gpu_blocks = len(self._on_gpu)
 
     def mark_on_cpu(self, idx: int) -> None:
         self._on_gpu.discard(idx)
@@ -397,6 +395,11 @@ class TrainingBlockOffloader:
             for offset in range(1, self._prefetch_count + 1):
                 self._submit_prefetch(idx + direction * offset, max_on_gpu)
 
+            # Track peak including pending prefetches (which are on GPU but untracked)
+            total = len(self._tracker._on_gpu) + len(self._pending)
+            if total > self._tracker.peak_gpu_blocks:
+                self._tracker.peak_gpu_blocks = total
+
         for layer in self._layers:
             idx = idx_map[id(layer)]
             h = layer.register_forward_pre_hook(functools.partial(_pre_hook, idx=idx))
@@ -408,8 +411,9 @@ class TrainingBlockOffloader:
 
     @property
     def peak_gpu_blocks(self) -> int:
+        """Peak blocks on GPU (tracked + pending prefetches) since last reset."""
         return self._tracker.peak_gpu_blocks if self._tracker is not None else 0
 
     def reset_peak(self) -> None:
         if self._tracker is not None:
-            self._tracker.peak_gpu_blocks = len(self._tracker._on_gpu)
+            self._tracker.peak_gpu_blocks = len(self._tracker._on_gpu) + len(self._pending)
