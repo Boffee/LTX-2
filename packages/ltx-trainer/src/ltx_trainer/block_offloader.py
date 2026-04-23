@@ -109,6 +109,8 @@ class _PackedSlab:
         self.meta: list[tuple[int, int, torch.Size, tuple[int, ...]]] = []
         total = 0
         for t in tensors:
+            if not t.is_contiguous():
+                raise ValueError("_PackedSlab only supports contiguous tensors")
             self.meta.append((total, t.numel(), t.size(), t.stride()))
             total += t.numel()
         self.cpu_flat = torch.empty(total, dtype=tensors[0].dtype, pin_memory=True)
@@ -207,6 +209,8 @@ class _BlockPinnedSlabs:
         flat = torch.empty(total, dtype=tensors[0].dtype, pin_memory=True)
         off = 0
         for t in tensors:
+            if not t.is_contiguous():
+                raise ValueError("_PackedSlab only supports contiguous tensors")
             flat[off : off + t.numel()].copy_(t.reshape(-1))
             off += t.numel()
         return flat
@@ -245,16 +249,18 @@ class _GpuPool:
     def set_compute_event(self, slot_id: int, event: torch.cuda.Event) -> None:
         self._events[slot_id] = event
 
-    def wait_if_needed(self, slot_id: int, _stream: torch.cuda.Stream | None) -> None:
-        """Clear the compute-done event for this slot.
+    def wait_if_needed(self, slot_id: int, stream: torch.cuda.Stream | None) -> None:
+        """Ensure compute is done reading from this slot before it is reused.
 
-        With LRU eviction the victim was last read 20+ blocks ago, so the
-        compute is always finished long before the slot is reused.  Inserting
-        a stream.wait_event here would stall the prefetch stream for ~14ms
-        (the previous block's forward time), severely cutting into DMA lead
-        time without providing any practical safety benefit.
+        Uses ``event.query()`` to skip the GPU-side dependency when the
+        compute event is already signaled (which is almost always the case
+        for LRU victims that were last read 20+ blocks ago).
         """
-        self._events[slot_id] = None
+        ev = self._events[slot_id]
+        if ev is not None:
+            if stream is not None and not ev.query():
+                stream.wait_event(ev)
+            self._events[slot_id] = None
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +503,7 @@ class TrainingBlockOffloader:
         self._executor: ThreadPoolExecutor | None = None
         self._stream: torch.cuda.Stream | None = None
         self._pending: dict[int, Future[None]] = {}
+        self._prefetch_events: dict[int, torch.cuda.Event] = {}
         self._last_idx: int = -1
 
         self.setup()
@@ -530,6 +537,7 @@ class TrainingBlockOffloader:
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._stream = torch.cuda.Stream(device=self._target_device, priority=-1)
         self._pending = {}
+        self._prefetch_events = {i: torch.cuda.Event() for i in range(num_layers)}
         self._last_idx = -1
 
         # Move non-block modules to GPU
@@ -576,6 +584,7 @@ class TrainingBlockOffloader:
             if self._tracker is not None:
                 self._tracker.mark_on_gpu(idx)
         self._pending.clear()
+        self._prefetch_events.clear()
 
         if self._executor is not None:
             self._executor.shutdown(wait=True)
@@ -611,6 +620,7 @@ class TrainingBlockOffloader:
     def _do_prefetch(self, idx: int) -> None:
         with torch.cuda.stream(self._stream):
             self._store.load_block(idx, self._layers[idx], self._target_device, non_blocking=True, stream=self._stream)
+            self._prefetch_events[idx].record(self._stream)
 
     def _submit_prefetch(self, idx: int, max_on_gpu: int) -> None:
         if idx < 0 or idx >= len(self._layers):
@@ -625,18 +635,9 @@ class TrainingBlockOffloader:
         future = self._pending.pop(idx, None)
         if future is not None:
             future.result()
-            # The prefetch thread scheduled DMA via copy_() with ≥3 blocks of
-            # lead time (~42ms). The DMA takes ~9ms, so it completes ~33ms
-            # before the compute stream needs the data. On NVIDIA GPUs
-            # (Kepler+) the L2 cache is coherent across all engines: once the
-            # copy engine writes global memory the data is visible to SMs
-            # without explicit cross-stream synchronisation.
-            #
-            # Skipping wait_event here avoids a GPU pipeline stall that costs
-            # ~1.7ms per call (breaks kernel pipelining across blocks).
-            # Diagnostic confirmed: 48 wait_event calls add ~80ms overhead
-            # per step; removing them gives 97% of no-offload speed with
-            # correct training results.
+            ev = self._prefetch_events[idx]
+            if not ev.query():
+                torch.cuda.current_stream(self._target_device).wait_event(ev)
             self._tracker.mark_on_gpu(idx)
             return
 
