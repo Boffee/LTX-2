@@ -81,15 +81,11 @@ class _PinnedParamBuffer:
             return nn.Parameter(qt, requires_grad=False)
         return nn.Parameter(self.pinned_data.to(device, non_blocking=non_blocking), requires_grad=False)
 
-    def save_from_gpu(self, param: nn.Parameter) -> nn.Parameter:
-        """Copy GPU param back to pinned buffer, return CPU param pointing to pinned storage."""
-        t = param.data
+    def restore_to_pinned(self) -> nn.Parameter:
+        """Return a CPU param pointing to the existing pinned buffer (no copy)."""
         if self.is_quanto:
-            self.pinned_data.copy_(t._data)
-            self.pinned_scale.copy_(t._scale)
             qt = WeightQBytesTensor.create(self.qtype, self.axis, self.size, self.stride, self.pinned_data, self.pinned_scale, self.act_qt)
             return nn.Parameter(qt, requires_grad=False)
-        self.pinned_data.copy_(t)
         return nn.Parameter(self.pinned_data, requires_grad=False)
 
 
@@ -111,11 +107,11 @@ class _BlockPinnedStore:
             new_p = buf.load_to_gpu(device, non_blocking=non_blocking)
             torch.utils.swap_tensors(params[buf.name], new_p)
 
-    def save_block(self, idx: int, layer: nn.Module) -> None:
+    def evict_block(self, idx: int, layer: nn.Module) -> None:
+        """Point params back to pinned CPU buffers, freeing GPU memory (no copy needed)."""
         params = dict(layer.named_parameters())
         for buf in self._buffers[idx]:
-            new_p = buf.save_from_gpu(params[buf.name])
-            torch.utils.swap_tensors(params[buf.name], new_p)
+            torch.utils.swap_tensors(params[buf.name], buf.restore_to_pinned())
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +318,7 @@ class TrainingBlockOffloader:
             torch.cuda.synchronize(device=self._target_device)
             for idx, layer in enumerate(self._layers):
                 if self._tracker.is_on_gpu(idx):
-                    self._store.save_block(idx, layer)
+                    self._store.evict_block(idx, layer)
                     # Also move buffers back to CPU
                     for b in layer.buffers():
                         if b.data.is_cuda:
@@ -339,7 +335,7 @@ class TrainingBlockOffloader:
 
     def _evict_one(self, protected: set[int]) -> None:
         victim = self._tracker.pick_victim(protected=protected)
-        self._store.save_block(victim, self._layers[victim])
+        self._store.evict_block(victim, self._layers[victim])
         for b in self._layers[victim].buffers():
             if b.data.is_cuda:
                 b.data = b.data.to("cpu")
