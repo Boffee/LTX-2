@@ -186,6 +186,12 @@ data:
   # cache_in_memory: true
   # shard_size: 500  # samples per shard (null = cache entire dataset)
 
+  # --- Online encoding mode (alternative to preprocessed_data_root) ---
+  # Encode raw videos + captions per shard at training time. Single-GPU only.
+  # Set `preprocessed_data_root: null` and uncomment:
+  # dataset_metadata_file: "/path/to/dataset.json"  # columns: media_path, caption
+  # resolution_buckets: "448x256x25"                # WxHxF;WxHxF;...
+
 # -----------------------------------------------------------------------------
 # Validation Configuration
 # -----------------------------------------------------------------------------

@@ -187,7 +187,10 @@ class AccelerationConfig(ConfigBaseModel):
 class DataConfig(ConfigBaseModel):
     """Configuration for data loading and processing"""
 
-    preprocessed_data_root: str = Field(
+    # --- Precomputed mode (offline preprocessing with process_dataset.py) ---
+
+    preprocessed_data_root: str | None = Field(
+        default=None,
         description="Path to folder containing preprocessed training data",
     )
 
@@ -212,6 +215,33 @@ class DataConfig(ConfigBaseModel):
         "If None with cache_in_memory=True, the entire dataset is cached.",
         gt=0,
     )
+
+    # --- Online encoding mode (encode per shard at training time) ---
+
+    dataset_metadata_file: str | Path | None = Field(
+        default=None,
+        description="Path to CSV/JSON/JSONL metadata file with video paths (column 'media_path') "
+        "and captions (column 'caption'). Enables online encoding mode — no separate "
+        "preprocessing step needed. Video latents are cached to .latent_cache next to this file.",
+    )
+
+    resolution_buckets: str | None = Field(
+        default=None,
+        description='Resolution buckets for online encoding, format "WxHxF;WxHxF;..." '
+        '(e.g., "768x768x25;512x512x49").',
+    )
+
+    @field_validator("dataset_metadata_file")
+    @classmethod
+    def validate_dataset_metadata_file(cls, v: str | Path | None) -> str | Path | None:
+        if v is None:
+            return None
+        p = Path(v)
+        if not p.is_file():
+            raise ValueError(f"dataset_metadata_file does not exist or is not a file: {v}")
+        if p.suffix.lower() not in (".csv", ".json", ".jsonl"):
+            raise ValueError(f"dataset_metadata_file must be CSV/JSON/JSONL, got {p.suffix}")
+        return v
 
 
 class ValidationConfig(ConfigBaseModel):
@@ -572,14 +602,56 @@ class LtxTrainerConfig(ConfigBaseModel):
                     "Block offloading only works with frozen base weights."
                 )
 
-        # Shard size requires in-memory caching
-        if self.data.shard_size is not None and not self.data.cache_in_memory:
-            raise ValueError("shard_size requires cache_in_memory=True")
+        # Shard size requires in-memory caching (precomputed mode) or online mode
+        if self.data.shard_size is not None and not self.data.cache_in_memory and not self.data.dataset_metadata_file:
+            raise ValueError("shard_size requires cache_in_memory=True or dataset_metadata_file")
 
         # Shard must hold at least one full batch (drop_last=True would yield 0 batches otherwise)
         if self.data.shard_size is not None and self.data.shard_size < self.optimization.batch_size:
             raise ValueError(
                 f"shard_size ({self.data.shard_size}) must be >= batch_size ({self.optimization.batch_size})"
             )
+
+        # Data source: exactly one of preprocessed_data_root or dataset_metadata_file
+        has_precomputed = self.data.preprocessed_data_root is not None
+        has_online = self.data.dataset_metadata_file is not None
+        if not has_precomputed and not has_online:
+            raise ValueError("Either preprocessed_data_root or dataset_metadata_file must be provided")
+        if has_precomputed and has_online:
+            raise ValueError("preprocessed_data_root and dataset_metadata_file are mutually exclusive")
+
+        # Online mode requires resolution_buckets and text_encoder_path
+        if has_online:
+            if not self.data.resolution_buckets:
+                raise ValueError("resolution_buckets is required with dataset_metadata_file")
+            if not self.model.text_encoder_path:
+                raise ValueError("text_encoder_path is required with dataset_metadata_file")
+
+            # Validate bucket string format
+            from ltx_trainer.video_preprocessing import parse_resolution_buckets
+
+            parse_resolution_buckets(self.data.resolution_buckets)
+
+            # Audio training is not yet supported in online mode — OnlineEncodingDataset
+            # does not produce audio_latents, which the training strategy requires.
+            strategy = self.training_strategy
+            if getattr(strategy, "with_audio", False):
+                raise ValueError(
+                    "Audio training (with_audio=True) is not supported in online encoding mode. "
+                    "Use precomputed mode (preprocessed_data_root) for audio training."
+                )
+            if getattr(strategy, "name", None) == "video_to_video":
+                raise ValueError(
+                    "Video-to-video training strategy is not supported in online encoding mode. "
+                    "Use precomputed mode (preprocessed_data_root) for reference-video training."
+                )
+
+            # bitsandbytes 8-bit Gemma uses device_map='auto' and cannot be moved between
+            # CPU and GPU, which online mode requires for per-shard encoding.
+            if self.acceleration.load_text_encoder_in_8bit:
+                raise ValueError(
+                    "load_text_encoder_in_8bit is not compatible with online encoding mode "
+                    "(bitsandbytes quantized models cannot be moved between CPU and GPU)."
+                )
 
         return self

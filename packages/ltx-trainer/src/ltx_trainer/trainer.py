@@ -34,6 +34,7 @@ from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
 from ltx_trainer.datasets import PrecomputedDataset
+from ltx_trainer.online_dataset import OnlineEncodingDataset
 from ltx_trainer.gpu_utils import free_gpu_memory, free_gpu_memory_context, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
@@ -147,6 +148,8 @@ class LtxvTrainer:
         self._init_dataloader()
         if resuming and training_state is not None:
             self._dataset.restore_shard_state(training_state.shard_cycle, training_state.shard_idx)
+        if self._is_online_mode:
+            self._encode_current_shard()
         data_iter = iter(self._dataloader)
         self._init_timestep_sampler()
 
@@ -201,6 +204,8 @@ class LtxvTrainer:
                     batch = next(data_iter)
                 except StopIteration:
                     self._dataset.advance_shard()
+                    if self._is_online_mode:
+                        self._encode_current_shard()
                     data_iter = iter(self._dataloader)
                     batch = next(data_iter)
 
@@ -443,11 +448,18 @@ class LtxvTrainer:
                         )
                     )
 
-        # Unload Gemma model and feature extractor, keep only connectors for training
-        del text_encoder
-        self._embeddings_processor.feature_extractor = None
+        # In online encoding mode, keep TE + feature extractor on CPU for per-shard encoding
+        if self._config.data.dataset_metadata_file is not None:
+            text_encoder.to("cpu")
+            self._embeddings_processor.feature_extractor.to("cpu")
+            self._text_encoder = text_encoder
+            logger.debug("Validation prompt embeddings cached. Text encoder moved to CPU (online encoding mode)")
+        else:
+            del text_encoder
+            self._embeddings_processor.feature_extractor = None
+            self._text_encoder = None
+            logger.debug("Validation prompt embeddings cached. Gemma model unloaded")
 
-        logger.debug("Validation prompt embeddings cached. Gemma model unloaded")
         return cached_embeddings
 
     def _load_models(self) -> None:
@@ -457,9 +469,11 @@ class LtxvTrainer:
         # 2. Validation is configured to generate audio (even if not training audio)
         load_audio = self._training_strategy.requires_audio or self._config.validation.generate_audio
 
-        # Check if we need VAE encoder (for image or reference video conditioning)
+        # Check if we need VAE encoder (for image conditioning, reference videos, or online encoding)
         need_vae_encoder = (
-            self._config.validation.images is not None or self._config.validation.reference_videos is not None
+            self._config.validation.images is not None
+            or self._config.validation.reference_videos is not None
+            or self._config.data.dataset_metadata_file is not None
         )
 
         # Load all model components (except text encoder - already handled)
@@ -616,9 +630,8 @@ class LtxvTrainer:
             and fp.lora_rank != cfg.lora.rank
         ):
             mismatches.append(f"lora_rank: {fp.lora_rank} → {cfg.lora.rank}")
-        current_shard_size = cfg.data.shard_size if cfg.data.cache_in_memory else None
-        if fp.shard_size is not None and fp.shard_size != current_shard_size:
-            mismatches.append(f"shard_size: {fp.shard_size} → {current_shard_size}")
+        if fp.shard_size != cfg.data.shard_size:
+            mismatches.append(f"shard_size: {fp.shard_size} → {cfg.data.shard_size}")
         if mismatches:
             logger.warning(
                 f"⚠️ Training state config mismatch ({', '.join(mismatches)}). "
@@ -766,35 +779,15 @@ class LtxvTrainer:
     def _init_dataloader(self) -> None:
         """Initialize the training data loader using the strategy's data sources."""
         if self._dataset is None:
-            # Get data sources from the training strategy
-            data_sources = self._training_strategy.get_data_sources()
-
-            self._dataset = PrecomputedDataset(
-                self._config.data.preprocessed_data_root,
-                data_sources=data_sources,
-                cache_in_memory=self._config.data.cache_in_memory,
-                shard_size=self._config.data.shard_size,
-                seed=self._config.seed,
-            )
-            total = self._dataset.total_samples
-            shard_info = ""
-            if self._dataset.num_shards > 1:
-                shard_info = f" ({self._dataset.num_shards} shards of ~{self._config.data.shard_size})"
-            logger.debug(f"Loaded dataset with {total:,} samples{shard_info} from sources: {list(data_sources)}")
-
-            if self._dataset.num_shards > 1:
-                min_shard = min(len(g) for g in self._dataset._shard_groups)
-                batches_per_shard = min_shard // self._config.optimization.batch_size
-                if batches_per_shard < self._accelerator.num_processes:
-                    raise ValueError(
-                        f"Smallest shard ({min_shard} samples) yields {batches_per_shard} batches, "
-                        f"but {self._accelerator.num_processes} processes need at least 1 batch each. "
-                        f"Increase shard_size or reduce batch_size."
-                    )
+            if self._config.data.dataset_metadata_file is not None:
+                self._init_online_dataset()
+            else:
+                self._init_precomputed_dataset()
 
         num_workers = self._config.data.num_dataloader_workers
-        if self._config.data.cache_in_memory and num_workers > 0:
-            logger.info("Setting num_dataloader_workers=0 for in-memory caching (data served from RAM)")
+        if self._is_online_mode or (self._config.data.cache_in_memory and num_workers > 0):
+            if num_workers > 0:
+                logger.info("Setting num_dataloader_workers=0 for in-memory caching (data served from RAM)")
             num_workers = 0
 
         dataloader = DataLoader(
@@ -808,6 +801,106 @@ class LtxvTrainer:
         )
 
         self._dataloader = self._accelerator.prepare(dataloader)
+
+    def _init_precomputed_dataset(self) -> None:
+        data_sources = self._training_strategy.get_data_sources()
+        self._dataset = PrecomputedDataset(
+            self._config.data.preprocessed_data_root,
+            data_sources=data_sources,
+            cache_in_memory=self._config.data.cache_in_memory,
+            shard_size=self._config.data.shard_size,
+            seed=self._config.seed,
+        )
+        total = self._dataset.total_samples
+        shard_info = ""
+        if self._dataset.num_shards > 1:
+            shard_info = f" ({self._dataset.num_shards} shards of ~{self._config.data.shard_size})"
+        logger.debug(f"Loaded dataset with {total:,} samples{shard_info} from sources: {list(data_sources)}")
+        self._validate_shard_size()
+
+    def _init_online_dataset(self) -> None:
+        if self._accelerator.num_processes > 1:
+            raise ValueError(
+                "Online encoding mode is only supported on single-GPU training. "
+                "Use precomputed mode (preprocessed_data_root) for multi-GPU."
+            )
+
+        from ltx_trainer.video_preprocessing import parse_resolution_buckets
+
+        buckets = parse_resolution_buckets(self._config.data.resolution_buckets)
+
+        self._dataset = OnlineEncodingDataset(
+            dataset_file=self._config.data.dataset_metadata_file,
+            resolution_buckets=buckets,
+            shard_size=self._config.data.shard_size,
+            seed=self._config.seed,
+        )
+        total = self._dataset.total_samples
+        shard_info = ""
+        if self._dataset.num_shards > 1:
+            shard_info = f" ({self._dataset.num_shards} shards of ~{self._config.data.shard_size})"
+        logger.debug(f"Online encoding dataset with {total:,} samples{shard_info}")
+        self._validate_shard_size()
+        # Initial encoding is driven by train() after optional shard-state restore,
+        # so we don't waste an encode on shard 0 that gets discarded on resume.
+
+    def _validate_shard_size(self) -> None:
+        if self._dataset.num_shards > 1:
+            min_shard = self._dataset.min_shard_size
+            batches_per_shard = min_shard // self._config.optimization.batch_size
+            if batches_per_shard < self._accelerator.num_processes:
+                raise ValueError(
+                    f"Smallest shard ({min_shard} samples) yields {batches_per_shard} batches, "
+                    f"but {self._accelerator.num_processes} processes need at least 1 batch each. "
+                    f"Increase shard_size or reduce batch_size."
+                )
+
+    @property
+    def _is_online_mode(self) -> bool:
+        return isinstance(self._dataset, OnlineEncodingDataset)
+
+    @torch.inference_mode()
+    def _encode_current_shard(self) -> None:
+        """Encode the current shard's videos + captions.
+
+        Moves TE and VAE encoder to GPU for encoding, then back to CPU. The
+        ``try/finally`` ensures models are restored to CPU even if encoding fails,
+        so a transient error does not leave the GPU in an unexpected state.
+        """
+        device = self._accelerator.device
+        te = self._text_encoder
+        vae_enc = self._vae_encoder
+        feat_ext = self._embeddings_processor.feature_extractor
+
+        te.to(device)
+        vae_enc.to(device)
+        feat_ext.to(device)
+        try:
+            self._dataset.encode_shard(
+                vae_encoder=vae_enc,
+                text_encoder=te,
+                embeddings_processor=self._embeddings_processor,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+        finally:
+            te.to("cpu")
+            vae_enc.to("cpu")
+            feat_ext.to("cpu")
+            free_gpu_memory()
+
+        # Ensure enough samples survived encoding to produce at least one batch
+        # per process. With drop_last=True the dataloader silently yields zero
+        # batches otherwise, so we fail loudly here.
+        usable = len(self._dataset)
+        min_required = self._config.optimization.batch_size * self._accelerator.num_processes
+        if usable < min_required:
+            raise RuntimeError(
+                f"Shard has only {usable} usable samples after encoding, but need "
+                f"{min_required} (batch_size={self._config.optimization.batch_size} × "
+                f"num_processes={self._accelerator.num_processes}). Too many samples failed — "
+                f"check warnings above for per-sample errors."
+            )
 
     def _init_lora_weights(self) -> None:
         """Initialize LoRA weights for the transformer."""
@@ -1210,7 +1303,7 @@ class LtxvTrainer:
                 scheduler_type=self._config.optimization.scheduler_type,
                 training_mode=self._config.model.training_mode,
                 lora_rank=self._config.lora.rank if self._config.lora is not None else None,
-                shard_size=self._config.data.shard_size if self._config.data.cache_in_memory else None,
+                shard_size=self._config.data.shard_size,
             ),
             rng_states=RngStates(
                 torch_state=torch.random.get_rng_state(),

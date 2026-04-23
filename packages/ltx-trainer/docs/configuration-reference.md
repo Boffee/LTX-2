@@ -230,7 +230,9 @@ acceleration:
 
 ### DataConfig
 
-Data loading and processing configuration.
+Data loading and processing configuration. Two modes are supported:
+
+**Precomputed mode** — run `process_dataset.py` offline to produce `.pt` files, then point the trainer at them.
 
 ```yaml
 data:
@@ -240,14 +242,27 @@ data:
   shard_size: null                                      # Samples per shard (null = cache all)
 ```
 
+**Online mode** — point the trainer at a metadata file with raw video paths + captions. Encoding happens per shard at training time. Single-GPU only; video latents cached to disk (at `.latent_cache/` next to the metadata file), text embeddings held in memory only.
+
+```yaml
+data:
+  dataset_metadata_file: "/path/to/dataset.json"   # CSV/JSON/JSONL with media_path + caption columns
+  resolution_buckets: "448x256x25;256x448x25"      # WxHxF;WxHxF;...
+  shard_size: 500
+```
+
 **Key parameters:**
 
-| Parameter                | Description                                                                                                          |
-|--------------------------|----------------------------------------------------------------------------------------------------------------------|
-| `preprocessed_data_root` | Path to your preprocessed dataset (contains `latents/`, `conditions/`, etc.)                                         |
-| `num_dataloader_workers` | Number of parallel data loading processes (0 = synchronous loading, useful when debugging)                           |
-| `cache_in_memory`        | Cache precomputed data in system RAM to avoid repeated disk I/O. Automatically sets `num_dataloader_workers` to 0    |
-| `shard_size`             | When `cache_in_memory` is true, only hold this many samples in RAM at a time. Shards rotate automatically each pass  |
+| Parameter                | Mode        | Description                                                                                                          |
+|--------------------------|-------------|----------------------------------------------------------------------------------------------------------------------|
+| `preprocessed_data_root` | precomputed | Path to your preprocessed dataset (contains `latents/`, `conditions/`, etc.). Mutually exclusive with `dataset_metadata_file`. |
+| `num_dataloader_workers` | precomputed | Number of parallel data loading processes (0 = synchronous loading, useful when debugging)                           |
+| `cache_in_memory`        | precomputed | Cache precomputed data in system RAM to avoid repeated disk I/O. Automatically sets `num_dataloader_workers` to 0    |
+| `shard_size`             | both        | Samples per shard. Shards rotate automatically each pass. Required for online mode.                                  |
+| `dataset_metadata_file`  | online      | Path to CSV/JSON/JSONL with columns `media_path` (video paths) and `caption` (text). Triggers online encoding mode.  |
+| `resolution_buckets`     | online      | Resolution buckets as `"WxHxF;WxHxF;..."`. Each video is matched to the nearest bucket by aspect ratio.              |
+
+**Online mode constraints**: single-GPU only; incompatible with `training_strategy.with_audio=true`, `training_strategy.name=video_to_video`, and `acceleration.load_text_encoder_in_8bit=true`.
 
 ### ValidationConfig
 

@@ -186,6 +186,10 @@ data:
   # cache_in_memory: true
   # shard_size: 500  # samples per shard (null = cache entire dataset)
 
+  # Note: online encoding mode (dataset_metadata_file) is not supported for
+  # video-to-video training — use precomputed mode with process_dataset.py
+  # and --reference-column for reference-video training.
+
 # -----------------------------------------------------------------------------
 # Validation Configuration
 # -----------------------------------------------------------------------------

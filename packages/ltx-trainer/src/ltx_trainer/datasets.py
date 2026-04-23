@@ -1,4 +1,3 @@
-import random
 import time
 from pathlib import Path
 from typing import Any
@@ -9,6 +8,7 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from ltx_trainer import logger
+from ltx_trainer.shard_manager import ShardManager
 
 # Constants for precomputed data directories
 PRECOMPUTED_DIR_NAME = ".precomputed"
@@ -120,17 +120,17 @@ class PrecomputedDataset(Dataset):
         self._validate_setup()
 
         first_key = next(iter(self.sample_files.keys()))
-        self._total_samples = len(self.sample_files[first_key])
+        total_samples = len(self.sample_files[first_key])
 
         self._memory_cache: dict[int, dict[str, Any]] | None = None
-        self._shard_groups: list[list[int]] | None = None
-        self._current_shard_idx: int = 0
-        self._shard_size: int | None = shard_size if cache_in_memory else None
-        self._seed = seed
-        self._shard_cycle: int = 0
+        self._cache_in_memory = cache_in_memory
+        self._shards = ShardManager(
+            total_samples=total_samples,
+            shard_size=shard_size if cache_in_memory else None,
+            seed=seed,
+        )
 
         if cache_in_memory:
-            self._setup_shards()
             self._load_current_shard()
 
     @staticmethod
@@ -238,18 +238,24 @@ class PrecomputedDataset(Dataset):
 
     @property
     def total_samples(self) -> int:
-        return self._total_samples
+        return self._shards.total_samples
 
     @property
     def num_shards(self) -> int:
-        if self._shard_groups is None:
-            return 1
-        return len(self._shard_groups)
+        return self._shards.num_shards if self._cache_in_memory else 1
+
+    @property
+    def min_shard_size(self) -> int:
+        return self._shards.min_shard_size
+
+    @property
+    def shard_state(self) -> tuple[int, int]:
+        return self._shards.state
 
     def __len__(self) -> int:
-        if self._shard_groups is not None:
-            return len(self._shard_groups[self._current_shard_idx])
-        return self._total_samples
+        if self._cache_in_memory:
+            return self._shards.current_shard_size
+        return self._shards.total_samples
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         if self._memory_cache is not None:
@@ -279,25 +285,10 @@ class PrecomputedDataset(Dataset):
         result["idx"] = index
         return result
 
-    def _setup_shards(self) -> None:
-        indices = list(range(self._total_samples))
-
-        if self._shard_size is not None and self._shard_size < self._total_samples:
-            rng = random.Random(self._seed + self._shard_cycle)
-            rng.shuffle(indices)
-            self._shard_groups = [
-                indices[i : i + self._shard_size] for i in range(0, self._total_samples, self._shard_size)
-            ]
-            if len(self._shard_groups) > 1 and len(self._shard_groups[-1]) < self._shard_size:
-                self._shard_groups[-2].extend(self._shard_groups.pop())
-        else:
-            self._shard_groups = [indices]
-
-        self._current_shard_idx = 0
-
     def _load_current_shard(self) -> None:
-        shard = self._shard_groups[self._current_shard_idx]
-        num_shards = len(self._shard_groups)
+        shard = self._shards.current_shard
+        num_shards = self._shards.num_shards
+        shard_num = self._shards.state[1] + 1
 
         start = time.monotonic()
         cache: dict[int, dict[str, Any]] = {}
@@ -306,33 +297,19 @@ class PrecomputedDataset(Dataset):
         elapsed = time.monotonic() - start
 
         self._memory_cache = cache
-        logger.info(f"Cached shard {self._current_shard_idx + 1}/{num_shards} ({len(shard)} samples) in {elapsed:.1f}s")
+        logger.info(f"Cached shard {shard_num}/{num_shards} ({len(shard)} samples) in {elapsed:.1f}s")
 
     def advance_shard(self) -> None:
-        if self._shard_groups is None or len(self._shard_groups) <= 1:
+        if not self._cache_in_memory or not self._shards.has_sharding():
             return
-
-        self._current_shard_idx += 1
-
-        if self._current_shard_idx >= len(self._shard_groups):
-            self._current_shard_idx = 0
-            self._shard_cycle += 1
-            self._setup_shards()
-            logger.info("All shards visited, reshuffling for next cycle")
-
+        self._shards.advance()
         self._memory_cache = None
         self._load_current_shard()
 
-    @property
-    def shard_state(self) -> tuple[int, int]:
-        return (self._shard_cycle, self._current_shard_idx)
-
     def restore_shard_state(self, cycle: int, shard_idx: int) -> None:
-        if self._shard_groups is None or len(self._shard_groups) <= 1:
+        if not self._cache_in_memory or not self._shards.has_sharding():
             return
-        self._shard_cycle = cycle
-        self._setup_shards()
-        self._current_shard_idx = min(shard_idx, len(self._shard_groups) - 1)
+        self._shards.restore(cycle, shard_idx)
         self._memory_cache = None
         self._load_current_shard()
 
