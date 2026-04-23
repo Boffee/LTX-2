@@ -90,28 +90,35 @@ class _PinnedParamBuffer:
 
 
 class _BlockPinnedStore:
-    """Manages pinned buffers for all frozen params in a set of blocks."""
+    """Manages pinned buffers for all frozen params and buffers in a set of blocks."""
 
     def __init__(self, layers: nn.ModuleList) -> None:
-        self._buffers: list[list[_PinnedParamBuffer]] = []
+        self._param_bufs: list[list[_PinnedParamBuffer]] = []
+        self._module_bufs: list[dict[str, torch.Tensor]] = []
         for layer in layers:
-            block_bufs = []
+            block_pbufs = []
             for name, param in layer.named_parameters():
                 if not param.requires_grad:
-                    block_bufs.append(_PinnedParamBuffer(name, param))
-            self._buffers.append(block_bufs)
+                    block_pbufs.append(_PinnedParamBuffer(name, param))
+            self._param_bufs.append(block_pbufs)
+            # Cache CPU copies of module buffers (input_scale, output_scale)
+            self._module_bufs.append({name: buf.data.clone() for name, buf in layer.named_buffers()})
 
     def load_block(self, idx: int, layer: nn.Module, device: torch.device, non_blocking: bool = False) -> None:
         params = dict(layer.named_parameters())
-        for buf in self._buffers[idx]:
+        for buf in self._param_bufs[idx]:
             new_p = buf.load_to_gpu(device, non_blocking=non_blocking)
             torch.utils.swap_tensors(params[buf.name], new_p)
+        for name, mod_buf in layer.named_buffers():
+            mod_buf.data = self._module_bufs[idx][name].to(device, non_blocking=non_blocking)
 
     def evict_block(self, idx: int, layer: nn.Module) -> None:
-        """Point params back to pinned CPU buffers, freeing GPU memory (no copy needed)."""
+        """Point params/buffers back to CPU copies, freeing GPU memory (no copy needed)."""
         params = dict(layer.named_parameters())
-        for buf in self._buffers[idx]:
+        for buf in self._param_bufs[idx]:
             torch.utils.swap_tensors(params[buf.name], buf.restore_to_pinned())
+        for name, mod_buf in layer.named_buffers():
+            mod_buf.data = self._module_bufs[idx][name]
 
 
 # ---------------------------------------------------------------------------
@@ -278,12 +285,6 @@ class TrainingBlockOffloader:
             self._store.load_block(idx, self._layers[idx], self._target_device)
             self._tracker.mark_on_gpu(idx)
 
-        # Also move buffers (input_scale, output_scale) for resident blocks
-        for idx in range(min(num_resident, num_layers)):
-            for b in self._layers[idx].buffers():
-                if not b.data.is_cuda:
-                    b.data = b.data.to(self._target_device)
-
         self._register_hooks(num_resident)
 
         logger.info(
@@ -317,10 +318,6 @@ class TrainingBlockOffloader:
             for idx, layer in enumerate(self._layers):
                 if self._tracker.is_on_gpu(idx):
                     self._store.evict_block(idx, layer)
-                    # Also move buffers back to CPU
-                    for b in layer.buffers():
-                        if b.data.is_cuda:
-                            b.data = b.data.to("cpu")
             self._tracker.clear()
 
         self._tracker = None
@@ -334,18 +331,11 @@ class TrainingBlockOffloader:
     def _evict_one(self, protected: set[int]) -> None:
         victim = self._tracker.pick_victim(protected=protected)
         self._store.evict_block(victim, self._layers[victim])
-        for b in self._layers[victim].buffers():
-            if b.data.is_cuda:
-                b.data = b.data.to("cpu")
         self._tracker.mark_on_cpu(victim)
 
     def _do_prefetch(self, idx: int) -> torch.cuda.Event:
-        """Background thread: transfer block to GPU on the prefetch stream."""
         with torch.cuda.stream(self._stream):
             self._store.load_block(idx, self._layers[idx], self._target_device, non_blocking=True)
-            for b in self._layers[idx].buffers():
-                if not b.data.is_cuda:
-                    b.data = b.data.to(self._target_device, non_blocking=True)
         return self._stream.record_event()
 
     def _submit_prefetch(self, idx: int, max_on_gpu: int) -> None:
@@ -358,7 +348,6 @@ class TrainingBlockOffloader:
         self._pending[idx] = self._executor.submit(self._do_prefetch, idx)
 
     def _ensure_on_gpu(self, idx: int) -> None:
-        """Wait for pending prefetch or load synchronously."""
         future = self._pending.pop(idx, None)
         if future is not None:
             event = future.result()
@@ -368,9 +357,6 @@ class TrainingBlockOffloader:
 
         if not self._tracker.is_on_gpu(idx):
             self._store.load_block(idx, self._layers[idx], self._target_device)
-            for b in self._layers[idx].buffers():
-                if not b.data.is_cuda:
-                    b.data = b.data.to(self._target_device)
             self._tracker.mark_on_gpu(idx)
 
     # ------------------------------------------------------------------
