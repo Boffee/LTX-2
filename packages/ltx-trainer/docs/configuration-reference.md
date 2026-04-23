@@ -236,14 +236,18 @@ Data loading and processing configuration.
 data:
   preprocessed_data_root: "/path/to/preprocessed/data"  # Path to precomputed dataset
   num_dataloader_workers: 2                             # Background data loading workers
+  cache_in_memory: false                                # Cache data in RAM (avoids disk I/O)
+  shard_size: null                                      # Samples per shard (null = cache all)
 ```
 
 **Key parameters:**
 
-| Parameter                | Description                                                                                |
-|--------------------------|--------------------------------------------------------------------------------------------|
-| `preprocessed_data_root` | Path to your preprocessed dataset (contains `latents/`, `conditions/`, etc.)               |
-| `num_dataloader_workers` | Number of parallel data loading processes (0 = synchronous loading, useful when debugging) |
+| Parameter                | Description                                                                                                          |
+|--------------------------|----------------------------------------------------------------------------------------------------------------------|
+| `preprocessed_data_root` | Path to your preprocessed dataset (contains `latents/`, `conditions/`, etc.)                                         |
+| `num_dataloader_workers` | Number of parallel data loading processes (0 = synchronous loading, useful when debugging)                           |
+| `cache_in_memory`        | Cache precomputed data in system RAM to avoid repeated disk I/O. Automatically sets `num_dataloader_workers` to 0    |
+| `shard_size`             | When `cache_in_memory` is true, only hold this many samples in RAM at a time. Shards rotate automatically each pass  |
 
 ### ValidationConfig
 

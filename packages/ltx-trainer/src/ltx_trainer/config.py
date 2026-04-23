@@ -197,6 +197,22 @@ class DataConfig(ConfigBaseModel):
         ge=0,
     )
 
+    cache_in_memory: bool = Field(
+        default=False,
+        description="Cache precomputed data in system memory (RAM) to avoid repeated disk I/O. "
+        "When combined with shard_size, loads one shard at a time and rotates shards "
+        "as training progresses. Automatically sets num_dataloader_workers to 0.",
+    )
+
+    shard_size: int | None = Field(
+        default=None,
+        description="Number of samples per shard when cache_in_memory is enabled. "
+        "Only one shard is held in memory at a time; shards rotate automatically "
+        "each epoch with reshuffling between full cycles. "
+        "If None with cache_in_memory=True, the entire dataset is cached.",
+        gt=0,
+    )
+
 
 class ValidationConfig(ConfigBaseModel):
     """Configuration for validation during training"""
@@ -555,5 +571,15 @@ class LtxTrainerConfig(ConfigBaseModel):
                     "blocks_to_swap requires training_mode='lora'. "
                     "Block offloading only works with frozen base weights."
                 )
+
+        # Shard size requires in-memory caching
+        if self.data.shard_size is not None and not self.data.cache_in_memory:
+            raise ValueError("shard_size requires cache_in_memory=True")
+
+        # Shard must hold at least one full batch (drop_last=True would yield 0 batches otherwise)
+        if self.data.shard_size is not None and self.data.shard_size < self.optimization.batch_size:
+            raise ValueError(
+                f"shard_size ({self.data.shard_size}) must be >= batch_size ({self.optimization.batch_size})"
+            )
 
         return self

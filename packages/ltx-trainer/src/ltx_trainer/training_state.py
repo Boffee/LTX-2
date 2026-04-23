@@ -11,6 +11,7 @@ class ConfigFingerprint(BaseModel):
     scheduler_type: str
     training_mode: str
     lora_rank: int | None = None
+    shard_size: int | None = None
 
 
 class RngStates(BaseModel):
@@ -29,6 +30,8 @@ class TrainingState(BaseModel):
     lr_scheduler_state_dict: dict[str, Any] | None = None
     optimizer_state_dict: dict[str, Any] | None = None
     wandb_run_id: str | None = None
+    shard_cycle: int = 0
+    shard_idx: int = 0
 
     def to_save_dict(self) -> dict[str, Any]:
         """Build dict suitable for torch.save -- recurses BaseModel sub-models, passes tensors/dicts through."""
@@ -50,4 +53,6 @@ class TrainingState(BaseModel):
             lr_scheduler_state_dict=data.get("lr_scheduler_state_dict"),
             optimizer_state_dict=data.get("optimizer_state_dict"),
             wandb_run_id=data.get("wandb_run_id"),
+            shard_cycle=data.get("shard_cycle", 0),
+            shard_idx=data.get("shard_idx", 0),
         )

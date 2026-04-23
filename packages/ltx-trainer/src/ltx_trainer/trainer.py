@@ -145,6 +145,8 @@ class LtxvTrainer:
         self._init_wandb(resume_run_id=resume_run_id)
 
         self._init_dataloader()
+        if resuming and training_state is not None:
+            self._dataset.restore_shard_state(training_state.shard_cycle, training_state.shard_idx)
         data_iter = iter(self._dataloader)
         self._init_timestep_sampler()
 
@@ -198,6 +200,7 @@ class LtxvTrainer:
                 try:
                     batch = next(data_iter)
                 except StopIteration:
+                    self._dataset.advance_shard()
                     data_iter = iter(self._dataloader)
                     batch = next(data_iter)
 
@@ -613,6 +616,9 @@ class LtxvTrainer:
             and fp.lora_rank != cfg.lora.rank
         ):
             mismatches.append(f"lora_rank: {fp.lora_rank} → {cfg.lora.rank}")
+        current_shard_size = cfg.data.shard_size if cfg.data.cache_in_memory else None
+        if fp.shard_size is not None and fp.shard_size != current_shard_size:
+            mismatches.append(f"shard_size: {fp.shard_size} → {current_shard_size}")
         if mismatches:
             logger.warning(
                 f"⚠️ Training state config mismatch ({', '.join(mismatches)}). "
@@ -762,10 +768,34 @@ class LtxvTrainer:
             # Get data sources from the training strategy
             data_sources = self._training_strategy.get_data_sources()
 
-            self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
-            logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
+            self._dataset = PrecomputedDataset(
+                self._config.data.preprocessed_data_root,
+                data_sources=data_sources,
+                cache_in_memory=self._config.data.cache_in_memory,
+                shard_size=self._config.data.shard_size,
+                seed=self._config.seed,
+            )
+            total = self._dataset.total_samples
+            shard_info = ""
+            if self._dataset.num_shards > 1:
+                shard_info = f" ({self._dataset.num_shards} shards of ~{self._config.data.shard_size})"
+            logger.debug(f"Loaded dataset with {total:,} samples{shard_info} from sources: {list(data_sources)}")
+
+            if self._dataset.num_shards > 1:
+                min_shard = min(len(g) for g in self._dataset._shard_groups)
+                batches_per_shard = min_shard // self._config.optimization.batch_size
+                if batches_per_shard < self._accelerator.num_processes:
+                    raise ValueError(
+                        f"Smallest shard ({min_shard} samples) yields {batches_per_shard} batches, "
+                        f"but {self._accelerator.num_processes} processes need at least 1 batch each. "
+                        f"Increase shard_size or reduce batch_size."
+                    )
 
         num_workers = self._config.data.num_dataloader_workers
+        if self._config.data.cache_in_memory and num_workers > 0:
+            logger.info("Setting num_dataloader_workers=0 for in-memory caching (data served from RAM)")
+            num_workers = 0
+
         dataloader = DataLoader(
             self._dataset,
             batch_size=self._config.optimization.batch_size,
@@ -1168,6 +1198,10 @@ class LtxvTrainer:
             else:
                 optimizer_state = self._optimizer.state_dict()
 
+        shard_cycle, shard_idx = (0, 0)
+        if self._dataset is not None and hasattr(self._dataset, "shard_state"):
+            shard_cycle, shard_idx = self._dataset.shard_state
+
         state = TrainingState(
             global_step=self._global_step,
             config_fingerprint=ConfigFingerprint(
@@ -1175,6 +1209,7 @@ class LtxvTrainer:
                 scheduler_type=self._config.optimization.scheduler_type,
                 training_mode=self._config.model.training_mode,
                 lora_rank=self._config.lora.rank if self._config.lora is not None else None,
+                shard_size=self._config.data.shard_size if self._config.data.cache_in_memory else None,
             ),
             rng_states=RngStates(
                 torch_state=torch.random.get_rng_state(),
@@ -1183,6 +1218,8 @@ class LtxvTrainer:
             lr_scheduler_state_dict=self._lr_scheduler.state_dict() if self._lr_scheduler is not None else None,
             optimizer_state_dict=optimizer_state,
             wandb_run_id=self._wandb_run.id if self._wandb_run is not None else None,
+            shard_cycle=shard_cycle,
+            shard_idx=shard_idx,
         )
 
         state_path = save_dir / f"training_state_step_{self._global_step:05d}.pt"

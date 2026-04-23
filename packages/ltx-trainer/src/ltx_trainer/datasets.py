@@ -1,4 +1,7 @@
+import random
+import time
 from pathlib import Path
+from typing import Any
 
 import torch
 from einops import rearrange
@@ -84,7 +87,14 @@ class DummyDataset(Dataset):
 
 
 class PrecomputedDataset(Dataset):
-    def __init__(self, data_root: str, data_sources: dict[str, str] | list[str] | None = None) -> None:
+    def __init__(
+        self,
+        data_root: str,
+        data_sources: dict[str, str] | list[str] | None = None,
+        cache_in_memory: bool = False,
+        shard_size: int | None = None,
+        seed: int = 42,
+    ) -> None:
         """
         Generic dataset for loading precomputed data from multiple sources.
         Args:
@@ -93,13 +103,10 @@ class PrecomputedDataset(Dataset):
               - Dict mapping directory names to output keys
               - List of directory names (keys will equal values)
               - None (defaults to ["latents", "conditions"])
-        Example:
-            # Standard mode (list)
-            dataset = PrecomputedDataset("data/", ["latents", "conditions"])
-            # Standard mode (dict)
-            dataset = PrecomputedDataset("data/", {"latents": "latent_conditions", "conditions": "text_conditions"})
-            # IC-LoRA mode
-            dataset = PrecomputedDataset("data/", ["latents", "conditions", "reference_latents"])
+            cache_in_memory: Cache loaded data in RAM to avoid repeated disk I/O.
+            shard_size: When cache_in_memory is True, only cache this many samples
+              at a time. Shards rotate automatically each epoch. None = cache all.
+            seed: Random seed for deterministic shard shuffling.
         Note:
             Latents are always returned in non-patchified format [C, F, H, W].
             Legacy patchified format [seq_len, C] is automatically converted.
@@ -111,6 +118,20 @@ class PrecomputedDataset(Dataset):
         self.source_paths = self._setup_source_paths()
         self.sample_files = self._discover_samples()
         self._validate_setup()
+
+        first_key = next(iter(self.sample_files.keys()))
+        self._total_samples = len(self.sample_files[first_key])
+
+        self._memory_cache: dict[int, dict[str, Any]] | None = None
+        self._shard_groups: list[list[int]] | None = None
+        self._current_shard_idx: int = 0
+        self._shard_size: int | None = shard_size if cache_in_memory else None
+        self._seed = seed
+        self._shard_cycle: int = 0
+
+        if cache_in_memory:
+            self._setup_shards()
+            self._load_current_shard()
 
     @staticmethod
     def _setup_data_root(data_root: str) -> Path:
@@ -215,12 +236,27 @@ class PrecomputedDataset(Dataset):
         if len(set(sample_counts.values())) > 1:
             raise ValueError(f"Mismatched sample counts across sources: {sample_counts}")
 
+    @property
+    def total_samples(self) -> int:
+        return self._total_samples
+
+    @property
+    def num_shards(self) -> int:
+        if self._shard_groups is None:
+            return 1
+        return len(self._shard_groups)
+
     def __len__(self) -> int:
-        # Use the first output key as reference count
-        first_key = next(iter(self.sample_files.keys()))
-        return len(self.sample_files[first_key])
+        if self._shard_groups is not None:
+            return len(self._shard_groups[self._current_shard_idx])
+        return self._total_samples
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        if self._memory_cache is not None:
+            return self._memory_cache[index]
+        return self._load_sample(index)
+
+    def _load_sample(self, index: int) -> dict[str, torch.Tensor]:
         result = {}
 
         for dir_name, output_key in self.data_sources.items():
@@ -242,6 +278,63 @@ class PrecomputedDataset(Dataset):
         # Add index for debugging
         result["idx"] = index
         return result
+
+    def _setup_shards(self) -> None:
+        indices = list(range(self._total_samples))
+
+        if self._shard_size is not None and self._shard_size < self._total_samples:
+            rng = random.Random(self._seed + self._shard_cycle)
+            rng.shuffle(indices)
+            self._shard_groups = [
+                indices[i : i + self._shard_size] for i in range(0, self._total_samples, self._shard_size)
+            ]
+            if len(self._shard_groups) > 1 and len(self._shard_groups[-1]) < self._shard_size:
+                self._shard_groups[-2].extend(self._shard_groups.pop())
+        else:
+            self._shard_groups = [indices]
+
+        self._current_shard_idx = 0
+
+    def _load_current_shard(self) -> None:
+        shard = self._shard_groups[self._current_shard_idx]
+        num_shards = len(self._shard_groups)
+
+        start = time.monotonic()
+        cache: dict[int, dict[str, Any]] = {}
+        for local_idx, global_idx in enumerate(shard):
+            cache[local_idx] = self._load_sample(global_idx)
+        elapsed = time.monotonic() - start
+
+        self._memory_cache = cache
+        logger.info(f"Cached shard {self._current_shard_idx + 1}/{num_shards} ({len(shard)} samples) in {elapsed:.1f}s")
+
+    def advance_shard(self) -> None:
+        if self._shard_groups is None or len(self._shard_groups) <= 1:
+            return
+
+        self._current_shard_idx += 1
+
+        if self._current_shard_idx >= len(self._shard_groups):
+            self._current_shard_idx = 0
+            self._shard_cycle += 1
+            self._setup_shards()
+            logger.info("All shards visited, reshuffling for next cycle")
+
+        self._memory_cache = None
+        self._load_current_shard()
+
+    @property
+    def shard_state(self) -> tuple[int, int]:
+        return (self._shard_cycle, self._current_shard_idx)
+
+    def restore_shard_state(self, cycle: int, shard_idx: int) -> None:
+        if self._shard_groups is None or len(self._shard_groups) <= 1:
+            return
+        self._shard_cycle = cycle
+        self._setup_shards()
+        self._current_shard_idx = min(shard_idx, len(self._shard_groups) - 1)
+        self._memory_cache = None
+        self._load_current_shard()
 
     @staticmethod
     def _normalize_video_latents(data: dict) -> dict:
