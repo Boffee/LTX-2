@@ -131,6 +131,9 @@ optimization:
   # Typical range for LoRA: 1e-5 to 1e-4
   learning_rate: 1e-4
 
+  # Optional: separate learning rate for audio pathway LoRA parameters
+  # audio_learning_rate: 5e-5
+
   # Total number of training steps
   steps: 2000
 
@@ -177,6 +180,12 @@ acceleration:
   # Load text encoder in 8-bit precision to save memory
   # Useful when GPU memory is limited
   load_text_encoder_in_8bit: true
+
+  # Number of transformer blocks to offload to CPU
+  # Frozen block weights are streamed between CPU pinned memory and GPU on demand
+  # Higher values save more VRAM but slow training
+  # For the 48-block LTX-2 model, 30 keeps 18 blocks on GPU at a time
+  blocks_to_swap: 30
 
 # -----------------------------------------------------------------------------
 # Data Configuration

@@ -43,6 +43,7 @@ from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
+from ltx_trainer.block_offloader import TrainingBlockOffloader
 from ltx_trainer.training_strategies import get_training_strategy
 from ltx_trainer.utils import open_image_as_srgb, save_image
 from ltx_trainer.validation_sampler import CachedPromptEmbeddings, GenerationConfig, ValidationSampler
@@ -702,8 +703,24 @@ class LtxvTrainer:
 
         # Embedding connectors are already on GPU from _load_text_encoder_and_cache_embeddings
 
-        # noinspection PyTypeChecker
-        self._transformer = self._accelerator.prepare(self._transformer)
+        # Set up block offloading (must happen before accelerator.prepare while weights are on CPU)
+        self._block_offloader: TrainingBlockOffloader | None = None
+        blocks_to_swap = self._config.acceleration.blocks_to_swap
+        if blocks_to_swap is not None and blocks_to_swap > 0:
+            if self._accelerator.distributed_type == DistributedType.FSDP or self._accelerator.num_processes > 1:
+                raise ValueError("blocks_to_swap is only supported on single-GPU training")
+            self._block_offloader = TrainingBlockOffloader(
+                model=self._transformer,
+                target_device=self._accelerator.device,
+                blocks_to_swap=blocks_to_swap,
+            )
+
+        if self._block_offloader is not None:
+            # noinspection PyTypeChecker
+            self._transformer = self._accelerator.prepare(self._transformer, device_placement=[False])
+        else:
+            # noinspection PyTypeChecker
+            self._transformer = self._accelerator.prepare(self._transformer)
 
         # Log GPU memory usage after model preparation
         vram_usage_gb = torch.cuda.memory_allocated() / 1024**3
@@ -768,18 +785,43 @@ class LtxvTrainer:
             if isinstance(module, (BaseTunerLayer, ModulesToSaveWrapper)):
                 module.reset_lora_parameters(adapter_name="default", init_lora_weights=True)
 
+    # audio_to_video_attn excluded: Q from video, serves video quality
+    # video_to_audio_attn included: Q from audio, modifies audio representation
+    _AUDIO_MODULES = {".audio_attn1.", ".audio_attn2.", ".audio_ff.", ".video_to_audio_attn."}
+
     def _init_optimizer(self) -> None:
         """Initialize the optimizer and learning rate scheduler."""
         opt_cfg = self._config.optimization
-
         lr = opt_cfg.learning_rate
+        audio_lr = opt_cfg.audio_learning_rate
+
+        if audio_lr is not None:
+            audio_params: list[torch.nn.Parameter] = []
+            video_params: list[torch.nn.Parameter] = []
+            for name, p in self._transformer.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if any(mod in name for mod in self._AUDIO_MODULES):
+                    audio_params.append(p)
+                else:
+                    video_params.append(p)
+            param_groups = [{"params": video_params, "lr": lr}]
+            if audio_params:
+                param_groups.append({"params": audio_params, "lr": audio_lr})
+                logger.info(
+                    f"Audio LR: {audio_lr:.2e} ({len(audio_params)} params), "
+                    f"video LR: {lr:.2e} ({len(video_params)} params)"
+                )
+        else:
+            param_groups = self._trainable_params
+
         if opt_cfg.optimizer_type == "adamw":
-            optimizer = AdamW(self._trainable_params, lr=lr)
+            optimizer = AdamW(param_groups, lr=lr)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
-            optimizer = AdamW8bit(self._trainable_params, lr=lr)
+            optimizer = AdamW8bit(param_groups, lr=lr)
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 
@@ -895,6 +937,26 @@ class LtxvTrainer:
         self._optimizer.zero_grad(set_to_none=True)
         free_gpu_memory()
 
+        # Teardown block offloader — validation calls .to(device) which would corrupt offloader state
+        if self._block_offloader is not None:
+            self._block_offloader.teardown()
+
+        try:
+            return self._run_validation_sampling(
+                progress, use_images, use_reference_videos, generate_audio, inference_steps
+            )
+        finally:
+            if self._block_offloader is not None:
+                self._block_offloader.setup()
+
+    def _run_validation_sampling(
+        self,
+        progress: TrainingProgress,
+        use_images: bool,
+        use_reference_videos: bool,
+        generate_audio: bool,
+        inference_steps: int,
+    ) -> list[Path] | None:
         # Start sampling progress tracking
         sampling_ctx = progress.start_sampling(
             num_prompts=len(self._config.validation.prompts),

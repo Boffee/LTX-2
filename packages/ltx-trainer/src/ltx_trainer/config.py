@@ -102,6 +102,13 @@ class OptimizationConfig(ConfigBaseModel):
         description="Learning rate for optimization",
     )
 
+    audio_learning_rate: float | None = Field(
+        default=None,
+        description="Separate learning rate for audio pathway LoRA parameters. "
+        "When set, audio attention and cross-modal LoRA weights use this LR "
+        "while video pathway parameters use the main learning_rate. If None, all parameters use learning_rate.",
+    )
+
     steps: int = Field(
         default=3000,
         description="Number of training steps",
@@ -166,6 +173,14 @@ class AccelerationConfig(ConfigBaseModel):
     load_text_encoder_in_8bit: bool = Field(
         default=False,
         description="Whether to load the text encoder in 8-bit precision to save memory",
+    )
+
+    blocks_to_swap: int | None = Field(
+        default=None,
+        description="Number of transformer blocks to offload to CPU. "
+        "Frozen block weights are streamed between CPU pinned memory and GPU on demand. "
+        "Only supported in LoRA training mode on a single GPU. Higher values save more VRAM but slow training.",
+        ge=0,
     )
 
 
@@ -532,5 +547,13 @@ class LtxTrainerConfig(ConfigBaseModel):
         # Check that LoRA config is provided when using video_to_video strategy
         if self.training_strategy.name == "video_to_video" and self.model.training_mode != "lora":
             raise ValueError("Training mode must be 'lora' when using video_to_video strategy")
+
+        # Block offloading requires LoRA mode (frozen base weights are offloaded)
+        if self.acceleration.blocks_to_swap is not None and self.acceleration.blocks_to_swap > 0:
+            if self.model.training_mode != "lora":
+                raise ValueError(
+                    "blocks_to_swap requires training_mode='lora'. "
+                    "Block offloading only works with frozen base weights."
+                )
 
         return self
