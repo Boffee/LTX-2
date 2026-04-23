@@ -43,8 +43,8 @@ def create_dummy_data(data_dir: Path, num_samples: int = 8) -> None:
         torch.save(latent_data, latents_dir / f"sample_{i:04d}.pt")
 
         condition_data = {
-            "video_prompt_embeds": torch.randn(256, 4096),
-            "audio_prompt_embeds": torch.randn(256, 4096),
+            "video_prompt_embeds": torch.randn(256, 4096, dtype=torch.bfloat16),
+            "audio_prompt_embeds": torch.randn(256, 2048, dtype=torch.bfloat16),
             "prompt_attention_mask": torch.ones(256, dtype=torch.bool),
         }
         torch.save(condition_data, conditions_dir / f"sample_{i:04d}.pt")
