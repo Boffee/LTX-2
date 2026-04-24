@@ -200,13 +200,6 @@ data:
   # Used for parallel data loading to speed up data loading
   num_dataloader_workers: 2
 
-  # Cache precomputed data in system RAM to avoid repeated disk I/O.
-  # Especially useful when training data lives on slow storage (HDD, NFS).
-  # When combined with shard_size, only one shard is held in RAM at a time,
-  # rotating automatically each epoch — avoids OOM on large datasets.
-  # cache_in_memory: true
-  # shard_size: 500  # samples per shard (null = cache entire dataset)
-
 # -----------------------------------------------------------------------------
 # Validation Configuration
 # -----------------------------------------------------------------------------
