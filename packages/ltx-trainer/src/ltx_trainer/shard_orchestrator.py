@@ -184,6 +184,12 @@ class ShardOrchestrator:
         ``T_0``) is pinned to the full-run total via ``scheduler_params`` so the
         LR curve spans all shards rather than resetting per shard. ``steps``
         controls the stop point, ``scheduler_params`` controls the curve.
+
+        ``checkpoints.keep_last_n`` is forced to -1 (keep all) for the per-shard
+        trainer: per-instance retention can't see across shards, and the trainer's
+        same-step interval-save + final-save pattern can unlink the file the
+        orchestrator needs for handoff. Sharded runs accumulate all per-shard
+        checkpoints under the output dir; clean up manually if disk fills.
         """
         cfg = self._cfg.model_copy(deep=True)
         cfg.data.preprocessed_data_root = str(self._output_dir)
@@ -193,6 +199,7 @@ class ShardOrchestrator:
         cfg.data.shard_preprocessing_output_dir = None
         cfg.model.load_checkpoint = str(load_checkpoint) if load_checkpoint else None
         cfg.optimization.steps = target_steps
+        cfg.checkpoints.keep_last_n = -1  # see docstring
 
         total_steps = self._cfg.optimization.steps
         key = _SCHEDULER_TOTAL_KEY.get(cfg.optimization.scheduler_type)
