@@ -387,6 +387,13 @@ class ShardOrchestrator:
         # auto-find the latest) and skip any shards whose cumulative target has
         # already been reached.
         completed_steps = self._latest_saved_step()
+        if completed_steps >= total_steps:
+            logger.info(
+                f"✅ Already at step {completed_steps} ≥ target {total_steps}; "
+                f"nothing to do. (Adjust optimization.steps to extend training, "
+                f"or remove {self._ckpt_dir} to start fresh.)"
+            )
+            return
         if completed_steps > 0:
             logger.info(f"🔁 Resuming orchestrator from step {completed_steps}")
             last_checkpoint: Path | None = self._ckpt_dir
