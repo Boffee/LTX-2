@@ -34,6 +34,7 @@ import pandas as pd
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.trainer import LtxvTrainer
+from ltx_trainer.training_strategies import get_training_strategy
 
 # Match the columns process_dataset.py expects by default.
 VIDEO_COLUMN = "media_path"
@@ -123,6 +124,11 @@ class ShardOrchestrator:
         self._metadata_file = Path(config.data.dataset_metadata_file)
         self._samples = self._load_metadata(self._metadata_file)
         self._resolution_buckets = _parse_resolution_buckets(config.data.resolution_buckets)
+        # Resolve the strategy here so we get a typed `requires_audio` answer
+        # (the orchestrator only sees the strategy's *config*, which exposes
+        # different fields per type — TextToVideoConfig has `with_audio`,
+        # VideoToVideoConfig does not). Same dispatch the trainer uses.
+        self._strategy = get_training_strategy(config.training_strategy)
 
     @staticmethod
     def _load_metadata(dataset_file: Path) -> list[dict[str, str]]:
@@ -185,7 +191,7 @@ class ShardOrchestrator:
         latents_dir = self._output_dir / "latents"
         conditions_dir = self._output_dir / "conditions"
         audio_dir = self._output_dir / "audio_latents"
-        needs_audio = getattr(self._cfg.training_strategy, "with_audio", False)
+        needs_audio = self._strategy.requires_audio
 
         count = 0
         for row in rows:
@@ -219,7 +225,7 @@ class ShardOrchestrator:
                 text_encoder_path=str(self._cfg.model.text_encoder_path),
                 device="cuda",
                 remove_llm_prefixes=False,
-                with_audio=getattr(self._cfg.training_strategy, "with_audio", False),
+                with_audio=self._strategy.requires_audio,
                 load_text_encoder_in_8bit=self._cfg.acceleration.load_text_encoder_in_8bit,
             )
         finally:
