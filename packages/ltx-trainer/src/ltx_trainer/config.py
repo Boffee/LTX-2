@@ -187,8 +187,10 @@ class AccelerationConfig(ConfigBaseModel):
 class DataConfig(ConfigBaseModel):
     """Configuration for data loading and processing"""
 
-    preprocessed_data_root: str = Field(
-        description="Path to folder containing preprocessed training data",
+    preprocessed_data_root: str | None = Field(
+        default=None,
+        description="Path to folder containing preprocessed training data. "
+        "Mutually exclusive with dataset_metadata_file.",
     )
 
     num_dataloader_workers: int = Field(
@@ -196,6 +198,46 @@ class DataConfig(ConfigBaseModel):
         description="Number of background processes for data loading (0 means synchronous loading)",
         ge=0,
     )
+
+    # --- Sharded preprocessing mode (driven by scripts/train.py's ShardOrchestrator) ---
+
+    dataset_metadata_file: str | Path | None = Field(
+        default=None,
+        description="Path to CSV/JSON/JSONL metadata file with 'media_path' and 'caption' columns. "
+        "When set, training runs under the sharded-preprocessing orchestrator instead of reading "
+        "a precomputed data root — the orchestrator preprocesses one shard at a time between epochs.",
+    )
+
+    resolution_buckets: str | None = Field(
+        default=None,
+        description='Resolution buckets for sharded preprocessing, format "WxHxF;WxHxF;..." '
+        '(e.g., "768x768x25;512x512x49").',
+    )
+
+    shard_size: int | None = Field(
+        default=None,
+        description="Samples per shard for sharded preprocessing. Each shard is preprocessed, "
+        "trained on for one epoch, then the next shard is preprocessed in its place.",
+        gt=0,
+    )
+
+    shard_preprocessing_output_dir: str | Path | None = Field(
+        default=None,
+        description="Where the sharded-preprocessing orchestrator writes its output. Required "
+        "with dataset_metadata_file.",
+    )
+
+    @field_validator("dataset_metadata_file")
+    @classmethod
+    def validate_dataset_metadata_file(cls, v: str | Path | None) -> str | Path | None:
+        if v is None:
+            return None
+        p = Path(v)
+        if not p.is_file():
+            raise ValueError(f"dataset_metadata_file does not exist or is not a file: {v}")
+        if p.suffix.lower() not in (".csv", ".json", ".jsonl"):
+            raise ValueError(f"dataset_metadata_file must be CSV/JSON/JSONL, got {p.suffix}")
+        return v
 
 
 class ValidationConfig(ConfigBaseModel):
@@ -555,5 +597,24 @@ class LtxTrainerConfig(ConfigBaseModel):
                     "blocks_to_swap requires training_mode='lora'. "
                     "Block offloading only works with frozen base weights."
                 )
+
+        # Data source: exactly one of preprocessed_data_root or dataset_metadata_file
+        has_precomputed = self.data.preprocessed_data_root is not None
+        has_metadata = self.data.dataset_metadata_file is not None
+        if not has_precomputed and not has_metadata:
+            raise ValueError("Either preprocessed_data_root or dataset_metadata_file must be provided")
+        if has_precomputed and has_metadata:
+            raise ValueError("preprocessed_data_root and dataset_metadata_file are mutually exclusive")
+
+        # Sharded preprocessing requires its own set of fields
+        if has_metadata:
+            if not self.data.resolution_buckets:
+                raise ValueError("resolution_buckets is required with dataset_metadata_file")
+            if not self.data.shard_size:
+                raise ValueError("shard_size is required with dataset_metadata_file")
+            if not self.data.shard_preprocessing_output_dir:
+                raise ValueError("shard_preprocessing_output_dir is required with dataset_metadata_file")
+            if not self.model.text_encoder_path:
+                raise ValueError("text_encoder_path is required with dataset_metadata_file")
 
         return self
