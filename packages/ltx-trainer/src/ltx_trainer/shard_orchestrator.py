@@ -23,6 +23,7 @@ orchestration on top of the two existing entry points.
 from __future__ import annotations
 
 import contextlib
+import gc
 import json
 import os
 import random
@@ -95,6 +96,31 @@ def _parse_resolution_buckets(s: str) -> list[tuple[int, int, int]]:
         w, h, f = (int(p) for p in parts)
         out.append((f, h, w))
     return out
+
+
+def _tear_down_trainer(trainer: "LtxvTrainer") -> None:
+    """Break the shard-trainer reference cycle so its GPU/pinned memory is
+    released before the next shard's trainer is constructed.
+
+    The block offloader registers forward-pre hooks on transformer block
+    modules. Each hook closure retains a reference to the offloader, which
+    references the model, which references the block — a cycle that
+    refcount GC can't break on its own. Without explicit teardown, shard N+1
+    starts loading its model on top of shard N's still-resident GPU
+    parameters + optimizer state + pinned CPU buffers, and OOMs on the
+    first tensor that doesn't fit in whatever sliver remains.
+    """
+    try:
+        import torch
+
+        offloader = getattr(trainer, "_block_offloader", None)
+        if offloader is not None:
+            offloader.teardown()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"⚠️  Trainer teardown encountered {type(e).__name__}: {e}")
 
 
 class ShardOrchestrator:
@@ -484,6 +510,16 @@ class ShardOrchestrator:
                     # a kill-in-flight write.
                     _, last_checkpoint = self._latest_saved_checkpoint()
                     seen_initial = True
+                    # Tear down the shard's trainer explicitly before the
+                    # next shard creates a new one. The block offloader's
+                    # forward-pre hooks form a cycle with the transformer
+                    # blocks (module → hook → closure → module), so the
+                    # trainer isn't reclaimed by refcount-only GC when the
+                    # loop rebinds ``trainer`` on the next iteration. Without
+                    # this, shard 2's model load OOMs on top of the still-
+                    # resident shard 1 parameters/optimizer state.
+                    _tear_down_trainer(trainer)
+                    del trainer
 
                 if cumulative_target >= total_steps:
                     logger.info("✅ Reached total step target — orchestrator done")
