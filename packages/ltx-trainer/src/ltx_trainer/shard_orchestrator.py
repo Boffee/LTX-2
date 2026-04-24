@@ -289,6 +289,17 @@ class ShardOrchestrator:
         return LtxTrainerConfig.model_validate(cfg.model_dump())
 
     def run(self, disable_progress_bars: bool = False) -> None:
+        # Check completion before touching tmpfs — no point validating the
+        # mount and installing the conditions symlink just to return.
+        completed_steps, _ = self._latest_saved_checkpoint()
+        total_steps = self._cfg.optimization.steps
+        if completed_steps >= total_steps:
+            logger.info(
+                f"✅ Already at step {completed_steps} ≥ target {total_steps}; "
+                f"nothing to do. (Adjust optimization.steps to extend training, "
+                f"or remove {self._ckpt_dir} to start fresh.)"
+            )
+            return
         with self._tmpfs_conditions() as conditions_tmpfs:
             self._run_loop(disable_progress_bars, conditions_tmpfs)
 
@@ -354,27 +365,47 @@ class ShardOrchestrator:
             else:
                 item.unlink()
 
-    def _latest_saved_step(self) -> int:
-        """Highest step that has both weights and a training_state sidecar saved.
+    def _latest_saved_checkpoint(self) -> tuple[int, Path | None]:
+        """Return ``(step, weights_path)`` for the latest complete (weights + state)
+        pair, or ``(0, None)`` if none. Weights-without-state orphans are ignored.
 
-        We glob ``training_state_step_*.pt`` rather than the .safetensors weights
-        because the trainer writes weights before the sidecar
-        (``trainer.py:1121`` / ``1127`` then ``trainer.py:1135``); a kill between
-        those leaves orphan weights without optimizer/scheduler state. The
-        sidecar is written atomically via tmp+rename
-        (``trainer.py:_save_training_state``), so its presence guarantees
-        the matching weights file also landed. Resuming from sidecar-step
-        ensures the trainer's optimizer state restore actually runs.
+        We glob ``training_state_step_*.pt`` because the trainer writes weights
+        before the state sidecar (``trainer.py:1121``/``1127`` then ``:1135``); a
+        kill between those leaves orphan weights without optimizer/scheduler
+        state. The sidecar is written atomically via tmp+rename in
+        ``_save_training_state``, so its presence guarantees the matching
+        weights file also landed.
+
+        The caller passes the returned ``weights_path`` as ``model.load_checkpoint``
+        rather than the checkpoints directory, so the trainer's ``_find_checkpoint``
+        can't fall back to a newer orphan weights file (which would bypass the
+        atomic-resume guarantee and make ``_resolve_resume_state`` silently return
+        ``(0, None)``, losing optimizer state continuity).
         """
         if not self._ckpt_dir.is_dir():
-            return 0
-        latest = 0
+            return 0, None
+        latest_step = 0
+        latest_state_path: Path | None = None
         for p in self._ckpt_dir.rglob("training_state_step_*.pt"):
             try:
-                latest = max(latest, int(p.stem.split("step_")[1]))
+                step = int(p.stem.split("step_")[1])
             except (IndexError, ValueError):
                 continue
-        return latest
+            if step > latest_step:
+                latest_step, latest_state_path = step, p
+        if latest_state_path is None:
+            return 0, None
+        padded = f"{latest_step:05d}"
+        weights = next(latest_state_path.parent.glob(f"*_weights_step_{padded}.safetensors"), None)
+        if weights is None:
+            # Sidecar without matching weights is an unexpected half-state.
+            # Refuse to resume rather than silently start fresh.
+            logger.warning(
+                f"⚠️  Found {latest_state_path.name} with no matching weights file. "
+                f"Refusing to resume — starting from scratch."
+            )
+            return 0, None
+        return latest_step, weights
 
     def _run_loop(self, disable_progress_bars: bool, conditions_tmpfs: Path) -> None:
         total_steps = self._cfg.optimization.steps
@@ -382,21 +413,14 @@ class ShardOrchestrator:
         # samples (the trainer loops `remaining_steps * grad_accum` batches).
         samples_per_step = self._cfg.optimization.batch_size * self._cfg.optimization.gradient_accumulation_steps
 
-        # Resume: if any shard has already saved a checkpoint under this output
-        # dir, point the first shard's trainer at that checkpoints dir (it will
-        # auto-find the latest) and skip any shards whose cumulative target has
-        # already been reached.
-        completed_steps = self._latest_saved_step()
-        if completed_steps >= total_steps:
-            logger.info(
-                f"✅ Already at step {completed_steps} ≥ target {total_steps}; "
-                f"nothing to do. (Adjust optimization.steps to extend training, "
-                f"or remove {self._ckpt_dir} to start fresh.)"
-            )
-            return
+        # Resume: if any shard has already saved a (weights + state) pair under
+        # this output dir, point the first shard's trainer at the matching
+        # weights file so the trainer's resume path loads its sidecar state.
+        # Skip any shards whose cumulative target was already reached.
+        completed_steps, resume_weights = self._latest_saved_checkpoint()
         if completed_steps > 0:
             logger.info(f"🔁 Resuming orchestrator from step {completed_steps}")
-            last_checkpoint: Path | None = self._ckpt_dir
+            last_checkpoint: Path | None = resume_weights
         else:
             last_checkpoint = (
                 Path(self._cfg.model.load_checkpoint) if self._cfg.model.load_checkpoint else None
@@ -452,10 +476,12 @@ class ShardOrchestrator:
                     last_checkpoint, cumulative_target, skip_initial_validation=seen_initial
                 )
                 trainer = LtxvTrainer(shard_cfg)
-                last_checkpoint, _ = trainer.train(disable_progress_bars=disable_progress_bars)
-                # After the first successful train, subsequent shards always
-                # resume from cfg.output_dir/checkpoints (trainer auto-finds latest).
-                last_checkpoint = self._ckpt_dir
+                trainer.train(disable_progress_bars=disable_progress_bars)
+                # Re-resolve the latest complete (weights + state) pair so the
+                # next shard resumes from an atomic pair — handing over the
+                # checkpoints directory would let the trainer's _find_checkpoint
+                # glob pick an orphan weights file from a kill-in-flight write.
+                _, last_checkpoint = self._latest_saved_checkpoint()
                 seen_initial = True
 
                 if cumulative_target >= total_steps:
