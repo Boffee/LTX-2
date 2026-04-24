@@ -26,7 +26,6 @@ import contextlib
 import json
 import os
 import random
-import shutil
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -293,7 +292,7 @@ class ShardOrchestrator:
 
     def run(self, disable_progress_bars: bool = False) -> None:
         # Check completion before touching tmpfs — no point validating the
-        # mount and installing the conditions symlink just to return.
+        # mount just to return.
         completed_steps, _ = self._latest_saved_checkpoint()
         total_steps = self._cfg.optimization.steps
         if completed_steps >= total_steps:
@@ -303,43 +302,46 @@ class ShardOrchestrator:
                 f"or remove {self._ckpt_dir} to start fresh.)"
             )
             return
-        with self._tmpfs_conditions() as conditions_tmpfs:
-            self._run_loop(disable_progress_bars, conditions_tmpfs)
-
-    @contextlib.contextmanager
-    def _tmpfs_conditions(self) -> Iterator[Path]:
-        """Back ``<output>/conditions`` with a tempdir under ``tmpfs_conditions_dir``
-        via a symlink. Yields the tempdir so the caller can wipe it between shards.
-
-        Conditions never touch persistent disk: ``preprocess_dataset`` writes
-        through the symlink into the tempdir on tmpfs, which is wiped each shard.
-        Validates the tmpfs path here (not at config-load time) so configs are
-        portable across hosts.
-        """
+        # Validate tmpfs root once up front — the per-shard context just
+        # creates/cleans a tempdir under this root, so any misconfiguration
+        # should fail here rather than on every shard iteration.
         tmpfs_root = Path(self._cfg.data.tmpfs_conditions_dir)
         if not tmpfs_root.is_dir():
             raise RuntimeError(
                 f"tmpfs_conditions_dir does not exist or is not a directory: {tmpfs_root}. "
                 f"Mount the tmpfs first (e.g. /dev/shm is the Linux default)."
             )
+        logger.info(f"🗂  conditions tmpfs root: {tmpfs_root}")
+        self._run_loop(disable_progress_bars)
 
-        # Note: SIGKILL / OOM-kill bypass TemporaryDirectory's atexit cleanup,
-        # so crashed runs leave one shard's worth of conditions under
-        # tmpfs_root forever. We don't auto-sweep on entry because two
-        # independent sharded runs sharing the tmpfs would clobber each
-        # other's live tempdirs (single-GPU mode only protects against
-        # multi-process within one launch). tmpfs is wiped on reboot;
-        # otherwise: `rm -rf <tmpfs>/ltx-shard-conditions-*` manually.
+    @contextlib.contextmanager
+    def _shard_conditions_tmpfs(self) -> Iterator[Path]:
+        """Create a fresh tmpfs tempdir for one shard's text embeddings and
+        symlink ``<output>/conditions`` at it. On context exit,
+        ``TemporaryDirectory`` wipes the tempdir and the symlink is removed,
+        so the previous shard's conditions are gone before the next shard
+        begins preprocessing.
+
+        Conditions never touch persistent disk: ``preprocess_dataset`` writes
+        through the symlink into the tempdir on tmpfs.
+
+        Note: SIGKILL / OOM-kill bypass ``TemporaryDirectory.__exit__``, so a
+        hard-killed run leaves one orphan tempdir under ``tmpfs_conditions_dir``
+        forever. We don't auto-sweep on entry because independent sharded runs
+        sharing the tmpfs would clobber each other's live tempdirs. tmpfs is
+        wiped on reboot; otherwise
+        ``rm -rf <tmpfs>/ltx-shard-conditions-*`` manually.
+        """
+        tmpfs_root = Path(self._cfg.data.tmpfs_conditions_dir)
+        cond_link = self._output_dir / "conditions"
         with tempfile.TemporaryDirectory(dir=str(tmpfs_root), prefix=TMPFS_PREFIX) as cond_path_str:
             cond_path = Path(cond_path_str)
-            cond_link = self._output_dir / "conditions"
             self._install_conditions_symlink(cond_link, cond_path)
-            logger.info(f"🗂  conditions backed by tmpfs at {cond_path} (symlink: {cond_link})")
             try:
                 yield cond_path
             finally:
-                # Remove only the symlink; the tempdir itself is cleaned by the
-                # ``with`` on TemporaryDirectory.
+                # Remove only the symlink; the tempdir itself is cleaned by
+                # the ``with`` on TemporaryDirectory.
                 if cond_link.is_symlink():
                     cond_link.unlink()
 
@@ -356,17 +358,6 @@ class ShardOrchestrator:
             )
         link.parent.mkdir(parents=True, exist_ok=True)
         link.symlink_to(target, target_is_directory=True)
-
-    @staticmethod
-    def _clear_contents(d: Path) -> None:
-        """Delete everything inside ``d`` without removing ``d`` itself.
-        Used to wipe tmpfs conditions between shards without touching the
-        mount point or the enclosing symlink."""
-        for item in d.iterdir():
-            if item.is_dir() and not item.is_symlink():
-                shutil.rmtree(item)
-            else:
-                item.unlink()
 
     def _latest_saved_checkpoint(self) -> tuple[int, Path | None]:
         """Return ``(step, weights_path)`` for the latest complete (weights + state)
@@ -410,7 +401,7 @@ class ShardOrchestrator:
             return 0, None
         return latest_step, weights
 
-    def _run_loop(self, disable_progress_bars: bool, conditions_tmpfs: Path) -> None:
+    def _run_loop(self, disable_progress_bars: bool) -> None:
         total_steps = self._cfg.optimization.steps
         # One optimization step consumes batch_size * gradient_accumulation_steps
         # samples (the trainer loops `remaining_steps * grad_accum` batches).
@@ -459,37 +450,40 @@ class ShardOrchestrator:
                     f"samples={len(shard_rows)} target_step={cumulative_target}/{total_steps}"
                 )
 
-                # Fresh conditions tmpfs for each shard — only one shard's text
-                # embeddings occupy RAM at a time.
-                self._clear_contents(conditions_tmpfs)
+                # Fresh tmpfs tempdir scoped to this shard — only one shard's
+                # text embeddings occupy RAM at a time. Context exit wipes
+                # the tempdir before the next shard starts.
+                with self._shard_conditions_tmpfs():
+                    self._preprocess_shard(shard_rows)
 
-                self._preprocess_shard(shard_rows)
+                    trainable = self._count_trainable_rows(shard_rows)
+                    batch_size = self._cfg.optimization.batch_size
+                    if trainable < batch_size:
+                        raise RuntimeError(
+                            f"Shard cycle={cycle} idx={shard_idx + 1} produced {trainable} "
+                            f"trainable samples; need >= batch_size ({batch_size}) so the "
+                            f"trainer's drop_last=True dataloader yields at least one batch. "
+                            f"Of {len(shard_rows)} input rows, the rest were dropped during "
+                            f"preprocessing (frame-count filter, encode failures, missing "
+                            f"audio under with_audio=True, etc.). Check warnings above for "
+                            f"per-sample errors; fix the metadata or the underlying media "
+                            f"files and re-run."
+                        )
 
-                trainable = self._count_trainable_rows(shard_rows)
-                batch_size = self._cfg.optimization.batch_size
-                if trainable < batch_size:
-                    raise RuntimeError(
-                        f"Shard cycle={cycle} idx={shard_idx + 1} produced {trainable} "
-                        f"trainable samples; need >= batch_size ({batch_size}) so the "
-                        f"trainer's drop_last=True dataloader yields at least one batch. "
-                        f"Of {len(shard_rows)} input rows, the rest were dropped during "
-                        f"preprocessing (frame-count filter, encode failures, missing "
-                        f"audio under with_audio=True, etc.). Check warnings above for "
-                        f"per-sample errors; fix the metadata or the underlying media "
-                        f"files and re-run."
+                    shard_cfg = self._build_shard_config(
+                        last_checkpoint,
+                        cumulative_target,
+                        skip_initial_validation=seen_initial,
                     )
-
-                shard_cfg = self._build_shard_config(
-                    last_checkpoint, cumulative_target, skip_initial_validation=seen_initial
-                )
-                trainer = LtxvTrainer(shard_cfg)
-                trainer.train(disable_progress_bars=disable_progress_bars)
-                # Re-resolve the latest complete (weights + state) pair so the
-                # next shard resumes from an atomic pair — handing over the
-                # checkpoints directory would let the trainer's _find_checkpoint
-                # glob pick an orphan weights file from a kill-in-flight write.
-                _, last_checkpoint = self._latest_saved_checkpoint()
-                seen_initial = True
+                    trainer = LtxvTrainer(shard_cfg)
+                    trainer.train(disable_progress_bars=disable_progress_bars)
+                    # Re-resolve the latest complete (weights + state) pair so
+                    # the next shard resumes from an atomic pair — handing
+                    # over the checkpoints directory would let the trainer's
+                    # _find_checkpoint glob pick an orphan weights file from
+                    # a kill-in-flight write.
+                    _, last_checkpoint = self._latest_saved_checkpoint()
+                    seen_initial = True
 
                 if cumulative_target >= total_steps:
                     logger.info("✅ Reached total step target — orchestrator done")
