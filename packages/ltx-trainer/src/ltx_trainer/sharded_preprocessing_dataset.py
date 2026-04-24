@@ -11,15 +11,19 @@ videos whose nearest bucket actually changed; everything else is reused. The
 suffix is mirrored on the conditions file (same bucket key as latents) so the
 pairing logic in :class:`PrecomputedDataset` keeps working.
 
-Difference from :mod:`online_dataset`: both latents and text embeddings are
-written to disk (vs. embeddings kept only in RAM). This sets up for future
-tmpfs-backed condition directories where the on-disk representation is mounted
-in memory for faster retrieval.
+Optional tmpfs conditions: with ``tmpfs_conditions=True``, text embeddings are
+written to ``/dev/shm/`` instead of disk and wiped at the start of each shard.
+Text encoding is cheap to recompute but expensive to read/write through normal
+disk I/O, so memory-backed file storage gives reads at RAM speed without
+changing the dataset's file-based interface.
 """
 
 from __future__ import annotations
 
+import atexit
 import json
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -46,6 +50,8 @@ CAPTION_COLUMN = "caption"
 PRECOMPUTED_DIR_NAME = ".precomputed"
 LATENTS_DIR_NAME = "latents"
 CONDITIONS_DIR_NAME = "conditions"
+TMPFS_ROOT = Path("/dev/shm")
+TMPFS_DIR_PREFIX = "ltx-trainer-conditions-"
 
 
 class ShardPreprocessingDataset(Dataset):
@@ -74,6 +80,12 @@ class ShardPreprocessingDataset(Dataset):
         Samples per shard. ``None`` = preprocess the entire dataset in one shard.
     seed:
         Random seed for shard shuffling.
+    tmpfs_conditions:
+        When ``True``, write text embeddings to a fresh ``/dev/shm/`` directory
+        instead of the persistent ``.precomputed/conditions/`` tree, and wipe
+        them at the start of each shard. Latents stay on disk. Best for cases
+        where text encoding is cheap to recompute but disk I/O on the
+        conditions files is the bottleneck.
     """
 
     def __init__(
@@ -83,12 +95,18 @@ class ShardPreprocessingDataset(Dataset):
         resolution_buckets: list[tuple[int, int, int]],
         shard_size: int | None = None,
         seed: int = 42,
+        tmpfs_conditions: bool = False,
     ) -> None:
         super().__init__()
         self._dataset_file = Path(dataset_file)
         self._output_root = Path(output_dir).expanduser().resolve() / PRECOMPUTED_DIR_NAME
         self._latents_dir = self._output_root / LATENTS_DIR_NAME
-        self._conditions_dir = self._output_root / CONDITIONS_DIR_NAME
+        self._tmpfs_conditions = tmpfs_conditions
+        if tmpfs_conditions:
+            self._conditions_dir = _make_tmpfs_conditions_dir()
+            logger.info(f"Conditions in tmpfs at {self._conditions_dir} (wiped between shards)")
+        else:
+            self._conditions_dir = self._output_root / CONDITIONS_DIR_NAME
         self._resolution_buckets = resolution_buckets
         self._max_frames = max_frames_in_buckets(resolution_buckets)
 
@@ -214,26 +232,29 @@ class ShardPreprocessingDataset(Dataset):
         start = time.monotonic()
 
         self._latents_dir.mkdir(parents=True, exist_ok=True)
+        if self._tmpfs_conditions:
+            # Drop the previous shard's tmpfs conditions before encoding the new one,
+            # so memory use is bounded by a single shard's worth of text embeddings.
+            shutil.rmtree(self._conditions_dir, ignore_errors=True)
         self._conditions_dir.mkdir(parents=True, exist_ok=True)
 
         shard_files: list[tuple[Path, Path]] = []
         skipped = 0
-        reused = 0
+        latents_reused = 0
         for global_idx in shard_indices:
             sample = self._samples[global_idx]
             try:
                 latents_path, conditions_path, bucket = self._resolve_paths(sample)
-                if latents_path.exists() and conditions_path.exists():
-                    reused += 1
+                if latents_path.exists():
+                    latents_reused += 1
                 else:
-                    if not latents_path.exists():
-                        self._encode_video_to_disk(
-                            sample, latents_path, bucket, vae_encoder, device, dtype
-                        )
-                    if not conditions_path.exists():
-                        self._encode_text_to_disk(
-                            sample, conditions_path, text_encoder, embeddings_processor
-                        )
+                    self._encode_video_to_disk(
+                        sample, latents_path, bucket, vae_encoder, device, dtype
+                    )
+                if not conditions_path.exists():
+                    self._encode_text_to_disk(
+                        sample, conditions_path, text_encoder, embeddings_processor
+                    )
             except Exception as e:
                 logger.warning(f"Skipping sample {global_idx} ({sample['video_path']}): {e}")
                 skipped += 1
@@ -243,14 +264,14 @@ class ShardPreprocessingDataset(Dataset):
         self._shard_files = shard_files
         elapsed = time.monotonic() - start
         info_parts: list[str] = []
-        if reused:
-            info_parts.append(f"{reused} from cache")
+        if latents_reused:
+            info_parts.append(f"{latents_reused} latents from cache")
         if skipped:
             info_parts.append(f"{skipped} skipped")
         info_str = f" ({', '.join(info_parts)})" if info_parts else ""
         logger.info(
             f"Preprocessed shard {shard_num}/{num_shards}: {len(shard_files)} samples{info_str} "
-            f"→ {self._output_root} in {elapsed:.1f}s"
+            f"in {elapsed:.1f}s"
         )
 
         if not shard_files:
@@ -339,3 +360,20 @@ def _atomic_save(obj: dict[str, Any], path: Path) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(obj, tmp)
     tmp.replace(path)
+
+
+def _make_tmpfs_conditions_dir() -> Path:
+    """Create a fresh tmpfs-backed directory for ephemeral text embeddings.
+
+    Uses ``/dev/shm`` (the standard Linux tmpfs mount) and registers an atexit
+    handler to clean up on normal interpreter shutdown. Hard kills (SIGKILL,
+    OOM kill) leave the directory behind; ``/dev/shm/ltx-trainer-conditions-*``
+    can be safely deleted manually if it accumulates.
+    """
+    if not TMPFS_ROOT.is_dir():
+        raise RuntimeError(
+            f"tmpfs_conditions=True requires {TMPFS_ROOT} (Linux tmpfs); not found on this system"
+        )
+    tmp_dir = Path(tempfile.mkdtemp(dir=str(TMPFS_ROOT), prefix=TMPFS_DIR_PREFIX))
+    atexit.register(shutil.rmtree, tmp_dir, ignore_errors=True)
+    return tmp_dir

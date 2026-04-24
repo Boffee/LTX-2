@@ -204,6 +204,8 @@ data:
   # resolution_buckets: "448x256x25"
   # shard_size: 500
   # shard_preprocessing_output_dir: "/path/to/dataset/dir"
+  # tmpfs_conditions: true   # write text embeddings to /dev/shm and wipe per shard
+                             # (cheap to recompute, fast to read; latents stay on disk)
 
 # -----------------------------------------------------------------------------
 # Validation Configuration

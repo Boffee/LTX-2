@@ -259,7 +259,10 @@ data:
   resolution_buckets: "448x256x25"
   shard_size: 500
   shard_preprocessing_output_dir: "/path/to/dataset/dir"  # writes .precomputed/{latents,conditions} here
+  tmpfs_conditions: false                                  # see below
 ```
+
+**`tmpfs_conditions`** (sharded preprocessing only): when `true`, text embeddings are written to a fresh `/dev/shm/ltx-trainer-conditions-*` directory (Linux tmpfs) instead of disk and wiped at the start of each shard. Latents still go to persistent disk. Use this when text encoding is cheap to recompute but conditions disk I/O is the bottleneck (e.g., slow shared filesystems). Memory cost is bounded by one shard's worth of text embeddings; the directory is cleaned up at process exit (best-effort — hard kills leave it behind, safe to delete manually).
 
 **Key parameters:**
 
@@ -272,6 +275,7 @@ data:
 | `dataset_metadata_file`          | online / sharded prep. | Path to CSV/JSON/JSONL with columns `media_path` (video paths) and `caption` (text). Selects a metadata-file mode.             |
 | `resolution_buckets`             | online / sharded prep. | Resolution buckets as `"WxHxF;WxHxF;..."`. Each video is matched to the nearest bucket by aspect ratio.                        |
 | `shard_preprocessing_output_dir` | sharded prep.          | When set, switches to sharded preprocessing mode and writes `.precomputed/{latents,conditions}/` here.                         |
+| `tmpfs_conditions`               | sharded prep.          | When `true`, route text embeddings to `/dev/shm` and wipe per shard. Latents stay on disk.                                     |
 
 **Metadata-file mode constraints** (both online and sharded preprocessing): single-GPU only; incompatible with `training_strategy.with_audio=true`, `training_strategy.name=video_to_video`, and `acceleration.load_text_encoder_in_8bit=true`.
 
