@@ -174,7 +174,9 @@ class ShardOrchestrator:
         finally:
             tmp_meta.unlink(missing_ok=True)
 
-    def _build_shard_config(self, load_checkpoint: Path | None, target_steps: int) -> LtxTrainerConfig:
+    def _build_shard_config(
+        self, load_checkpoint: Path | None, target_steps: int, *, skip_initial_validation: bool
+    ) -> LtxTrainerConfig:
         """Config passed to each per-shard ``LtxvTrainer``. Points at the shard
         output dir, resumes from the previous shard's final checkpoint, and sets
         ``optimization.steps`` to the cumulative target so the trainer stops at
@@ -190,6 +192,10 @@ class ShardOrchestrator:
         same-step interval-save + final-save pattern can unlink the file the
         orchestrator needs for handoff. Sharded runs accumulate all per-shard
         checkpoints under the output dir; clean up manually if disk fills.
+
+        ``validation.skip_initial_validation`` is forced True on every shard
+        except the very first trainer invocation of a fresh run — otherwise the
+        trainer's per-call initial validation fires at every shard boundary.
         """
         cfg = self._cfg.model_copy(deep=True)
         cfg.data.preprocessed_data_root = str(self._output_dir)
@@ -200,6 +206,8 @@ class ShardOrchestrator:
         cfg.model.load_checkpoint = str(load_checkpoint) if load_checkpoint else None
         cfg.optimization.steps = target_steps
         cfg.checkpoints.keep_last_n = -1  # see docstring
+        if skip_initial_validation:
+            cfg.validation.skip_initial_validation = True
 
         total_steps = self._cfg.optimization.steps
         key = _SCHEDULER_TOTAL_KEY.get(cfg.optimization.scheduler_type)
@@ -308,6 +316,13 @@ class ShardOrchestrator:
                 Path(self._cfg.model.load_checkpoint) if self._cfg.model.load_checkpoint else None
             )
 
+        # Initial validation should fire once at the start of a truly fresh
+        # run (no checkpoint on disk) — let the user's skip_initial_validation
+        # govern that first one. Every subsequent trainer invocation, including
+        # any after a process restart, must skip it; otherwise we'd validate
+        # at every shard boundary.
+        seen_initial = completed_steps > 0
+
         cumulative_target = 0
         cycle = 0
         while cumulative_target < total_steps:
@@ -337,12 +352,15 @@ class ShardOrchestrator:
 
                 self._preprocess_shard(shard_rows)
 
-                shard_cfg = self._build_shard_config(last_checkpoint, cumulative_target)
+                shard_cfg = self._build_shard_config(
+                    last_checkpoint, cumulative_target, skip_initial_validation=seen_initial
+                )
                 trainer = LtxvTrainer(shard_cfg)
                 last_checkpoint, _ = trainer.train(disable_progress_bars=disable_progress_bars)
                 # After the first successful train, subsequent shards always
                 # resume from output_dir/checkpoints (trainer auto-finds latest).
                 last_checkpoint = ckpt_dir
+                seen_initial = True
 
                 if cumulative_target >= total_steps:
                     logger.info("✅ Reached total step target — orchestrator done")
