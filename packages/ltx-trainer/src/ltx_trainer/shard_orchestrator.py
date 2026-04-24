@@ -193,6 +193,13 @@ class ShardOrchestrator:
         orchestrator needs for handoff. Sharded runs accumulate all per-shard
         checkpoints under the output dir; clean up manually if disk fills.
 
+        ``checkpoints.save_training_state`` is forced to "full" so the optimizer
+        state survives the per-shard trainer reinstantiation. With the default
+        "minimal", Adam's m/v moments would reset every shard boundary and the
+        adaptive LR would spike (lr/sqrt(v+eps) with v=0). Adds ~4× the LoRA
+        weight size to each saved state file (~500MB for default LoRA configs;
+        switch to optimizer_type="adamw8bit" to cut that ~4×).
+
         ``validation.skip_initial_validation`` is forced True on every shard
         except the very first trainer invocation of a fresh run — otherwise the
         trainer's per-call initial validation fires at every shard boundary.
@@ -206,6 +213,7 @@ class ShardOrchestrator:
         cfg.model.load_checkpoint = str(load_checkpoint) if load_checkpoint else None
         cfg.optimization.steps = target_steps
         cfg.checkpoints.keep_last_n = -1  # see docstring
+        cfg.checkpoints.save_training_state = "full"  # see docstring
         if skip_initial_validation:
             cfg.validation.skip_initial_validation = True
 
