@@ -19,10 +19,13 @@ orchestrates calls between them.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import random
+import shutil
 import sys
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 
 import pandas as pd
@@ -162,6 +165,60 @@ class ShardOrchestrator:
         return cfg
 
     def run(self, disable_progress_bars: bool = False) -> None:
+        with self._maybe_tmpfs_conditions() as conditions_tmpfs:
+            self._run_loop(disable_progress_bars, conditions_tmpfs)
+
+    @contextlib.contextmanager
+    def _maybe_tmpfs_conditions(self) -> Iterator[Path | None]:
+        """If tmpfs_conditions_dir is set, back <output>/conditions with a tempdir
+        on that mount via a symlink. Yields the tempdir so the caller can wipe it
+        between shards. The ``with`` block guarantees cleanup on exit."""
+        tmpfs_root = self._cfg.data.tmpfs_conditions_dir
+        if tmpfs_root is None:
+            yield None
+            return
+
+        with tempfile.TemporaryDirectory(
+            dir=str(tmpfs_root), prefix="ltx-shard-conditions-"
+        ) as cond_path_str:
+            cond_path = Path(cond_path_str)
+            cond_link = self._output_dir / "conditions"
+            self._install_conditions_symlink(cond_link, cond_path)
+            logger.info(f"🗂  conditions backed by tmpfs at {cond_path} (symlink: {cond_link})")
+            try:
+                yield cond_path
+            finally:
+                # Remove only the symlink; the tempdir itself is cleaned by the
+                # ``with`` on TemporaryDirectory.
+                if cond_link.is_symlink():
+                    cond_link.unlink()
+
+    @staticmethod
+    def _install_conditions_symlink(link: Path, target: Path) -> None:
+        """Ensure ``link → target``. Refuses to overwrite a real directory to
+        avoid stomping on an earlier non-tmpfs run's cached conditions."""
+        if link.is_symlink():
+            link.unlink()
+        elif link.exists():
+            raise RuntimeError(
+                f"{link} already exists and is not a symlink — refusing to overwrite. "
+                f"Remove it manually if you want to switch to tmpfs_conditions_dir."
+            )
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target, target_is_directory=True)
+
+    @staticmethod
+    def _clear_contents(d: Path) -> None:
+        """Delete everything inside ``d`` without removing ``d`` itself.
+        Used to wipe tmpfs conditions between shards without touching the
+        mount point or the enclosing symlink."""
+        for item in d.iterdir():
+            if item.is_dir() and not item.is_symlink():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+
+    def _run_loop(self, disable_progress_bars: bool, conditions_tmpfs: Path | None) -> None:
         total_steps = self._cfg.optimization.steps
         shard_size = self._cfg.data.shard_size
         batch_size = self._cfg.optimization.batch_size
@@ -180,6 +237,11 @@ class ShardOrchestrator:
                     f"🧩 Shard cycle={cycle} idx={shard_idx + 1}/{len(groups)} "
                     f"samples={len(shard_rows)} target_step={cumulative_target}/{total_steps}"
                 )
+
+                # Fresh conditions tmpfs for each shard — only one shard's text
+                # embeddings occupy RAM at a time.
+                if conditions_tmpfs is not None:
+                    self._clear_contents(conditions_tmpfs)
 
                 self._preprocess_shard(shard_rows)
 
