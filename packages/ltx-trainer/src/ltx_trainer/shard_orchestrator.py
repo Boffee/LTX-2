@@ -278,9 +278,9 @@ class ShardOrchestrator:
 
     def _run_loop(self, disable_progress_bars: bool, conditions_tmpfs: Path | None) -> None:
         total_steps = self._cfg.optimization.steps
-        shard_size = self._cfg.data.shard_size
-        batch_size = self._cfg.optimization.batch_size
-        steps_per_shard = max(1, shard_size // batch_size)
+        # One optimization step consumes batch_size * gradient_accumulation_steps
+        # samples (the trainer loops `remaining_steps * grad_accum` batches).
+        samples_per_step = self._cfg.optimization.batch_size * self._cfg.optimization.gradient_accumulation_steps
 
         # Resume: if any shard has already saved a checkpoint under this output
         # dir, point the first shard's trainer at that checkpoints dir (it will
@@ -301,7 +301,14 @@ class ShardOrchestrator:
         while cumulative_target < total_steps:
             groups = self._shard_groups(cycle)
             for shard_idx, shard_rows in enumerate(groups):
-                cumulative_target = min(cumulative_target + steps_per_shard, total_steps)
+                # Steps budget tracks actual shard size: a merged trailing
+                # shard (up to 2*shard_size-1 rows) gets proportionally more
+                # training than a standard shard, and shard_size > total_samples
+                # degenerates cleanly to a single-shard cycle. Divide by
+                # samples_per_step (= batch_size * grad_accum) because the
+                # trainer counts optimization steps, not batch iterations.
+                steps_this_shard = max(1, len(shard_rows) // samples_per_step)
+                cumulative_target = min(cumulative_target + steps_this_shard, total_steps)
 
                 # Skip shards whose work is already covered by the latest checkpoint.
                 if cumulative_target <= completed_steps:
