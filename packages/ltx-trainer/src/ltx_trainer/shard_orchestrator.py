@@ -466,13 +466,17 @@ class ShardOrchestrator:
                 self._preprocess_shard(shard_rows)
 
                 trainable = self._count_trainable_rows(shard_rows)
-                if trainable == 0:
+                batch_size = self._cfg.optimization.batch_size
+                if trainable < batch_size:
                     raise RuntimeError(
-                        f"Shard cycle={cycle} idx={shard_idx + 1} produced zero trainable "
-                        f"samples — all {len(shard_rows)} input rows were dropped during "
-                        f"preprocessing (frame-count filter, encode failures, missing audio "
-                        f"under with_audio=True, etc.). Check warnings above for per-sample "
-                        f"errors; fix the metadata or the underlying media files and re-run."
+                        f"Shard cycle={cycle} idx={shard_idx + 1} produced {trainable} "
+                        f"trainable samples; need >= batch_size ({batch_size}) so the "
+                        f"trainer's drop_last=True dataloader yields at least one batch. "
+                        f"Of {len(shard_rows)} input rows, the rest were dropped during "
+                        f"preprocessing (frame-count filter, encode failures, missing "
+                        f"audio under with_audio=True, etc.). Check warnings above for "
+                        f"per-sample errors; fix the metadata or the underlying media "
+                        f"files and re-run."
                     )
 
                 shard_cfg = self._build_shard_config(
