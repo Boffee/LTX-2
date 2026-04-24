@@ -199,7 +199,7 @@ class DataConfig(ConfigBaseModel):
         ge=0,
     )
 
-    # --- Sharded preprocessing mode (driven by scripts/train.py's ShardOrchestrator) ---
+    # --- Sharded preprocessing mode (driven by scripts/train_sharded.py) ---
 
     dataset_metadata_file: str | Path | None = Field(
         default=None,
