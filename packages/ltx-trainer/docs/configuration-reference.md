@@ -262,7 +262,7 @@ data:
 | `dataset_metadata_file`  | online      | Path to CSV/JSON/JSONL with columns `media_path` (video paths) and `caption` (text). Triggers online encoding mode.  |
 | `resolution_buckets`     | online      | Resolution buckets as `"WxHxF;WxHxF;..."`. Each video is matched to the nearest bucket by aspect ratio.              |
 
-**Online mode constraints**: single-GPU only; incompatible with `training_strategy.with_audio=true`, `training_strategy.name=video_to_video`, and `acceleration.load_text_encoder_in_8bit=true`.
+**Online mode constraints**: single-GPU only; incompatible with `training_strategy.name=video_to_video` and `acceleration.load_text_encoder_in_8bit=true`. Audio-video training (`training_strategy.with_audio=true`) is supported — audio latents are cached to `.audio_latent_cache/` next to the metadata file, mirroring the precomputed layout. Videos without an audio track are skipped with a warning.
 
 ### ValidationConfig
 

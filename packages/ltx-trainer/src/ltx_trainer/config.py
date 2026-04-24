@@ -632,14 +632,9 @@ class LtxTrainerConfig(ConfigBaseModel):
 
             parse_resolution_buckets(self.data.resolution_buckets)
 
-            # Audio training is not yet supported in online mode — OnlineEncodingDataset
-            # does not produce audio_latents, which the training strategy requires.
+            # Video-to-video strategy needs reference videos, which the online
+            # encoder doesn't handle yet.
             strategy = self.training_strategy
-            if getattr(strategy, "with_audio", False):
-                raise ValueError(
-                    "Audio training (with_audio=True) is not supported in online encoding mode. "
-                    "Use precomputed mode (preprocessed_data_root) for audio training."
-                )
             if getattr(strategy, "name", None) == "video_to_video":
                 raise ValueError(
                     "Video-to-video training strategy is not supported in online encoding mode. "
@@ -653,5 +648,15 @@ class LtxTrainerConfig(ConfigBaseModel):
                     "load_text_encoder_in_8bit is not compatible with online encoding mode "
                     "(bitsandbytes quantized models cannot be moved between CPU and GPU)."
                 )
+
+        # Audio training requires batch_size=1 because audio latent length depends on
+        # source FPS (target_duration = target_frames / fps), so two videos with the
+        # same video bucket but different FPS produce different-length audio latents
+        # that the default DataLoader collation can't stack.
+        if getattr(self.training_strategy, "with_audio", False) and self.optimization.batch_size != 1:
+            raise ValueError(
+                "with_audio=True requires optimization.batch_size=1 (audio latent length varies "
+                "with source FPS and cannot be collated across a batch)."
+            )
 
         return self

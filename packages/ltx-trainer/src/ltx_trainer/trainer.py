@@ -526,6 +526,29 @@ class LtxvTrainer:
         if self._vocoder is not None:
             self._vocoder.requires_grad_(False)
 
+        # Audio VAE encoder + processor for online audio encoding.
+        # Only needed when running audio training in online mode (precomputed audio
+        # latents are produced by process_dataset.py --with-audio ahead of time).
+        self._audio_vae_encoder = None
+        self._audio_processor = None
+        if self._config.data.dataset_metadata_file is not None and self._training_strategy.requires_audio:
+            from ltx_core.model.audio_vae import AudioProcessor  # noqa: PLC0415
+            from ltx_trainer.model_loader import load_audio_vae_encoder  # noqa: PLC0415
+
+            # Audio VAE runs in float32 for quality (matches process_videos.py).
+            self._audio_vae_encoder = load_audio_vae_encoder(
+                checkpoint_path=self._config.model.model_path,
+                device="cpu",
+                dtype=torch.float32,
+            )
+            self._audio_vae_encoder.requires_grad_(False)
+            self._audio_processor = AudioProcessor(
+                target_sample_rate=self._audio_vae_encoder.sample_rate,
+                mel_bins=self._audio_vae_encoder.mel_bins,
+                mel_hop_length=self._audio_vae_encoder.mel_hop_length,
+                n_fft=self._audio_vae_encoder.n_fft,
+            )
+
     def _collect_trainable_params(self) -> None:
         """Collect trainable parameters based on training mode."""
         if self._config.model.training_mode == "lora":
@@ -833,6 +856,7 @@ class LtxvTrainer:
             dataset_file=self._config.data.dataset_metadata_file,
             resolution_buckets=buckets,
             shard_size=self._config.data.shard_size,
+            with_audio=self._training_strategy.requires_audio,
             seed=self._config.seed,
         )
         total = self._dataset.total_samples
@@ -861,32 +885,46 @@ class LtxvTrainer:
 
     @torch.inference_mode()
     def _encode_current_shard(self) -> None:
-        """Encode the current shard's videos + captions.
+        """Encode the current shard's videos + captions (+ audio when enabled).
 
-        Moves TE and VAE encoder to GPU for encoding, then back to CPU. The
-        ``try/finally`` ensures models are restored to CPU even if encoding fails,
-        so a transient error does not leave the GPU in an unexpected state.
+        Moves TE and VAE encoder (and audio VAE + processor if present) to GPU for
+        encoding, then back to CPU. The ``try/finally`` ensures models are restored
+        to CPU even if encoding fails, so a transient error does not leave the GPU
+        in an unexpected state.
         """
         device = self._accelerator.device
         te = self._text_encoder
         vae_enc = self._vae_encoder
         feat_ext = self._embeddings_processor.feature_extractor
+        audio_vae = self._audio_vae_encoder
+        audio_proc = self._audio_processor
 
-        te.to(device)
-        vae_enc.to(device)
-        feat_ext.to(device)
+        # The try/finally wraps the device moves too — if any .to(device) OOMs, we
+        # still attempt to move everything back to CPU and release GPU memory.
         try:
+            te.to(device)
+            vae_enc.to(device)
+            feat_ext.to(device)
+            if audio_vae is not None:
+                audio_vae.to(device)
+                audio_proc.to(device)
+
             self._dataset.encode_shard(
                 vae_encoder=vae_enc,
                 text_encoder=te,
                 embeddings_processor=self._embeddings_processor,
                 device=device,
                 dtype=torch.bfloat16,
+                audio_vae_encoder=audio_vae,
+                audio_processor=audio_proc,
             )
         finally:
             te.to("cpu")
             vae_enc.to("cpu")
             feat_ext.to("cpu")
+            if audio_vae is not None:
+                audio_vae.to("cpu")
+                audio_proc.to("cpu")
             free_gpu_memory()
 
         # Ensure enough samples survived encoding to produce at least one batch

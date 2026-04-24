@@ -24,6 +24,7 @@ from torch.utils.data import Dataset
 from ltx_trainer import logger
 from ltx_trainer.shard_manager import ShardManager
 from ltx_trainer.video_preprocessing import (
+    VAE_TEMPORAL_FACTOR,
     buckets_fingerprint,
     find_nearest_bucket,
     max_frames_in_buckets,
@@ -36,6 +37,7 @@ from ltx_trainer.video_utils import read_video
 VIDEO_COLUMN = "media_path"
 CAPTION_COLUMN = "caption"
 LATENT_CACHE_DIR_NAME = ".latent_cache"
+AUDIO_LATENT_CACHE_DIR_NAME = ".audio_latent_cache"
 
 
 class OnlineEncodingDataset(Dataset):
@@ -56,6 +58,15 @@ class OnlineEncodingDataset(Dataset):
         nearest bucket by aspect ratio, then resized and cropped to that exact size.
     shard_size:
         Samples per shard. ``None`` = encode everything at once.
+    with_audio:
+        When True, also extract and encode audio per sample. ``encode_shard`` must
+        then be called with ``audio_vae_encoder`` and ``audio_processor``. Videos
+        without an audio track are dropped with a warning — the training strategy
+        expects every batch to contain paired audio latents. This matches the
+        effective behavior of precomputed mode: ``process_dataset.py --with-audio``
+        only writes audio ``.pt`` files for videos that have audio, and
+        ``PrecomputedDataset`` filters out samples missing any required source at
+        load time.
     seed:
         Random seed for shard shuffling.
     """
@@ -65,12 +76,15 @@ class OnlineEncodingDataset(Dataset):
         dataset_file: str | Path,
         resolution_buckets: list[tuple[int, int, int]],
         shard_size: int | None = None,
+        with_audio: bool = False,
         seed: int = 42,
     ) -> None:
         super().__init__()
         self._dataset_file = Path(dataset_file)
         self._resolution_buckets = resolution_buckets
+        self._with_audio = with_audio
         self._latent_cache_dir = self._dataset_file.parent / LATENT_CACHE_DIR_NAME
+        self._audio_latent_cache_dir = self._dataset_file.parent / AUDIO_LATENT_CACHE_DIR_NAME
         self._buckets_fp = buckets_fingerprint(resolution_buckets)
         self._max_frames = max_frames_in_buckets(resolution_buckets)
 
@@ -164,13 +178,20 @@ class OnlineEncodingDataset(Dataset):
         embeddings_processor: nn.Module,
         device: torch.device,
         dtype: torch.dtype = torch.bfloat16,
+        audio_vae_encoder: nn.Module | None = None,
+        audio_processor: nn.Module | None = None,
     ) -> None:
-        """Encode the current shard's videos + captions.
+        """Encode the current shard's videos + captions (+ audio when enabled).
 
         Video latents are cached to disk (only encoded once per bucket config).
+        Audio latents are cached to a separate disk directory (mirrors process_dataset.py).
         Text embeddings are computed fresh and kept in memory only.
-        Samples that fail to load/encode are skipped with a warning.
+        Samples that fail to load/encode (including missing audio tracks) are skipped
+        with a warning.
         """
+        if self._with_audio and (audio_vae_encoder is None or audio_processor is None):
+            raise ValueError("with_audio=True requires audio_vae_encoder and audio_processor")
+
         shard_indices = self._shards.current_shard
         shard_num = self._shards.state[1] + 1
         num_shards = self._shards.num_shards
@@ -184,15 +205,20 @@ class OnlineEncodingDataset(Dataset):
             try:
                 latent_data = self._encode_or_load_video(sample, vae_encoder, device, dtype)
                 text_data = self._encode_text(sample, text_encoder, embeddings_processor)
+                entry = {
+                    "latents": latent_data,
+                    "conditions": text_data,
+                    "idx": global_idx,
+                }
+                if self._with_audio:
+                    entry["audio_latents"] = self._encode_or_load_audio(
+                        sample, latent_data, audio_vae_encoder, audio_processor, device
+                    )
             except Exception as e:
                 logger.warning(f"Skipping sample {global_idx} ({sample['video_path']}): {e}")
                 skipped += 1
                 continue
-            cache[local_idx] = {
-                "latents": latent_data,
-                "conditions": text_data,
-                "idx": global_idx,
-            }
+            cache[local_idx] = entry
             local_idx += 1
 
         self._memory_cache = cache
@@ -273,6 +299,82 @@ class OnlineEncodingDataset(Dataset):
             result["audio_prompt_embeds"] = audio_embeds[0].cpu().contiguous()
         return result
 
+    def _encode_or_load_audio(
+        self,
+        sample: dict[str, str],
+        latent_data: dict[str, Any],
+        audio_vae_encoder: nn.Module,
+        audio_processor: nn.Module,
+        device: torch.device,
+    ) -> dict[str, Any]:
+        """Encode audio with the audio VAE, or load from disk cache if already encoded.
+
+        Raises if the video has no audio track (caller skips the sample).
+        """
+        from ltx_core.types import Audio
+
+        video_path = Path(sample["video_path"])
+        cache_path = self._get_audio_latent_cache_path(video_path)
+
+        if cache_path.exists():
+            return torch.load(cache_path, map_location="cpu", weights_only=True)
+
+        # Derive the source-space target duration from the cached video metadata.
+        # This matches process_videos.py: audio is trimmed/padded to exactly match
+        # the processed video's duration.
+        source_frames = (latent_data["num_frames"] - 1) * VAE_TEMPORAL_FACTOR + 1
+        target_duration = source_frames / latent_data["fps"]
+
+        waveform, sample_rate = self._extract_audio_waveform(video_path, target_duration)
+
+        vae_dtype = next(audio_vae_encoder.parameters()).dtype
+        # torchaudio.load returns [C, S]; audio VAE expects [B, C, S].
+        waveform = waveform.to(device=device, dtype=vae_dtype).unsqueeze(0)
+
+        duration = waveform.shape[-1] / sample_rate
+        mel_spectrogram = audio_processor.waveform_to_mel(
+            Audio(waveform=waveform, sampling_rate=sample_rate)
+        ).to(dtype=vae_dtype)
+
+        with torch.inference_mode():
+            latents = audio_vae_encoder(mel_spectrogram)
+
+        _, _, time_steps, freq_bins = latents.shape
+        audio_latent_data = {
+            "latents": latents.squeeze(0).cpu().contiguous(),  # [C, T, F]
+            "num_time_steps": time_steps,
+            "frequency_bins": freq_bins,
+            "duration": duration,
+        }
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        torch.save(audio_latent_data, tmp_path)
+        tmp_path.replace(cache_path)
+        return audio_latent_data
+
+    @staticmethod
+    def _extract_audio_waveform(video_path: Path, target_duration: float) -> tuple[Tensor, int]:
+        """Extract audio waveform from a video file, trimmed/padded to target_duration.
+
+        Raises ValueError if the video has no audio track.
+        """
+        import torchaudio
+
+        try:
+            waveform, sample_rate = torchaudio.load(str(video_path))
+        except Exception as e:
+            raise ValueError(f"could not read audio track: {e}") from e
+
+        target_samples = int(target_duration * sample_rate)
+        current_samples = waveform.shape[-1]
+        if current_samples > target_samples:
+            waveform = waveform[..., :target_samples]
+        elif current_samples < target_samples:
+            pad = target_samples - current_samples
+            waveform = torch.nn.functional.pad(waveform, (0, pad))
+        return waveform, sample_rate
+
     # ------------------------------------------------------------------
     # Cache keying
     # ------------------------------------------------------------------
@@ -286,3 +388,9 @@ class OnlineEncodingDataset(Dataset):
         key_material = f"{video_path.resolve()}|{self._buckets_fp}".encode()
         digest = hashlib.sha256(key_material).hexdigest()[:16]
         return self._latent_cache_dir / f"{video_path.stem}_{digest}.pt"
+
+    def _get_audio_latent_cache_path(self, video_path: Path) -> Path:
+        """Audio latent cache path. Keyed by path + bucket (audio duration depends on target frames)."""
+        key_material = f"{video_path.resolve()}|{self._buckets_fp}".encode()
+        digest = hashlib.sha256(key_material).hexdigest()[:16]
+        return self._audio_latent_cache_dir / f"{video_path.stem}_{digest}.pt"
