@@ -230,7 +230,7 @@ acceleration:
 
 ### DataConfig
 
-Data loading and processing configuration. Two modes are supported:
+Data loading and processing configuration. Three modes are supported:
 
 **Precomputed mode** — run `process_dataset.py` offline to produce `.pt` files, then point the trainer at them.
 
@@ -251,18 +251,29 @@ data:
   shard_size: 500
 ```
 
+**Sharded preprocessing mode** — same inputs as online mode, but each shard's latents and text embeddings are written to disk before training on the shard. Avoids running `process_dataset.py` over the full dataset up front. The output directory uses the standard `.precomputed/{latents,conditions}` layout, so it is a drop-in replacement for `preprocessed_data_root` afterwards. Samples whose output files already exist are skipped on re-shuffled shard visits. Single-GPU only.
+
+```yaml
+data:
+  dataset_metadata_file: "/path/to/dataset.json"
+  resolution_buckets: "448x256x25"
+  shard_size: 500
+  shard_preprocessing_output_dir: "/path/to/dataset/dir"  # writes .precomputed/{latents,conditions} here
+```
+
 **Key parameters:**
 
-| Parameter                | Mode        | Description                                                                                                          |
-|--------------------------|-------------|----------------------------------------------------------------------------------------------------------------------|
-| `preprocessed_data_root` | precomputed | Path to your preprocessed dataset (contains `latents/`, `conditions/`, etc.). Mutually exclusive with `dataset_metadata_file`. |
-| `num_dataloader_workers` | precomputed | Number of parallel data loading processes (0 = synchronous loading, useful when debugging)                           |
-| `cache_in_memory`        | precomputed | Cache precomputed data in system RAM to avoid repeated disk I/O. Automatically sets `num_dataloader_workers` to 0    |
-| `shard_size`             | both        | Samples per shard. Shards rotate automatically each pass. Required for online mode.                                  |
-| `dataset_metadata_file`  | online      | Path to CSV/JSON/JSONL with columns `media_path` (video paths) and `caption` (text). Triggers online encoding mode.  |
-| `resolution_buckets`     | online      | Resolution buckets as `"WxHxF;WxHxF;..."`. Each video is matched to the nearest bucket by aspect ratio.              |
+| Parameter                        | Mode                   | Description                                                                                                                    |
+|----------------------------------|------------------------|--------------------------------------------------------------------------------------------------------------------------------|
+| `preprocessed_data_root`         | precomputed            | Path to your preprocessed dataset (contains `latents/`, `conditions/`, etc.). Mutually exclusive with `dataset_metadata_file`. |
+| `num_dataloader_workers`         | precomputed            | Number of parallel data loading processes (0 = synchronous loading, useful when debugging)                                     |
+| `cache_in_memory`                | precomputed            | Cache precomputed data in system RAM to avoid repeated disk I/O. Automatically sets `num_dataloader_workers` to 0              |
+| `shard_size`                     | all                    | Samples per shard. Shards rotate automatically each pass. Required for online and sharded preprocessing modes.                 |
+| `dataset_metadata_file`          | online / sharded prep. | Path to CSV/JSON/JSONL with columns `media_path` (video paths) and `caption` (text). Selects a metadata-file mode.             |
+| `resolution_buckets`             | online / sharded prep. | Resolution buckets as `"WxHxF;WxHxF;..."`. Each video is matched to the nearest bucket by aspect ratio.                        |
+| `shard_preprocessing_output_dir` | sharded prep.          | When set, switches to sharded preprocessing mode and writes `.precomputed/{latents,conditions}/` here.                         |
 
-**Online mode constraints**: single-GPU only; incompatible with `training_strategy.with_audio=true`, `training_strategy.name=video_to_video`, and `acceleration.load_text_encoder_in_8bit=true`.
+**Metadata-file mode constraints** (both online and sharded preprocessing): single-GPU only; incompatible with `training_strategy.with_audio=true`, `training_strategy.name=video_to_video`, and `acceleration.load_text_encoder_in_8bit=true`.
 
 ### ValidationConfig
 

@@ -35,6 +35,7 @@ from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
 from ltx_trainer.datasets import PrecomputedDataset
 from ltx_trainer.online_dataset import OnlineEncodingDataset
+from ltx_trainer.sharded_preprocessing_dataset import ShardPreprocessingDataset
 from ltx_trainer.gpu_utils import free_gpu_memory, free_gpu_memory_context, get_gpu_memory_gb
 from ltx_trainer.hf_hub_utils import push_to_hub
 from ltx_trainer.model_loader import load_embeddings_processor, load_text_encoder
@@ -148,7 +149,7 @@ class LtxvTrainer:
         self._init_dataloader()
         if resuming and training_state is not None:
             self._dataset.restore_shard_state(training_state.shard_cycle, training_state.shard_idx)
-        if self._is_online_mode:
+        if self._needs_shard_encoding:
             self._encode_current_shard()
         data_iter = iter(self._dataloader)
         self._init_timestep_sampler()
@@ -204,7 +205,7 @@ class LtxvTrainer:
                     batch = next(data_iter)
                 except StopIteration:
                     self._dataset.advance_shard()
-                    if self._is_online_mode:
+                    if self._needs_shard_encoding:
                         self._encode_current_shard()
                     data_iter = iter(self._dataloader)
                     batch = next(data_iter)
@@ -780,12 +781,15 @@ class LtxvTrainer:
         """Initialize the training data loader using the strategy's data sources."""
         if self._dataset is None:
             if self._config.data.dataset_metadata_file is not None:
-                self._init_online_dataset()
+                if self._config.data.shard_preprocessing_output_dir is not None:
+                    self._init_shard_preprocessing_dataset()
+                else:
+                    self._init_online_dataset()
             else:
                 self._init_precomputed_dataset()
 
         num_workers = self._config.data.num_dataloader_workers
-        if self._is_online_mode or (self._config.data.cache_in_memory and num_workers > 0):
+        if self._needs_shard_encoding or (self._config.data.cache_in_memory and num_workers > 0):
             if num_workers > 0:
                 logger.info("Setting num_dataloader_workers=0 for in-memory caching (data served from RAM)")
             num_workers = 0
@@ -844,6 +848,33 @@ class LtxvTrainer:
         # Initial encoding is driven by train() after optional shard-state restore,
         # so we don't waste an encode on shard 0 that gets discarded on resume.
 
+    def _init_shard_preprocessing_dataset(self) -> None:
+        if self._accelerator.num_processes > 1:
+            raise ValueError(
+                "Sharded preprocessing mode is only supported on single-GPU training. "
+                "Use precomputed mode (preprocessed_data_root) for multi-GPU."
+            )
+
+        from ltx_trainer.video_preprocessing import parse_resolution_buckets
+
+        buckets = parse_resolution_buckets(self._config.data.resolution_buckets)
+
+        self._dataset = ShardPreprocessingDataset(
+            dataset_file=self._config.data.dataset_metadata_file,
+            output_dir=self._config.data.shard_preprocessing_output_dir,
+            resolution_buckets=buckets,
+            shard_size=self._config.data.shard_size,
+            seed=self._config.seed,
+        )
+        total = self._dataset.total_samples
+        shard_info = ""
+        if self._dataset.num_shards > 1:
+            shard_info = f" ({self._dataset.num_shards} shards of ~{self._config.data.shard_size})"
+        logger.debug(f"Shard preprocessing dataset with {total:,} samples{shard_info}")
+        self._validate_shard_size()
+        # Initial preprocessing is driven by train() after optional shard-state restore,
+        # so we don't waste work on shard 0 if it gets discarded on resume.
+
     def _validate_shard_size(self) -> None:
         if self._dataset.num_shards > 1:
             min_shard = self._dataset.min_shard_size
@@ -856,8 +887,9 @@ class LtxvTrainer:
                 )
 
     @property
-    def _is_online_mode(self) -> bool:
-        return isinstance(self._dataset, OnlineEncodingDataset)
+    def _needs_shard_encoding(self) -> bool:
+        """True when the dataset produces encoded samples on demand via ``encode_shard()``."""
+        return isinstance(self._dataset, (OnlineEncodingDataset, ShardPreprocessingDataset))
 
     @torch.inference_mode()
     def _encode_current_shard(self) -> None:

@@ -192,6 +192,17 @@ data:
   # dataset_metadata_file: "/path/to/dataset.json"  # columns: media_path, caption
   # resolution_buckets: "448x256x25"                # WxHxF;WxHxF;...
 
+  # --- Sharded preprocessing mode (alternative to the two above) ---
+  # Same inputs as online encoding, but each shard's latents + text embeddings
+  # are written to '<shard_preprocessing_output_dir>/.precomputed/{latents,conditions}/'
+  # before training on the shard. Avoids preprocessing the whole dataset up front
+  # while producing the standard precomputed layout (drop-in for preprocessed_data_root).
+  # Already-preprocessed samples are skipped on re-shuffled shards. Single-GPU only.
+  # dataset_metadata_file: "/path/to/dataset.json"
+  # resolution_buckets: "448x256x25"
+  # shard_size: 500
+  # shard_preprocessing_output_dir: "/path/to/dataset/dir"
+
 # -----------------------------------------------------------------------------
 # Validation Configuration
 # -----------------------------------------------------------------------------
