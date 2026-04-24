@@ -68,10 +68,17 @@ class _PinnedParamBuffer:
     def __init__(self, name: str, param: nn.Parameter) -> None:
         self.name = name
         t = param.data
+        # Force contiguous_format on the clone: fp8-quanto leaves some layers'
+        # internal _data buffers strided (likely via an internal transpose/view
+        # in the block-by-block quantizer), and the default preserve_format
+        # would carry that non-contiguity through to pin_memory(), tripping
+        # the strict is_contiguous() assert later in _PackedSlab._pack.
+        # The quanto tensor's own stride is stored separately (self.stride)
+        # and re-applied on GPU reconstruction via WeightQBytesTensor.create.
         if _QUANTO_AVAILABLE and isinstance(t, WeightQBytesTensor):
             self.is_quanto = True
-            self.pinned_data = t._data.clone().pin_memory()
-            self.pinned_scale = t._scale.clone().pin_memory()
+            self.pinned_data = t._data.clone(memory_format=torch.contiguous_format).pin_memory()
+            self.pinned_scale = t._scale.clone(memory_format=torch.contiguous_format).pin_memory()
             self.qtype = t.qtype
             self.axis = t.axis
             self.size = t.size()
@@ -84,7 +91,7 @@ class _PinnedParamBuffer:
             self.cpu_param = nn.Parameter(qt, requires_grad=False)
         else:
             self.is_quanto = False
-            self.pinned_data = t.data.clone().pin_memory()
+            self.pinned_data = t.data.clone(memory_format=torch.contiguous_format).pin_memory()
             self.pinned_scale = None
             self.qtype = self.axis = self.size = self.stride = self.act_qt = None
             self.cpu_param = nn.Parameter(self.pinned_data, requires_grad=False)
