@@ -709,8 +709,19 @@ class LtxvTrainer:
         if blocks_to_swap is not None and blocks_to_swap > 0:
             if self._accelerator.distributed_type == DistributedType.FSDP or self._accelerator.num_processes > 1:
                 raise ValueError("blocks_to_swap is only supported on single-GPU training")
+            # Pass the unwrapped base model: PeftModel.named_children() returns
+            # only ['base_model'], so the offloader's "move non-block children
+            # to GPU" loop would otherwise move the entire wrapped model —
+            # including transformer_blocks — and OOM on bf16 weights. The
+            # forward-pre hooks are attached to block modules directly, so
+            # they fire regardless of which wrapper owns the outer forward.
+            base_transformer = (
+                self._transformer.get_base_model()
+                if hasattr(self._transformer, "get_base_model")
+                else self._transformer
+            )
             self._block_offloader = TrainingBlockOffloader(
-                model=self._transformer,
+                model=base_transformer,
                 target_device=self._accelerator.device,
                 blocks_to_swap=blocks_to_swap,
                 layers_attr="transformer_blocks",

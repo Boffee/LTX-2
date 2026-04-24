@@ -58,7 +58,7 @@ def make_config(
     output_dir: str,
     blocks_to_swap: int | None = None,
     audio_learning_rate: float | None = None,
-    quantization: str = "int8-quanto",
+    quantization: str | None = "int8-quanto",
 ) -> dict:
     cfg = {
         "model": {
@@ -86,7 +86,8 @@ def make_config(
         },
         "acceleration": {
             "mixed_precision_mode": "bf16",
-            "quantization": quantization,
+            # quantization=None → pure bf16 weights, no quanto
+            "quantization": quantization if quantization != "none" else None,
             "load_text_encoder_in_8bit": True,
         },
         "data": {
@@ -238,8 +239,8 @@ def main() -> None:
         "--quantization",
         type=str,
         default="int8-quanto",
-        choices=["int8-quanto", "int4-quanto", "int2-quanto", "fp8-quanto", "fp8uz-quanto"],
-        help="Quanto precision to apply to the transformer",
+        choices=["none", "int8-quanto", "int4-quanto", "int2-quanto", "fp8-quanto", "fp8uz-quanto"],
+        help="Quanto precision to apply to the transformer; 'none' keeps bf16 weights",
     )
     args = parser.parse_args()
 
