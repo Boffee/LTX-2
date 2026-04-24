@@ -952,17 +952,16 @@ class LtxvTrainer:
         self._optimizer.zero_grad(set_to_none=True)
         free_gpu_memory()
 
-        # Teardown block offloader — validation calls .to(device) which would corrupt offloader state
-        if self._block_offloader is not None:
-            self._block_offloader.teardown()
+        # Keep the offloader active during validation — its forward-pre hooks
+        # swap blocks in/out the same way during inference as during training,
+        # so the full model never needs to sit on GPU at once. The validation
+        # sampler is told to skip its own transformer.to(device) call below.
+        offload_active = self._block_offloader is not None
 
-        try:
-            return self._run_validation_sampling(
-                progress, use_images, use_reference_videos, generate_audio, inference_steps
-            )
-        finally:
-            if self._block_offloader is not None:
-                self._block_offloader.setup()
+        return self._run_validation_sampling(
+            progress, use_images, use_reference_videos, generate_audio, inference_steps,
+            offload_active=offload_active,
+        )
 
     def _run_validation_sampling(
         self,
@@ -971,6 +970,7 @@ class LtxvTrainer:
         use_reference_videos: bool,
         generate_audio: bool,
         inference_steps: int,
+        offload_active: bool = False,
     ) -> list[Path] | None:
         # Start sampling progress tracking
         sampling_ctx = progress.start_sampling(
@@ -987,6 +987,7 @@ class LtxvTrainer:
             audio_decoder=self._audio_vae if generate_audio else None,
             vocoder=self._vocoder if generate_audio else None,
             sampling_context=sampling_ctx,
+            skip_transformer_to_device=offload_active,
         )
 
         output_dir = Path(self._config.output_dir) / "samples"

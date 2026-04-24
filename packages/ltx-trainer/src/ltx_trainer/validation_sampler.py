@@ -130,6 +130,7 @@ class ValidationSampler:
         vocoder: "Vocoder | None" = None,
         sampling_context: SamplingContext | None = None,
         embeddings_processor: "EmbeddingsProcessor | None" = None,
+        skip_transformer_to_device: bool = False,
     ):
         """Initialize the validation sampler.
         Args:
@@ -141,6 +142,10 @@ class ValidationSampler:
             vocoder: Optional vocoder (for audio generation)
             sampling_context: Optional SamplingContext for progress display during denoising
             embeddings_processor: Optional embeddings processor (required if text_encoder provided)
+            skip_transformer_to_device: If True, do not call transformer.to(device).
+                Used when block offloading is active — the offloader's forward-pre
+                hooks swap blocks in/out on demand, so the full model shouldn't be
+                pushed to GPU (and wouldn't fit for a 22B bf16 config on 32 GB).
         """
         self._transformer = transformer
         self._vae_decoder = vae_decoder
@@ -150,6 +155,7 @@ class ValidationSampler:
         self._audio_decoder = audio_decoder
         self._vocoder = vocoder
         self._sampling_context = sampling_context
+        self._skip_transformer_to_device = skip_transformer_to_device
 
         # Patchifiers
         self._video_patchifier = VideoLatentPatchifier(patch_size=1)
@@ -522,7 +528,8 @@ class ValidationSampler:
             )
 
         # Wrap transformer with X0Model to convert velocity predictions to denoised outputs
-        self._transformer.to(device)
+        if not self._skip_transformer_to_device:
+            self._transformer.to(device)
         x0_model = X0Model(self._transformer)
 
         with torch.autocast(device_type=str(device).split(":")[0], dtype=torch.bfloat16):
