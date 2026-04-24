@@ -626,6 +626,23 @@ class LtxTrainerConfig(ConfigBaseModel):
                 raise ValueError("shard_preprocessing_output_dir is required with dataset_metadata_file")
             if not self.model.text_encoder_path:
                 raise ValueError("text_encoder_path is required with dataset_metadata_file")
+            if self.data.shard_size < self.optimization.batch_size:
+                raise ValueError(
+                    f"shard_size ({self.data.shard_size}) must be >= batch_size "
+                    f"({self.optimization.batch_size}); otherwise the trainer's "
+                    f"drop_last=True dataloader yields no batches."
+                )
+            # Sharded mode can't produce reference_latents (VideoToVideoStrategy
+            # needs a `reference_column` that the orchestrator doesn't plumb;
+            # preprocess_dataset would silently skip that subtree and training
+            # would fail later at PrecomputedDataset's missing-source check).
+            if self.training_strategy.name == "video_to_video":
+                raise ValueError(
+                    "Sharded preprocessing mode does not support video_to_video strategy. "
+                    "Preprocess the dataset up front with scripts/process_dataset.py "
+                    "(passing --reference-column) and use scripts/train.py with "
+                    "data.preprocessed_data_root."
+                )
 
         # tmpfs_conditions_dir's path is validated at orchestrator entry rather
         # than here, so config loading stays machine-independent (CI, lint hosts
