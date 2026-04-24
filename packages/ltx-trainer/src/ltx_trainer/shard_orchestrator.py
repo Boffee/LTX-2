@@ -291,17 +291,21 @@ class ShardOrchestrator:
                 item.unlink()
 
     def _latest_saved_step(self) -> int:
-        """Highest step number saved under ``<cfg.output_dir>/checkpoints/``, or 0 if none.
+        """Highest step that has both weights and a training_state sidecar saved.
 
-        Mirrors the lookup the trainer uses in :meth:`_find_checkpoint` so we
-        derive "what's already done" purely from the on-disk checkpoints —
-        no separate orchestrator state file. Re-invoking the orchestrator
-        after a crash picks up where the trainer left off.
+        We glob ``training_state_step_*.pt`` rather than the .safetensors weights
+        because the trainer writes weights before the sidecar
+        (``trainer.py:1121`` / ``1127`` then ``trainer.py:1135``); a kill between
+        those leaves orphan weights without optimizer/scheduler state. The
+        sidecar is written atomically via tmp+rename
+        (``trainer.py:_save_training_state``), so its presence guarantees
+        the matching weights file also landed. Resuming from sidecar-step
+        ensures the trainer's optimizer state restore actually runs.
         """
         if not self._ckpt_dir.is_dir():
             return 0
         latest = 0
-        for p in self._ckpt_dir.rglob("*step_*.safetensors"):
+        for p in self._ckpt_dir.rglob("training_state_step_*.pt"):
             try:
                 latest = max(latest, int(p.stem.split("step_")[1]))
             except (IndexError, ValueError):
