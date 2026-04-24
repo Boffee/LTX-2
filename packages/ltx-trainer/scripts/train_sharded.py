@@ -21,12 +21,10 @@ from pathlib import Path
 
 import typer
 import yaml
-from rich.console import Console
 
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.shard_orchestrator import ShardOrchestrator
 
-console = Console()
 app = typer.Typer(
     pretty_exceptions_enable=False,
     no_args_is_help=True,
@@ -40,7 +38,7 @@ def main(
     disable_progress_bars: bool = typer.Option(
         False,
         "--disable-progress-bars",
-        help="Disable progress bars (useful for multi-process runs)",
+        help="Disable progress bars and log status messages instead.",
     ),
 ) -> None:
     """Run sharded-preprocessing training from the given configuration file."""

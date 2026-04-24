@@ -838,7 +838,7 @@ class LtxvTrainer:
         # Copy so the repeated ``params.pop(...)`` below doesn't mutate the
         # config-owned dict (the mutated version would otherwise be what
         # ``_save_config()`` writes to training_config.yaml).
-        params = dict(self._config.optimization.scheduler_params or {})
+        params = dict(self._config.optimization.scheduler_params)
 
         if scheduler_type is None:
             return None

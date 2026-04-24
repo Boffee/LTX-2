@@ -13,8 +13,11 @@ Used when the training config sets ``data.dataset_metadata_file`` instead of
      cumulative target so the trainer stops at the shard's epoch boundary.
   5. Loops to the next shard, reshuffling at cycle boundaries (``seed + cycle``).
 
-The trainer and the preprocessing scripts are unchanged; this module just
-orchestrates calls between them.
+The preprocessing scripts are unmodified; the trainer has a single 3-line
+consistency tweak in ``_create_scheduler`` (scheduler sizing now reads from
+``scheduler_params``, matching the existing pattern used by
+``cosine_with_restarts`` and ``step``). Everything else in this module is
+orchestration on top of the two existing entry points.
 """
 
 from __future__ import annotations
@@ -277,7 +280,7 @@ class ShardOrchestrator:
         total_steps = self._cfg.optimization.steps
         key = _SCHEDULER_TOTAL_KEY.get(cfg.optimization.scheduler_type)
         if key is not None:
-            params = dict(cfg.optimization.scheduler_params or {})
+            params = dict(cfg.optimization.scheduler_params)
             default = _scheduler_default_from_total(cfg.optimization.scheduler_type, total_steps)
             params.setdefault(key, default)  # user override wins
             cfg.optimization.scheduler_params = params
