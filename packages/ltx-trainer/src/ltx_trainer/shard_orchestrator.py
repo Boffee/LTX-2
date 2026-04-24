@@ -172,6 +172,33 @@ class ShardOrchestrator:
             json.dump(rows, f)
         return Path(tmp.name)
 
+    def _count_trainable_rows(self, rows: list[dict[str, str]]) -> int:
+        """Count rows whose required preprocessed files all landed on disk.
+
+        ``preprocess_dataset`` silently filters individual samples (videos with
+        too few frames in ``MediaDataset._filter_valid_videos``, captions that
+        fail to encode, audio extraction errors). The trainer's
+        ``PrecomputedDataset`` further filters samples missing any data source.
+        If every row in a shard is filtered, the trainer's DataLoader fails
+        deep in the stack; surface a clear orchestrator error before that.
+        """
+        latents_dir = self._output_dir / "latents"
+        conditions_dir = self._output_dir / "conditions"
+        audio_dir = self._output_dir / "audio_latents"
+        needs_audio = getattr(self._cfg.training_strategy, "with_audio", False)
+
+        count = 0
+        for row in rows:
+            media_rel = Path(row[VIDEO_COLUMN]).with_suffix(".pt")
+            if not (latents_dir / media_rel).exists():
+                continue
+            if not (conditions_dir / media_rel).exists():
+                continue
+            if needs_audio and not (audio_dir / media_rel).exists():
+                continue
+            count += 1
+        return count
+
     def _preprocess_shard(self, rows: list[dict[str, str]]) -> None:
         _ensure_scripts_on_path()
         from process_dataset import preprocess_dataset  # noqa: PLC0415
@@ -271,16 +298,13 @@ class ShardOrchestrator:
                 f"Mount the tmpfs first (e.g. /dev/shm is the Linux default)."
             )
 
-        # Sweep tempdirs from prior runs that died via SIGKILL/OOM —
-        # TemporaryDirectory's atexit cleanup doesn't fire in those cases, so
-        # /dev/shm/ltx-shard-conditions-* would otherwise accumulate one
-        # shard's worth of conditions per crashed run. Single-GPU mode means
-        # no concurrent orchestrator can own any of these.
-        for stale in tmpfs_root.glob(f"{TMPFS_PREFIX}*"):
-            if stale.is_dir() and not stale.is_symlink():
-                shutil.rmtree(stale, ignore_errors=True)
-                logger.info(f"🧹 Removed stale tmpfs conditions dir from a prior run: {stale}")
-
+        # Note: SIGKILL / OOM-kill bypass TemporaryDirectory's atexit cleanup,
+        # so crashed runs leave one shard's worth of conditions under
+        # tmpfs_root forever. We don't auto-sweep on entry because two
+        # independent sharded runs sharing the tmpfs would clobber each
+        # other's live tempdirs (single-GPU mode only protects against
+        # multi-process within one launch). tmpfs is wiped on reboot;
+        # otherwise: `rm -rf <tmpfs>/ltx-shard-conditions-*` manually.
         with tempfile.TemporaryDirectory(dir=str(tmpfs_root), prefix=TMPFS_PREFIX) as cond_path_str:
             cond_path = Path(cond_path_str)
             cond_link = self._output_dir / "conditions"
@@ -395,6 +419,16 @@ class ShardOrchestrator:
                 self._clear_contents(conditions_tmpfs)
 
                 self._preprocess_shard(shard_rows)
+
+                trainable = self._count_trainable_rows(shard_rows)
+                if trainable == 0:
+                    raise RuntimeError(
+                        f"Shard cycle={cycle} idx={shard_idx + 1} produced zero trainable "
+                        f"samples — all {len(shard_rows)} input rows were dropped during "
+                        f"preprocessing (frame-count filter, encode failures, missing audio "
+                        f"under with_audio=True, etc.). Check warnings above for per-sample "
+                        f"errors; fix the metadata or the underlying media files and re-run."
+                    )
 
                 shard_cfg = self._build_shard_config(
                     last_checkpoint, cumulative_target, skip_initial_validation=seen_initial
