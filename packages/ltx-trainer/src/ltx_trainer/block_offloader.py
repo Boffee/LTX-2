@@ -594,6 +594,13 @@ class TrainingBlockOffloader:
 
         self._register_hooks(num_resident)
 
+        # Seed peak to reflect the pre-loaded resident window. Since cb83965,
+        # peak_gpu_blocks is only updated inside the forward-pre hook; without
+        # this seed, peak stays at 0 between setup() and the first forward,
+        # which matters for teardown/setup cycles (validation) where a
+        # post-validation callback may read peak before any new forward runs.
+        self.reset_peak()
+
         logger.info(
             f"Block offloading active: {self._blocks_to_swap}/{num_layers} blocks on CPU, "
             f"{num_resident} resident on GPU, prefetch={self._prefetch_count}, "
