@@ -39,6 +39,10 @@ from ltx_trainer.trainer import LtxvTrainer
 VIDEO_COLUMN = "media_path"
 CAPTION_COLUMN = "caption"
 
+# Prefix for the per-run tmpfs tempdir that backs <output>/conditions. Stable
+# value lets us recognise dirs left behind by earlier runs that died via SIGKILL.
+TMPFS_PREFIX = "ltx-shard-conditions-"
+
 # For scheduler types whose curve shape is controlled by a single parameter,
 # the name of that parameter. Injected into ``scheduler_params`` per shard so
 # the curve is sized for the full run rather than per-shard.
@@ -267,7 +271,17 @@ class ShardOrchestrator:
                 f"Mount the tmpfs first (e.g. /dev/shm is the Linux default)."
             )
 
-        with tempfile.TemporaryDirectory(dir=str(tmpfs_root), prefix="ltx-shard-conditions-") as cond_path_str:
+        # Sweep tempdirs from prior runs that died via SIGKILL/OOM —
+        # TemporaryDirectory's atexit cleanup doesn't fire in those cases, so
+        # /dev/shm/ltx-shard-conditions-* would otherwise accumulate one
+        # shard's worth of conditions per crashed run. Single-GPU mode means
+        # no concurrent orchestrator can own any of these.
+        for stale in tmpfs_root.glob(f"{TMPFS_PREFIX}*"):
+            if stale.is_dir() and not stale.is_symlink():
+                shutil.rmtree(stale, ignore_errors=True)
+                logger.info(f"🧹 Removed stale tmpfs conditions dir from a prior run: {stale}")
+
+        with tempfile.TemporaryDirectory(dir=str(tmpfs_root), prefix=TMPFS_PREFIX) as cond_path_str:
             cond_path = Path(cond_path_str)
             cond_link = self._output_dir / "conditions"
             self._install_conditions_symlink(cond_link, cond_path)
