@@ -227,12 +227,14 @@ class DataConfig(ConfigBaseModel):
         "with dataset_metadata_file.",
     )
 
-    tmpfs_conditions_dir: str | Path | None = Field(
-        default=None,
-        description="Optional tmpfs mount (e.g. /dev/shm) to back the per-shard conditions "
-        "directory. When set, text embeddings for the current shard live in a tempdir under "
-        "this mount (via a symlink at <output>/conditions), and are wiped before each shard "
-        "so only one shard's conditions occupy RAM at a time. Latents stay on disk.",
+    tmpfs_conditions_dir: str | Path = Field(
+        default="/dev/shm",
+        description="tmpfs mount (default: /dev/shm) backing the per-shard conditions "
+        "directory. Text embeddings for the current shard live in a tempdir under this "
+        "mount (via a symlink at <output>/conditions) and are wiped before each shard, so "
+        "only one shard's conditions occupy RAM at a time. Latents stay on disk. The "
+        "orchestrator validates the path exists at entry, not at config load, so "
+        "configs are portable across hosts.",
     )
 
     @field_validator("dataset_metadata_file")
@@ -625,15 +627,8 @@ class LtxTrainerConfig(ConfigBaseModel):
             if not self.model.text_encoder_path:
                 raise ValueError("text_encoder_path is required with dataset_metadata_file")
 
-        # tmpfs_conditions_dir only applies under sharded-preprocessing mode.
-        if self.data.tmpfs_conditions_dir is not None:
-            if not has_metadata:
-                raise ValueError("tmpfs_conditions_dir requires dataset_metadata_file to also be set")
-            if not Path(self.data.tmpfs_conditions_dir).is_dir():
-                raise ValueError(
-                    f"tmpfs_conditions_dir does not exist or is not a directory: "
-                    f"{self.data.tmpfs_conditions_dir}. Mount the tmpfs first "
-                    f"(e.g. /dev/shm is the Linux default)."
-                )
+        # tmpfs_conditions_dir's path is validated at orchestrator entry rather
+        # than here, so config loading stays machine-independent (CI, lint hosts
+        # without /dev/shm).
 
         return self
