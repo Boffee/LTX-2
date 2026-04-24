@@ -38,6 +38,31 @@ from ltx_trainer.trainer import LtxvTrainer
 VIDEO_COLUMN = "media_path"
 CAPTION_COLUMN = "caption"
 
+# For scheduler types whose curve shape is controlled by a single parameter,
+# the name of that parameter. Injected into ``scheduler_params`` per shard so
+# the curve is sized for the full run rather than per-shard.
+#
+# ``step`` is omitted: ``step_size`` is a period (every N steps, multiply LR
+# by gamma) rather than a total run length, so "set it from total_steps" has
+# no obvious right value. User configures it themselves via scheduler_params.
+_SCHEDULER_TOTAL_KEY: dict[str, str] = {
+    "linear": "total_iters",
+    "cosine": "T_max",
+    "polynomial": "total_iters",
+    "cosine_with_restarts": "T_0",
+}
+
+
+def _scheduler_default_from_total(scheduler_type: str, total_steps: int) -> int:
+    """Default value to inject for the scheduler's sizing parameter, given
+    the full run length. Mirrors the trainer's non-sharded defaults: for
+    most schedulers the curve length equals ``total_steps``, but
+    ``cosine_with_restarts`` uses ``T_0 = steps // 4`` — a restart cycle
+    length, not a run total — so we preserve that meaning."""
+    if scheduler_type == "cosine_with_restarts":
+        return total_steps // 4
+    return total_steps
+
 
 def _ensure_scripts_on_path() -> None:
     """Expose ``packages/ltx-trainer/scripts/`` so ``from process_dataset import ...`` works.
@@ -153,7 +178,13 @@ class ShardOrchestrator:
         """Config passed to each per-shard ``LtxvTrainer``. Points at the shard
         output dir, resumes from the previous shard's final checkpoint, and sets
         ``optimization.steps`` to the cumulative target so the trainer stops at
-        the shard's epoch boundary."""
+        the shard's epoch boundary.
+
+        The scheduler's curve-length parameter (``total_iters`` / ``T_max`` /
+        ``T_0``) is pinned to the full-run total via ``scheduler_params`` so the
+        LR curve spans all shards rather than resetting per shard. ``steps``
+        controls the stop point, ``scheduler_params`` controls the curve.
+        """
         cfg = self._cfg.model_copy(deep=True)
         cfg.data.preprocessed_data_root = str(self._output_dir)
         cfg.data.dataset_metadata_file = None
@@ -162,6 +193,14 @@ class ShardOrchestrator:
         cfg.data.shard_preprocessing_output_dir = None
         cfg.model.load_checkpoint = str(load_checkpoint) if load_checkpoint else None
         cfg.optimization.steps = target_steps
+
+        total_steps = self._cfg.optimization.steps
+        key = _SCHEDULER_TOTAL_KEY.get(cfg.optimization.scheduler_type)
+        if key is not None:
+            params = dict(cfg.optimization.scheduler_params or {})
+            default = _scheduler_default_from_total(cfg.optimization.scheduler_type, total_steps)
+            params.setdefault(key, default)  # user override wins
+            cfg.optimization.scheduler_params = params
         return cfg
 
     def run(self, disable_progress_bars: bool = False) -> None:

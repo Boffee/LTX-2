@@ -835,7 +835,10 @@ class LtxvTrainer:
         """Create learning rate scheduler based on config."""
         scheduler_type = self._config.optimization.scheduler_type
         steps = self._config.optimization.steps
-        params = self._config.optimization.scheduler_params or {}
+        # Copy so the repeated ``params.pop(...)`` below doesn't mutate the
+        # config-owned dict (the mutated version would otherwise be what
+        # ``_save_config()`` writes to training_config.yaml).
+        params = dict(self._config.optimization.scheduler_params or {})
 
         if scheduler_type is None:
             return None
@@ -845,13 +848,13 @@ class LtxvTrainer:
                 optimizer,
                 start_factor=params.pop("start_factor", 1.0),
                 end_factor=params.pop("end_factor", 0.1),
-                total_iters=steps,
+                total_iters=params.pop("total_iters", steps),
                 **params,
             )
         elif scheduler_type == "cosine":
             scheduler = CosineAnnealingLR(
                 optimizer,
-                T_max=steps,
+                T_max=params.pop("T_max", steps),
                 eta_min=params.pop("eta_min", 0),
                 **params,
             )
@@ -866,7 +869,7 @@ class LtxvTrainer:
         elif scheduler_type == "polynomial":
             scheduler = PolynomialLR(
                 optimizer,
-                total_iters=steps,
+                total_iters=params.pop("total_iters", steps),
                 power=params.pop("power", 1.0),
                 **params,
             )
