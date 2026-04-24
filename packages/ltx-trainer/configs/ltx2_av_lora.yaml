@@ -197,7 +197,9 @@ data:
   # are written to '<shard_preprocessing_output_dir>/.precomputed/{latents,conditions}/'
   # before training on the shard. Avoids preprocessing the whole dataset up front
   # while producing the standard precomputed layout (drop-in for preprocessed_data_root).
-  # Already-preprocessed samples are skipped on re-shuffled shards. Single-GPU only.
+  # Files are keyed by the *chosen* bucket (<stem>_<f>x<h>x<w>.pt), so editing
+  # the bucket list only re-encodes videos whose nearest bucket actually changed.
+  # Single-GPU only.
   # dataset_metadata_file: "/path/to/dataset.json"
   # resolution_buckets: "448x256x25"
   # shard_size: 500

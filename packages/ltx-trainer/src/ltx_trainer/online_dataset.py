@@ -10,7 +10,6 @@ Video latents are loaded from disk cache on subsequent visits.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from pathlib import Path
@@ -24,13 +23,13 @@ from torch.utils.data import Dataset
 from ltx_trainer import logger
 from ltx_trainer.shard_manager import ShardManager
 from ltx_trainer.video_preprocessing import (
-    buckets_fingerprint,
+    bucket_filename_suffix,
     find_nearest_bucket,
     max_frames_in_buckets,
     normalize_video_frames,
     resize_and_crop_video,
 )
-from ltx_trainer.video_utils import read_video
+from ltx_trainer.video_utils import get_video_metadata, read_video
 
 # Conventions (same as process_dataset.py defaults)
 VIDEO_COLUMN = "media_path"
@@ -71,7 +70,6 @@ class OnlineEncodingDataset(Dataset):
         self._dataset_file = Path(dataset_file)
         self._resolution_buckets = resolution_buckets
         self._latent_cache_dir = self._dataset_file.parent / LATENT_CACHE_DIR_NAME
-        self._buckets_fp = buckets_fingerprint(resolution_buckets)
         self._max_frames = max_frames_in_buckets(resolution_buckets)
 
         self._samples = self._load_metadata()
@@ -215,18 +213,23 @@ class OnlineEncodingDataset(Dataset):
         device: torch.device,
         dtype: torch.dtype,
     ) -> dict[str, Any]:
-        """Encode video with VAE, or load from disk cache if already encoded."""
+        """Encode video with VAE, or load from disk cache if already encoded.
+
+        Reads container metadata (no frame decode) to pick the bucket, then keys
+        the cache by ``(video_path, chosen_bucket)``. Adding or removing buckets
+        only re-encodes videos whose nearest bucket actually changed.
+        """
         video_path = Path(sample["video_path"])
-        cache_path = self._get_latent_cache_path(video_path)
+
+        num_frames, h, w = get_video_metadata(video_path)
+        bucket = find_nearest_bucket(num_frames, h, w, self._resolution_buckets)
+        cache_path = self._get_latent_cache_path(video_path, bucket)
 
         if cache_path.exists():
             return torch.load(cache_path, map_location="cpu", weights_only=True)
 
+        target_f, target_h, target_w = bucket
         video, fps = read_video(video_path, max_frames=self._max_frames)
-        num_frames = video.shape[0]
-        h, w = video.shape[2], video.shape[3]
-        target_f, target_h, target_w = find_nearest_bucket(num_frames, h, w, self._resolution_buckets)
-
         video = resize_and_crop_video(video, target_h, target_w)
         video = video[:target_f]
         video = normalize_video_frames(video)
@@ -277,12 +280,13 @@ class OnlineEncodingDataset(Dataset):
     # Cache keying
     # ------------------------------------------------------------------
 
-    def _get_latent_cache_path(self, video_path: Path) -> Path:
-        """Build a cache path keyed by video path AND the resolution bucket config.
+    def _get_latent_cache_path(self, video_path: Path, bucket: tuple[int, int, int]) -> Path:
+        """Build a cache path keyed by video path AND the *chosen* bucket.
 
-        Changing buckets produces a different cache key so stale latents at an
-        old resolution are never served.
+        The bucket dimensions live in the filename (``<stem>_<f>x<h>x<w>.pt``), so
+        only videos whose nearest bucket changed need to be re-encoded when the
+        bucket list is edited. Cached files for buckets that are still in the list
+        keep being reused.
         """
-        key_material = f"{video_path.resolve()}|{self._buckets_fp}".encode()
-        digest = hashlib.sha256(key_material).hexdigest()[:16]
-        return self._latent_cache_dir / f"{video_path.stem}_{digest}.pt"
+        suffix = bucket_filename_suffix(bucket)
+        return self._latent_cache_dir / f"{video_path.stem}_{suffix}.pt"

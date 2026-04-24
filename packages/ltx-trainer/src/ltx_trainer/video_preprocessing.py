@@ -105,3 +105,15 @@ def buckets_fingerprint(buckets: list[tuple[int, int, int]]) -> str:
     """Stable string fingerprint of a bucket list, for use in cache keys."""
     sorted_buckets = sorted(buckets)
     return ";".join(f"{f}x{h}x{w}" for f, h, w in sorted_buckets)
+
+
+def bucket_filename_suffix(bucket: tuple[int, int, int]) -> str:
+    """Format a single ``(frames, height, width)`` bucket as a filename suffix.
+
+    Used to key per-video latent cache files by the *chosen* bucket rather than
+    the entire bucket list. With this scheme, adding/removing buckets only forces
+    re-encoding for videos whose nearest bucket actually changed; videos that
+    still pick the same bucket are served from cache.
+    """
+    f, h, w = bucket
+    return f"{f}x{h}x{w}"

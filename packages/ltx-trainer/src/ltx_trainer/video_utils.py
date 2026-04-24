@@ -39,6 +39,31 @@ def get_video_frame_count(video_path: str | Path) -> int:
         return sum(1 for _ in container.decode(video=0))
 
 
+def get_video_metadata(video_path: str | Path) -> tuple[int, int, int]:
+    """Read ``(num_frames, height, width)`` from container metadata without decoding frames.
+
+    Used to determine a video's resolution bucket cheaply, before deciding whether
+    a cached encoding can be reused. Falls back to a fast decode-and-count for
+    frame count when stream metadata is missing (same logic as :func:`get_video_frame_count`).
+    """
+    with av.open(str(video_path)) as container:
+        video_stream = container.streams.video[0]
+        height = video_stream.height
+        width = video_stream.width
+
+        if video_stream.frames > 0:
+            num_frames = video_stream.frames
+        else:
+            rate = video_stream.average_rate or video_stream.base_rate
+            if video_stream.duration and video_stream.time_base and rate:
+                duration = Fraction(video_stream.duration) * Fraction(video_stream.time_base)
+                num_frames = round(duration * Fraction(rate))
+            else:
+                num_frames = sum(1 for _ in container.decode(video=0))
+
+    return num_frames, height, width
+
+
 def read_video(video_path: str | Path, max_frames: int | None = None) -> tuple[Tensor, float]:
     """Load frames from a video file using PyAV.
     Args:

@@ -1,14 +1,15 @@
 """Sharded offline-style preprocessing at training time.
 
 Runs the offline preprocessing pipeline (VAE latents + text embeddings) on one
-shard at a time and writes results to a standard ``.precomputed/{latents,conditions}``
-directory. The trainer consumes the shard from disk, trains one epoch, then
-rotates to the next shard which is preprocessed on demand.
+shard at a time and writes results to ``.precomputed/{latents,conditions}/``.
+The trainer consumes the shard from disk, trains one epoch, then rotates to
+the next shard which is preprocessed on demand.
 
-Outputs use the same file layout as ``scripts/process_dataset.py``, so a partially
-preprocessed dataset can later be fed directly to :class:`PrecomputedDataset`.
-Samples whose output files already exist are skipped on subsequent shard visits
-(idempotent), so re-shuffled shards never re-encode the same videos.
+File layout uses ``<stem>_<f>x<h>x<w>.pt`` with the *chosen* resolution bucket
+as a filename suffix, so editing the bucket list only forces re-encoding for
+videos whose nearest bucket actually changed; everything else is reused. The
+suffix is mirrored on the conditions file (same bucket key as latents) so the
+pairing logic in :class:`PrecomputedDataset` keeps working.
 
 Difference from :mod:`online_dataset`: both latents and text embeddings are
 written to disk (vs. embeddings kept only in RAM). This sets up for future
@@ -31,12 +32,13 @@ from torch.utils.data import Dataset
 from ltx_trainer import logger
 from ltx_trainer.shard_manager import ShardManager
 from ltx_trainer.video_preprocessing import (
+    bucket_filename_suffix,
     find_nearest_bucket,
     max_frames_in_buckets,
     normalize_video_frames,
     resize_and_crop_video,
 )
-from ltx_trainer.video_utils import read_video
+from ltx_trainer.video_utils import get_video_metadata, read_video
 
 # Conventions (same as process_dataset.py defaults)
 VIDEO_COLUMN = "media_path"
@@ -198,9 +200,12 @@ class ShardPreprocessingDataset(Dataset):
     ) -> None:
         """Preprocess the current shard to disk.
 
-        For each sample in the shard, compute video latents and text embeddings
-        and write them to ``.precomputed/{latents,conditions}/<stem>.pt``. Samples
-        whose output files already exist are skipped (idempotent re-visits).
+        For each sample in the shard, choose the nearest resolution bucket from
+        container metadata, then write video latents to
+        ``.precomputed/latents/<stem>_<f>x<h>x<w>.pt`` and text embeddings to
+        ``.precomputed/conditions/<stem>_<f>x<h>x<w>.pt``. Samples whose output
+        files already exist are skipped (idempotent re-visits, even across bucket
+        list edits — only videos whose nearest bucket actually changed re-encode).
         Samples that fail to load/encode are skipped with a warning.
         """
         shard_indices = self._shards.current_shard
@@ -216,16 +221,15 @@ class ShardPreprocessingDataset(Dataset):
         reused = 0
         for global_idx in shard_indices:
             sample = self._samples[global_idx]
-            rel = Path(sample["relative_path"]).with_suffix(".pt")
-            latents_path = self._latents_dir / rel
-            conditions_path = self._conditions_dir / rel
-
             try:
+                latents_path, conditions_path, bucket = self._resolve_paths(sample)
                 if latents_path.exists() and conditions_path.exists():
                     reused += 1
                 else:
                     if not latents_path.exists():
-                        self._encode_video_to_disk(sample, latents_path, vae_encoder, device, dtype)
+                        self._encode_video_to_disk(
+                            sample, latents_path, bucket, vae_encoder, device, dtype
+                        )
                     if not conditions_path.exists():
                         self._encode_text_to_disk(
                             sample, conditions_path, text_encoder, embeddings_processor
@@ -255,20 +259,38 @@ class ShardPreprocessingDataset(Dataset):
                 f"all {len(shard_indices)} samples failed to encode"
             )
 
+    def _resolve_paths(self, sample: dict[str, str]) -> tuple[Path, Path, tuple[int, int, int]]:
+        """Pick the nearest bucket from container metadata and return output paths.
+
+        Conditions are bucket-independent in *content* (text embeddings don't depend
+        on resolution) but the filename still carries the bucket suffix to keep the
+        latents/conditions pairing intact for downstream :class:`PrecomputedDataset`
+        consumption.
+        """
+        video_path = Path(sample["video_path"])
+        num_frames, h, w = get_video_metadata(video_path)
+        bucket = find_nearest_bucket(num_frames, h, w, self._resolution_buckets)
+        suffix = bucket_filename_suffix(bucket)
+
+        rel = Path(sample["relative_path"])
+        rel_with_bucket = rel.with_name(f"{rel.stem}_{suffix}.pt")
+        latents_path = self._latents_dir / rel_with_bucket
+        conditions_path = self._conditions_dir / rel_with_bucket
+        return latents_path, conditions_path, bucket
+
     def _encode_video_to_disk(
         self,
         sample: dict[str, str],
         output_path: Path,
+        bucket: tuple[int, int, int],
         vae_encoder: nn.Module,
         device: torch.device,
         dtype: torch.dtype,
     ) -> None:
         video_path = Path(sample["video_path"])
-        video, fps = read_video(video_path, max_frames=self._max_frames)
-        num_frames = video.shape[0]
-        h, w = video.shape[2], video.shape[3]
-        target_f, target_h, target_w = find_nearest_bucket(num_frames, h, w, self._resolution_buckets)
+        target_f, target_h, target_w = bucket
 
+        video, fps = read_video(video_path, max_frames=self._max_frames)
         video = resize_and_crop_video(video, target_h, target_w)
         video = video[:target_f]
         video = normalize_video_frames(video)

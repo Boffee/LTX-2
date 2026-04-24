@@ -251,7 +251,7 @@ data:
   shard_size: 500
 ```
 
-**Sharded preprocessing mode** — same inputs as online mode, but each shard's latents and text embeddings are written to disk before training on the shard. Avoids running `process_dataset.py` over the full dataset up front. The output directory uses the standard `.precomputed/{latents,conditions}` layout, so it is a drop-in replacement for `preprocessed_data_root` afterwards. Samples whose output files already exist are skipped on re-shuffled shard visits. Single-GPU only.
+**Sharded preprocessing mode** — same inputs as online mode, but each shard's latents and text embeddings are written to disk before training on the shard. Avoids running `process_dataset.py` over the full dataset up front. The output directory uses the standard `.precomputed/{latents,conditions}` layout, so it is a drop-in replacement for `preprocessed_data_root` afterwards. Files are keyed by the *chosen* resolution bucket (`<stem>_<f>x<h>x<w>.pt`), so editing the bucket list only re-encodes videos whose nearest bucket actually changed — everything else is reused. Single-GPU only.
 
 ```yaml
 data:
