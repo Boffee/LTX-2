@@ -94,8 +94,13 @@ class ShardOrchestrator:
 
     def __init__(self, config: LtxTrainerConfig) -> None:
         self._cfg = config
+        # Preprocessing output (latents on disk, conditions symlinked to tmpfs)
+        # is rooted at data.shard_preprocessing_output_dir; checkpoints come out
+        # under cfg.output_dir (the trainer's choice — see trainer.py:1085).
+        # These are typically distinct in user configs.
         self._output_dir = Path(config.data.shard_preprocessing_output_dir).expanduser().resolve()
         self._output_dir.mkdir(parents=True, exist_ok=True)
+        self._ckpt_dir = Path(config.output_dir).expanduser().resolve() / "checkpoints"
         self._metadata_file = Path(config.data.dataset_metadata_file)
         self._samples = self._load_metadata(self._metadata_file)
         self._resolution_buckets = _parse_resolution_buckets(config.data.resolution_buckets)
@@ -286,18 +291,17 @@ class ShardOrchestrator:
                 item.unlink()
 
     def _latest_saved_step(self) -> int:
-        """Highest step number saved under ``<output_dir>/checkpoints/``, or 0 if none.
+        """Highest step number saved under ``<cfg.output_dir>/checkpoints/``, or 0 if none.
 
         Mirrors the lookup the trainer uses in :meth:`_find_checkpoint` so we
         derive "what's already done" purely from the on-disk checkpoints —
         no separate orchestrator state file. Re-invoking the orchestrator
         after a crash picks up where the trainer left off.
         """
-        ckpt_dir = self._output_dir / "checkpoints"
-        if not ckpt_dir.is_dir():
+        if not self._ckpt_dir.is_dir():
             return 0
         latest = 0
-        for p in ckpt_dir.rglob("*step_*.safetensors"):
+        for p in self._ckpt_dir.rglob("*step_*.safetensors"):
             try:
                 latest = max(latest, int(p.stem.split("step_")[1]))
             except (IndexError, ValueError):
@@ -315,10 +319,9 @@ class ShardOrchestrator:
         # auto-find the latest) and skip any shards whose cumulative target has
         # already been reached.
         completed_steps = self._latest_saved_step()
-        ckpt_dir = self._output_dir / "checkpoints"
         if completed_steps > 0:
             logger.info(f"🔁 Resuming orchestrator from step {completed_steps}")
-            last_checkpoint: Path | None = ckpt_dir
+            last_checkpoint: Path | None = self._ckpt_dir
         else:
             last_checkpoint = (
                 Path(self._cfg.model.load_checkpoint) if self._cfg.model.load_checkpoint else None
@@ -366,8 +369,8 @@ class ShardOrchestrator:
                 trainer = LtxvTrainer(shard_cfg)
                 last_checkpoint, _ = trainer.train(disable_progress_bars=disable_progress_bars)
                 # After the first successful train, subsequent shards always
-                # resume from output_dir/checkpoints (trainer auto-finds latest).
-                last_checkpoint = ckpt_dir
+                # resume from cfg.output_dir/checkpoints (trainer auto-finds latest).
+                last_checkpoint = self._ckpt_dir
                 seen_initial = True
 
                 if cumulative_target >= total_steps:
