@@ -22,16 +22,22 @@ import torch
 import yaml
 
 
-def create_dummy_data(data_dir: Path, num_samples: int = 8) -> None:
+def create_dummy_data(
+    data_dir: Path,
+    num_samples: int = 8,
+    video_dims: tuple[int, int, int] = (640, 352, 25),
+) -> None:
     latents_dir = data_dir / "latents"
     conditions_dir = data_dir / "conditions"
     latents_dir.mkdir(parents=True)
     conditions_dir.mkdir(parents=True)
 
-    # 640x352, 25 frames → latent shape [128, 4, 11, 20]
-    latent_frames = (25 - 1) // 8 + 1  # 4
-    latent_h = 352 // 32  # 11
-    latent_w = 640 // 32  # 20
+    width, height, num_frames = video_dims
+    assert num_frames % 8 == 1, f"num_frames must satisfy frames % 8 == 1, got {num_frames}"
+    assert width % 32 == 0 and height % 32 == 0, "dims must be divisible by 32"
+    latent_frames = (num_frames - 1) // 8 + 1
+    latent_h = height // 32
+    latent_w = width // 32
 
     for i in range(num_samples):
         latent_data = {
@@ -59,6 +65,7 @@ def make_config(
     blocks_to_swap: int | None = None,
     audio_learning_rate: float | None = None,
     quantization: str | None = "int8-quanto",
+    video_dims: tuple[int, int, int] = (640, 352, 25),
 ) -> dict:
     cfg = {
         "model": {
@@ -95,7 +102,7 @@ def make_config(
         },
         "validation": {
             "prompts": ["a cat sitting on a table"],
-            "video_dims": [640, 352, 25],
+            "video_dims": list(video_dims),
             "inference_steps": 4,
             "interval": 2,
         },
@@ -242,14 +249,22 @@ def main() -> None:
         choices=["none", "int8-quanto", "int4-quanto", "int2-quanto", "fp8-quanto", "fp8uz-quanto"],
         help="Quanto precision to apply to the transformer; 'none' keeps bf16 weights",
     )
+    parser.add_argument(
+        "--video-dims",
+        type=str,
+        default="640x352x25",
+        help="Video dims WxHxF (frames must satisfy frames%%8==1; W,H divisible by 32)",
+    )
     args = parser.parse_args()
+    w, h, f = (int(x) for x in args.video_dims.split("x"))
+    video_dims = (w, h, f)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="offload_test_"))
     data_dir = tmp_dir / "data"
     print(f"Working directory: {tmp_dir}")
 
     try:
-        create_dummy_data(data_dir)
+        create_dummy_data(data_dir, video_dims=video_dims)
 
         base_kwargs = {
             "model_path": args.model_path,
@@ -265,6 +280,7 @@ def main() -> None:
             output_dir=str(tmp_dir / "offload"),
             blocks_to_swap=args.blocks_to_swap,
             quantization=args.quantization,
+            video_dims=video_dims,
         )
         results["offloading"] = run_test(
             f"block offloading (blocks_to_swap={args.blocks_to_swap})", cfg, tmp_dir
@@ -277,6 +293,7 @@ def main() -> None:
             blocks_to_swap=args.blocks_to_swap,
             audio_learning_rate=5e-5,
             quantization=args.quantization,
+            video_dims=video_dims,
         )
         results["both"] = run_test("offloading + audio LR", cfg, tmp_dir)
 
