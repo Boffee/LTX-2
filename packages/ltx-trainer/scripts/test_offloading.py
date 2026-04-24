@@ -15,6 +15,7 @@ Usage:
 import argparse
 import shutil
 import tempfile
+import time
 from pathlib import Path
 
 import torch
@@ -57,6 +58,7 @@ def make_config(
     output_dir: str,
     blocks_to_swap: int | None = None,
     audio_learning_rate: float | None = None,
+    quantization: str = "int8-quanto",
 ) -> dict:
     cfg = {
         "model": {
@@ -84,7 +86,7 @@ def make_config(
         },
         "acceleration": {
             "mixed_precision_mode": "bf16",
-            "quantization": "int8-quanto",
+            "quantization": quantization,
             "load_text_encoder_in_8bit": True,
         },
         "data": {
@@ -167,20 +169,44 @@ def run_test(name: str, config: dict, tmp_dir: Path) -> bool:
         from ltx_trainer.trainer import LtxvTrainer
 
         trainer_config = LtxTrainerConfig(**config)
+
+        # Time model construction separately so the stats.steps_per_second
+        # figure isn't drowned by one-time setup cost. trainer.train()'s
+        # internal total_time_seconds covers only the training loop itself
+        # (it starts its own timer at train_start_time), but block offloader
+        # setup happens inside __init__ before we even call train().
+        init_start = time.perf_counter()
         trainer = LtxvTrainer(trainer_config)
+        init_time = time.perf_counter() - init_start
 
         blocks_to_swap = config["acceleration"].get("blocks_to_swap")
         audio_lr = config["optimization"].get("audio_learning_rate")
 
+        # Per-step wall-clock timing — measures the gap between consecutive
+        # step_callback firings, which matches one optimization step (plus any
+        # validation triggered at that step boundary).
+        step_times: list[float] = []
+        last_mark = [time.perf_counter()]
+
         def step_callback(step: int, total: int, paths: list[Path]) -> None:
+            now = time.perf_counter()
+            step_times.append(now - last_mark[0])
+            last_mark[0] = now
             if blocks_to_swap:
                 _verify_offloader(trainer, blocks_to_swap)
             if audio_lr:
                 _verify_audio_lr(trainer, audio_lr)
 
+        train_start = time.perf_counter()
         _model_path, stats = trainer.train(
             disable_progress_bars=True, step_callback=step_callback
         )
+        train_wall = time.perf_counter() - train_start
+
+        if step_times:
+            per_step = "  ".join(f"step {i + 1}: {t:.2f}s" for i, t in enumerate(step_times))
+            print(f"  timing: trainer-init={init_time:.1f}s  train-wall={train_wall:.1f}s")
+            print(f"  per-step (wall, between callbacks): {per_step}")
 
         print(
             f"  PASSED — {stats.steps_per_second:.1f} steps/s, peak VRAM: {stats.peak_gpu_memory_gb:.1f} GB"
@@ -208,6 +234,13 @@ def main() -> None:
         default=24,
         help="Blocks to swap for offloading test",
     )
+    parser.add_argument(
+        "--quantization",
+        type=str,
+        default="int8-quanto",
+        choices=["int8-quanto", "int4-quanto", "int2-quanto", "fp8-quanto", "fp8uz-quanto"],
+        help="Quanto precision to apply to the transformer",
+    )
     args = parser.parse_args()
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="offload_test_"))
@@ -230,6 +263,7 @@ def main() -> None:
             **base_kwargs,
             output_dir=str(tmp_dir / "offload"),
             blocks_to_swap=args.blocks_to_swap,
+            quantization=args.quantization,
         )
         results["offloading"] = run_test(
             f"block offloading (blocks_to_swap={args.blocks_to_swap})", cfg, tmp_dir
@@ -241,6 +275,7 @@ def main() -> None:
             output_dir=str(tmp_dir / "both"),
             blocks_to_swap=args.blocks_to_swap,
             audio_learning_rate=5e-5,
+            quantization=args.quantization,
         )
         results["both"] = run_test("offloading + audio LR", cfg, tmp_dir)
 
