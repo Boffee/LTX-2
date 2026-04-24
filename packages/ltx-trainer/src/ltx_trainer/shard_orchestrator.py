@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import random
 import shutil
 import sys
@@ -93,6 +94,20 @@ class ShardOrchestrator:
     """Runs one cycle of (preprocess shard → train on shard) at a time."""
 
     def __init__(self, config: LtxTrainerConfig) -> None:
+        # Sharded preprocessing is single-GPU only — preprocessing, the tmpfs
+        # symlink, and the on-disk shard output are all process-singleton state.
+        # Under `accelerate launch` / `torchrun`, every rank would spawn its own
+        # orchestrator and trample each other. Bail immediately.
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if world_size > 1:
+            raise RuntimeError(
+                f"Sharded preprocessing mode is single-GPU only (WORLD_SIZE={world_size}). "
+                f"Run `python scripts/train_sharded.py CONFIG` directly, not via "
+                f"`accelerate launch` or `torchrun`. For multi-GPU training, preprocess "
+                f"the dataset up front with scripts/process_dataset.py and use "
+                f"scripts/train.py with data.preprocessed_data_root instead."
+            )
+
         self._cfg = config
         # Preprocessing output (latents on disk, conditions symlinked to tmpfs)
         # is rooted at data.shard_preprocessing_output_dir; checkpoints come out
