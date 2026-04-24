@@ -242,12 +242,14 @@ class DataConfig(ConfigBaseModel):
         "(single-GPU, no audio, no video_to_video, no 8-bit Gemma).",
     )
 
-    tmpfs_conditions: bool = Field(
-        default=False,
-        description="Sharded preprocessing only. When True, write text embeddings to a fresh "
-        "/dev/shm directory (Linux tmpfs) instead of disk, and wipe them at the start of each "
-        "shard. Latents stay on persistent disk. Use when text encoding is cheap to recompute "
-        "but conditions disk I/O is the bottleneck (e.g. slow shared filesystems).",
+    tmpfs_conditions_dir: str | Path | None = Field(
+        default=None,
+        description="Sharded preprocessing only. When set, write text embeddings to a fresh "
+        "subdirectory under this tmpfs mount instead of disk, wiped at the start of each shard. "
+        "Latents stay on persistent disk. Use when text encoding is cheap to recompute but "
+        "conditions disk I/O is the bottleneck. Typical value: /dev/shm (Linux default tmpfs). "
+        "Point at a dedicated tmpfs mount if /dev/shm is too small — each shard needs roughly "
+        "(shard_size × per-sample embedding size) free.",
     )
 
     @field_validator("dataset_metadata_file")
@@ -646,11 +648,11 @@ class LtxTrainerConfig(ConfigBaseModel):
                 "shard_preprocessing_output_dir requires dataset_metadata_file to also be set"
             )
 
-        # tmpfs_conditions is sharded-preprocessing-only. Online mode already keeps text
+        # tmpfs_conditions_dir is sharded-preprocessing-only. Online mode already keeps text
         # embeddings in RAM (Python dict), so the flag is meaningless there.
-        if self.data.tmpfs_conditions and self.data.shard_preprocessing_output_dir is None:
+        if self.data.tmpfs_conditions_dir is not None and self.data.shard_preprocessing_output_dir is None:
             raise ValueError(
-                "tmpfs_conditions=True requires shard_preprocessing_output_dir to be set "
+                "tmpfs_conditions_dir requires shard_preprocessing_output_dir to be set "
                 "(online encoding mode already keeps text embeddings in memory)"
             )
 

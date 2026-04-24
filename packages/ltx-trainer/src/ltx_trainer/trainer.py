@@ -865,7 +865,7 @@ class LtxvTrainer:
             resolution_buckets=buckets,
             shard_size=self._config.data.shard_size,
             seed=self._config.seed,
-            tmpfs_conditions=self._config.data.tmpfs_conditions,
+            tmpfs_conditions_dir=self._config.data.tmpfs_conditions_dir,
         )
         total = self._dataset.total_samples
         shard_info = ""

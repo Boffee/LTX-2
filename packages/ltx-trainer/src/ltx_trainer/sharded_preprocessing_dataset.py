@@ -11,16 +11,21 @@ videos whose nearest bucket actually changed; everything else is reused. The
 suffix is mirrored on the conditions file (same bucket key as latents) so the
 pairing logic in :class:`PrecomputedDataset` keeps working.
 
-Optional tmpfs conditions: with ``tmpfs_conditions=True``, text embeddings are
-written to ``/dev/shm/`` instead of disk and wiped at the start of each shard.
-Text encoding is cheap to recompute but expensive to read/write through normal
-disk I/O, so memory-backed file storage gives reads at RAM speed without
-changing the dataset's file-based interface.
+Optional tmpfs conditions: pass ``tmpfs_conditions_dir`` (e.g. ``/dev/shm``) and
+text embeddings are written to a fresh subdirectory under that mount instead of
+disk, wiped at the start of each shard. Text encoding is cheap to recompute but
+expensive to read/write through normal disk I/O, so memory-backed file storage
+gives reads at RAM speed without changing the dataset's file-based interface.
+Conditions can be large (order 100 MB per sample for LTX-2 Gemma features) so
+the tmpfs mount must be sized for roughly ``shard_size * per-sample size`` —
+the default ``/dev/shm`` (50% of RAM) may not be enough for large shards and
+you may want to point at a dedicated tmpfs mount.
 """
 
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
 import shutil
 import tempfile
@@ -50,7 +55,6 @@ CAPTION_COLUMN = "caption"
 PRECOMPUTED_DIR_NAME = ".precomputed"
 LATENTS_DIR_NAME = "latents"
 CONDITIONS_DIR_NAME = "conditions"
-TMPFS_ROOT = Path("/dev/shm")
 TMPFS_DIR_PREFIX = "ltx-trainer-conditions-"
 
 
@@ -80,12 +84,14 @@ class ShardPreprocessingDataset(Dataset):
         Samples per shard. ``None`` = preprocess the entire dataset in one shard.
     seed:
         Random seed for shard shuffling.
-    tmpfs_conditions:
-        When ``True``, write text embeddings to a fresh ``/dev/shm/`` directory
-        instead of the persistent ``.precomputed/conditions/`` tree, and wipe
-        them at the start of each shard. Latents stay on disk. Best for cases
-        where text encoding is cheap to recompute but disk I/O on the
-        conditions files is the bottleneck.
+    tmpfs_conditions_dir:
+        When set, write text embeddings to a fresh subdirectory under this
+        tmpfs mount (e.g. ``/dev/shm``) instead of the persistent
+        ``.precomputed/conditions/`` tree, and wipe them at the start of each
+        shard. Latents stay on disk. Best for cases where text encoding is
+        cheap to recompute but disk I/O on the conditions files is the
+        bottleneck. The mount must be large enough to hold one shard's worth
+        of embeddings (roughly ``shard_size * per-sample size``).
     """
 
     def __init__(
@@ -95,15 +101,15 @@ class ShardPreprocessingDataset(Dataset):
         resolution_buckets: list[tuple[int, int, int]],
         shard_size: int | None = None,
         seed: int = 42,
-        tmpfs_conditions: bool = False,
+        tmpfs_conditions_dir: str | Path | None = None,
     ) -> None:
         super().__init__()
         self._dataset_file = Path(dataset_file)
         self._output_root = Path(output_dir).expanduser().resolve() / PRECOMPUTED_DIR_NAME
         self._latents_dir = self._output_root / LATENTS_DIR_NAME
-        self._tmpfs_conditions = tmpfs_conditions
-        if tmpfs_conditions:
-            self._conditions_dir = _make_tmpfs_conditions_dir()
+        self._tmpfs_conditions = tmpfs_conditions_dir is not None
+        if self._tmpfs_conditions:
+            self._conditions_dir = _make_tmpfs_conditions_dir(Path(tmpfs_conditions_dir))
             logger.info(f"Conditions in tmpfs at {self._conditions_dir} (wiped between shards)")
         else:
             self._conditions_dir = self._output_root / CONDITIONS_DIR_NAME
@@ -268,6 +274,8 @@ class ShardPreprocessingDataset(Dataset):
             info_parts.append(f"{latents_reused} latents from cache")
         if skipped:
             info_parts.append(f"{skipped} skipped")
+        if self._tmpfs_conditions:
+            info_parts.append(f"tmpfs {_format_bytes(_directory_size_bytes(self._conditions_dir))}")
         info_str = f" ({', '.join(info_parts)})" if info_parts else ""
         logger.info(
             f"Preprocessed shard {shard_num}/{num_shards}: {len(shard_files)} samples{info_str} "
@@ -362,18 +370,40 @@ def _atomic_save(obj: dict[str, Any], path: Path) -> None:
     tmp.replace(path)
 
 
-def _make_tmpfs_conditions_dir() -> Path:
+def _make_tmpfs_conditions_dir(tmpfs_root: Path) -> Path:
     """Create a fresh tmpfs-backed directory for ephemeral text embeddings.
 
-    Uses ``/dev/shm`` (the standard Linux tmpfs mount) and registers an atexit
-    handler to clean up on normal interpreter shutdown. Hard kills (SIGKILL,
-    OOM kill) leave the directory behind; ``/dev/shm/ltx-trainer-conditions-*``
-    can be safely deleted manually if it accumulates.
+    Accepts any tmpfs mount point as root (``/dev/shm`` is the Linux default; a
+    dedicated tmpfs at ``/mnt/<name>`` is appropriate when conditions are large
+    enough that ``/dev/shm`` fills up). Registers an atexit handler to clean up
+    on normal interpreter shutdown; hard kills (SIGKILL, OOM) leave the
+    directory behind. Leftover ``<tmpfs_root>/ltx-trainer-conditions-*`` dirs
+    can be safely deleted manually.
     """
-    if not TMPFS_ROOT.is_dir():
+    if not tmpfs_root.is_dir():
         raise RuntimeError(
-            f"tmpfs_conditions=True requires {TMPFS_ROOT} (Linux tmpfs); not found on this system"
+            f"tmpfs_conditions_dir={tmpfs_root} does not exist; mount the tmpfs first "
+            f"or point at an existing tmpfs (e.g. /dev/shm)"
         )
-    tmp_dir = Path(tempfile.mkdtemp(dir=str(TMPFS_ROOT), prefix=TMPFS_DIR_PREFIX))
+    tmp_dir = Path(tempfile.mkdtemp(dir=str(tmpfs_root), prefix=TMPFS_DIR_PREFIX))
     atexit.register(shutil.rmtree, tmp_dir, ignore_errors=True)
     return tmp_dir
+
+
+def _directory_size_bytes(path: Path) -> int:
+    total = 0
+    for p in path.rglob("*"):
+        if p.is_file():
+            with contextlib.suppress(OSError):
+                total += p.stat().st_size
+    return total
+
+
+def _format_bytes(n: int) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    v = float(n)
+    for u in units:
+        if v < 1024 or u == units[-1]:
+            return f"{v:.1f} {u}"
+        v /= 1024
+    return f"{n} B"

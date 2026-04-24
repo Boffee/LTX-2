@@ -204,8 +204,12 @@ data:
   # resolution_buckets: "448x256x25"
   # shard_size: 500
   # shard_preprocessing_output_dir: "/path/to/dataset/dir"
-  # tmpfs_conditions: true   # write text embeddings to /dev/shm and wipe per shard
-                             # (cheap to recompute, fast to read; latents stay on disk)
+  # tmpfs_conditions_dir: "/dev/shm"   # write text embeddings to this tmpfs mount
+                                       # and wipe per shard. Latents stay on disk.
+                                       # Conditions are large (~100MB each for LTX-2
+                                       # Gemma features), so sizing /dev/shm or a
+                                       # dedicated mount is critical — each shard
+                                       # needs about shard_size × 100MB free.
 
 # -----------------------------------------------------------------------------
 # Validation Configuration
