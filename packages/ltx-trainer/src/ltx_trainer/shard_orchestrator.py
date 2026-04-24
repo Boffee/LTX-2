@@ -275,7 +275,12 @@ class ShardOrchestrator:
             default = _scheduler_default_from_total(cfg.optimization.scheduler_type, total_steps)
             params.setdefault(key, default)  # user override wins
             cfg.optimization.scheduler_params = params
-        return cfg
+
+        # Re-validate via model_validate so model_validator-level invariants
+        # are re-checked on the mutated copy. Pydantic's model_copy(deep=True)
+        # does NOT re-run model validators; our mutations could silently
+        # violate a future cross-field invariant added to LtxTrainerConfig.
+        return LtxTrainerConfig.model_validate(cfg.model_dump())
 
     def run(self, disable_progress_bars: bool = False) -> None:
         with self._tmpfs_conditions() as conditions_tmpfs:
