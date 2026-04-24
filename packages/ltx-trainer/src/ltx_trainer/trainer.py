@@ -1285,9 +1285,19 @@ class LtxvTrainer:
         self._wandb_run = run
 
     def _log_metrics(self, metrics: dict[str, float]) -> None:
-        """Log metrics to Weights & Biases."""
+        """Log metrics to Weights & Biases.
+
+        Always passes ``step=self._global_step`` so the wandb internal step
+        counter tracks optimization step, not the auto-incrementing "nth
+        call" number. Without this, resumed runs would advance the internal
+        counter past any explicit-step call (like validation media at
+        ``step=global_step``), and wandb silently drops log entries whose
+        passed step is not monotonically ahead of the internal counter —
+        so only the first shard's validation samples land; subsequent
+        shards' media is discarded.
+        """
         if self._wandb_run is not None:
-            self._wandb_run.log(metrics)
+            self._wandb_run.log(metrics, step=self._global_step)
 
     def _log_validation_samples(self, sample_paths: list[Path], prompts: list[str]) -> None:
         """Log validation samples (videos or images) to Weights & Biases."""
