@@ -697,4 +697,15 @@ class LtxTrainerConfig(ConfigBaseModel):
                     "(bitsandbytes quantized models cannot be moved between CPU and GPU)."
                 )
 
+        # Audio training requires batch_size=1: audio latent length depends on source FPS
+        # (target_duration = target_frames / fps), so two videos with the same video bucket
+        # but different FPS produce different-length audio latents, and the default
+        # DataLoader collation can't stack them. Applies to both precomputed and per-shard
+        # modes — the shipped audio configs already set batch_size=1 by convention.
+        if getattr(self.training_strategy, "with_audio", False) and self.optimization.batch_size != 1:
+            raise ValueError(
+                "with_audio=True requires optimization.batch_size=1 (audio latent length varies "
+                "with source FPS and cannot be collated across a batch)."
+            )
+
         return self
