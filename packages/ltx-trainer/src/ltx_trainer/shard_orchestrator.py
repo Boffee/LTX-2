@@ -204,22 +204,27 @@ class ShardOrchestrator:
         return cfg
 
     def run(self, disable_progress_bars: bool = False) -> None:
-        with self._maybe_tmpfs_conditions() as conditions_tmpfs:
+        with self._tmpfs_conditions() as conditions_tmpfs:
             self._run_loop(disable_progress_bars, conditions_tmpfs)
 
     @contextlib.contextmanager
-    def _maybe_tmpfs_conditions(self) -> Iterator[Path | None]:
-        """If tmpfs_conditions_dir is set, back <output>/conditions with a tempdir
-        on that mount via a symlink. Yields the tempdir so the caller can wipe it
-        between shards. The ``with`` block guarantees cleanup on exit."""
-        tmpfs_root = self._cfg.data.tmpfs_conditions_dir
-        if tmpfs_root is None:
-            yield None
-            return
+    def _tmpfs_conditions(self) -> Iterator[Path]:
+        """Back ``<output>/conditions`` with a tempdir under ``tmpfs_conditions_dir``
+        via a symlink. Yields the tempdir so the caller can wipe it between shards.
 
-        with tempfile.TemporaryDirectory(
-            dir=str(tmpfs_root), prefix="ltx-shard-conditions-"
-        ) as cond_path_str:
+        Conditions never touch persistent disk: ``preprocess_dataset`` writes
+        through the symlink into the tempdir on tmpfs, which is wiped each shard.
+        Validates the tmpfs path here (not at config-load time) so configs are
+        portable across hosts.
+        """
+        tmpfs_root = Path(self._cfg.data.tmpfs_conditions_dir)
+        if not tmpfs_root.is_dir():
+            raise RuntimeError(
+                f"tmpfs_conditions_dir does not exist or is not a directory: {tmpfs_root}. "
+                f"Mount the tmpfs first (e.g. /dev/shm is the Linux default)."
+            )
+
+        with tempfile.TemporaryDirectory(dir=str(tmpfs_root), prefix="ltx-shard-conditions-") as cond_path_str:
             cond_path = Path(cond_path_str)
             cond_link = self._output_dir / "conditions"
             self._install_conditions_symlink(cond_link, cond_path)
@@ -276,7 +281,7 @@ class ShardOrchestrator:
                 continue
         return latest
 
-    def _run_loop(self, disable_progress_bars: bool, conditions_tmpfs: Path | None) -> None:
+    def _run_loop(self, disable_progress_bars: bool, conditions_tmpfs: Path) -> None:
         total_steps = self._cfg.optimization.steps
         # One optimization step consumes batch_size * gradient_accumulation_steps
         # samples (the trainer loops `remaining_steps * grad_accum` batches).
@@ -321,8 +326,7 @@ class ShardOrchestrator:
 
                 # Fresh conditions tmpfs for each shard — only one shard's text
                 # embeddings occupy RAM at a time.
-                if conditions_tmpfs is not None:
-                    self._clear_contents(conditions_tmpfs)
+                self._clear_contents(conditions_tmpfs)
 
                 self._preprocess_shard(shard_rows)
 
