@@ -55,6 +55,13 @@ def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
     dedup. The key incorporates view layout for that reason.
     """
     if _QUANTO_AVAILABLE and isinstance(t, WeightQBytesTensor):
+        # NOTE: relies on the internal structure of WeightQBytesTensor
+        # (`_data`, `_scale`, `qtype`, `axis`, `activation_qtype`) which
+        # quanto does not expose as a public API. Pinned to the
+        # WeightQBytesTensor layout in optimum-quanto as of the
+        # version this repo depends on; if quanto refactors the
+        # wrapper class this function will break at runtime — start
+        # debugging here.
         return (
             "quanto",
             t._data.data_ptr(),

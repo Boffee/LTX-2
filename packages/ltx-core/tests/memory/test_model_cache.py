@@ -432,25 +432,29 @@ class TestFailureModes:
         # Strategy was constructed and then closed.
         assert FakeStrategy.instances[0].events == ["activate", "close"]
 
-    def test_activation_failure_on_cached_entry_keeps_it_cached(self) -> None:
-        # Different from fresh-build: the entry was already cached
-        # before this activation attempt. Don't punish it for a one-off
-        # activation issue — leave it cached for retry.
+    def test_activation_failure_on_cached_entry_discards_it(self) -> None:
+        # Activation failure on a previously-cached entry is treated
+        # as poisoned (same as freshly-built). Strategies like
+        # BlockOffloader can fail mid-way through activate after
+        # partially installing hooks/pool; caching them as
+        # "ready to retry" lies about their state.
         cache = ModelCache(200)
-        # Build successfully first.
         cache.register(_spec("a", 100))
         with cache.use("a"):
             pass
-        # Mutate the strategy's activate to raise on next call.
         s = FakeStrategy.instances[0]
         s._activate_raises = RuntimeError("transient gpu")
         with pytest.raises(ActivationError):
             with cache.use("a"):
                 pass
-        # Entry is still cached, just inactive.
+        # Entry was discarded — closed and removed from cache state.
         snap = cache.snapshot()
-        assert "a" in snap.cached_keys_lru_to_mru
-        assert snap.used_cache_bytes == 100
+        assert "a" not in snap.cached_keys_lru_to_mru
+        assert snap.used_cache_bytes == 0
+        # The poisoned strategy was closed.
+        assert "close" in s.events
+        # Registration persisted for retry — but next acquire rebuilds.
+        assert "a" in snap.registered_keys
 
     def test_close_failure_during_eviction_propagates(self) -> None:
         cache = ModelCache(200)
@@ -640,6 +644,35 @@ class TestActualVsEstimate:
         snap = cache.snapshot()
         assert snap.used_cache_bytes == 250
         assert "filler" not in snap.cached_keys_lru_to_mru
+
+    def test_cache_bytes_reconciled_after_activate(self) -> None:
+        # A strategy that reports 0 bytes pre-activate but pins memory
+        # during activate (simulating BlockOffloader with auto_setup=False
+        # whose factory forgot to call prepare()) must have its
+        # cache_bytes reconciled by the cache after activate so
+        # _used_bytes reflects reality.
+        class LateBindStrategy(FakeStrategy):
+            def __init__(self, *args, late_bytes: int = 100, **kw):
+                super().__init__(0, **kw)  # report 0 pre-activate
+                self._late_bytes = late_bytes
+
+            def activate(self):
+                module = super().activate()
+                # Simulate pinning during activate.
+                self._cache_bytes = self._late_bytes
+                return module
+
+        def factory():
+            return LateBindStrategy(late_bytes=100)
+
+        cache = ModelCache(200)
+        spec = ModelSpec(key="late", estimated_cache_bytes=10, factory=factory)
+        with cache.use(spec):
+            # Inside the context, cache_bytes should reflect the
+            # post-activate reality (100), not the pre-activate 0.
+            info = cache.info("late")
+            assert info.cache_bytes == 100
+            assert cache.used_cache_bytes == 100
 
     def test_actual_overflow_rejects_and_closes(self) -> None:
         cache = ModelCache(100)

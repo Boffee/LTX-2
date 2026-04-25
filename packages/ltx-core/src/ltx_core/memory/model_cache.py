@@ -10,23 +10,23 @@ Design highlights
 -----------------
 - **Strategy-agnostic.** The cache only talks to the
   :class:`ModelStrategy` protocol — three lifecycle methods plus
-  ``cache_bytes`` accounting. Pluggable: today
-  :class:`PinnedWeights` only; tomorrow ``BlockOffloader`` (after its
-  lifecycle split), disk-mmap, NVMe-paged, multi-GPU shard.
+  ``cache_bytes`` accounting. Pluggable: today :class:`PinnedWeights`
+  and :class:`BlockOffloader`; future strategies (disk-mmap, NVMe-paged,
+  multi-GPU shard) just satisfy the protocol.
 - **Active-set with refcount.** Multiple keys can be active
   simultaneously (e.g. text encoder and embedding processor in the
   same call), and the same key can be acquired re-entrantly (refcount
   bump, the underlying strategy is not re-activated).
-- **Transactional admission, with one caveat.** Activation failure on
-  a freshly-built handle drops the poisoned entry, runs ``close()``,
-  and propagates :class:`ActivationError`. Close failure during
-  eviction propagates :class:`ModelEvictionError` rather than silently
-  corrupting state. **Factory failure** preserves the registration but
-  leaves any pre-eviction *committed* — the cache evicts inactive LRU
-  entries to give the factory a predictable host-memory budget for
-  pinning, and those evictions are not rolled back if the factory
-  raises (rolling back would mean re-pinning the just-released
-  weights, which can OOM the host allocator). The cache stays
+- **Transactional admission, with one caveat.** Activation failures
+  drop the poisoned entry, run ``close()``, and propagate
+  :class:`ActivationError`. Close failure during eviction propagates
+  :class:`ModelEvictionError` rather than silently corrupting state.
+  **Factory failure** preserves the registration but leaves any
+  pre-eviction *committed* — the cache evicts inactive LRU entries to
+  give the factory a predictable host-memory budget for pinning, and
+  those evictions are not rolled back if the factory raises (rolling
+  back would mean re-pinning the just-released weights, which can OOM
+  the host allocator). The cache stays
   internally consistent; the cost is some warm cached entries
   disappearing.
 - **No GPU budget.** The cache only enforces ``max_cache_bytes``
@@ -403,8 +403,7 @@ class ModelCache:
             return
 
         # First lease: ensure built, then activate.
-        is_freshly_built = entry.handle is None
-        if is_freshly_built:
+        if entry.handle is None:
             self._build_into_entry(entry)
         else:
             self._stats.hits += 1
@@ -415,17 +414,66 @@ class ModelCache:
             module = entry.handle.activate()
         except BaseException as exc:
             self._stats.activation_errors += 1
-            if is_freshly_built:
-                # Drop the poisoned entry — no point caching a handle
-                # whose activation just failed. close() may also fail;
-                # log and surface the original.
-                self._discard_freshly_built(entry, cause=exc)
-            else:
-                # Existing cached entry — keep it cached, but it's no
-                # longer active. Put back into the LRU so it remains
-                # eligible for eviction.
-                self._lru[key] = None
+            # Treat all activation failures as poisoned regardless of
+            # whether the entry was freshly built or previously cached.
+            # Strategies like BlockOffloader can fail mid-way through
+            # activate after partially registering hooks / allocating GPU
+            # pool / activating composed PinnedWeights, and their own
+            # rollback can fail (BlockOffloader.activate() preserves
+            # _active=True in that case so close() retries). Caching such
+            # an entry as "ready to retry" lies about its state and the
+            # next acquire would crash on the strategy's not-re-entrant
+            # guard or operate on partially-installed resources.
+            self._discard_entry(entry, cause=exc)
             raise ActivationError(f"activate() failed for {key!r}") from exc
+
+        # Reconcile cache_bytes after a successful activate. Strategies
+        # like BlockOffloader with auto_setup=False that the factory
+        # forgot to prepare() report cache_bytes=0 at admission, then
+        # activate() auto-prepares and pins memory. Without this update
+        # _used_bytes would lag reality and future admissions would
+        # over-commit. If the actual now exceeds max_cache_bytes we
+        # can't unwind mid-context (the strategy is active and being
+        # yielded), so we log and continue — the user is over budget
+        # but at least the accounting reflects it.
+        post_activate_bytes = entry.handle.cache_bytes
+        if post_activate_bytes < 0:
+            # Same guard as the factory-admission path. A misbehaving
+            # strategy returning negative cache_bytes after activate
+            # would corrupt _used_bytes accounting just as it would
+            # at admission. Treat the activation as failed and discard.
+            try:
+                entry.handle.deactivate()
+            except BaseException:
+                pass
+            self._stats.activation_errors += 1
+            self._discard_entry(
+                entry,
+                cause=ValueError(
+                    f"strategy.cache_bytes for {key!r} returned "
+                    f"{post_activate_bytes} (must be >= 0) after activate"
+                ),
+            )
+            raise ModelCacheError(
+                f"strategy.cache_bytes for {key!r} returned "
+                f"{post_activate_bytes} (must be >= 0) after activate"
+            )
+        if post_activate_bytes != entry.cache_bytes:
+            delta = post_activate_bytes - entry.cache_bytes
+            entry.cache_bytes = post_activate_bytes
+            self._used_bytes += delta
+            self._stats.peak_cache_bytes = max(
+                self._stats.peak_cache_bytes, self._used_bytes
+            )
+            if self._used_bytes > self._max_cache_bytes:
+                logger.warning(
+                    "ModelCache over budget after activate(): %r grew from "
+                    "%d to %d bytes; total %d/%d. Factory likely returned "
+                    "an unprepared strategy — call prepare() in the factory "
+                    "so the cache reads correct cache_bytes at admission.",
+                    key, entry.cache_bytes - delta, post_activate_bytes,
+                    self._used_bytes, self._max_cache_bytes,
+                )
 
         entry.active_module = module
         entry.active_count = 1
@@ -591,17 +639,16 @@ class ModelCache:
         finally:
             self._after_close()
 
-    def _discard_freshly_built(self, entry: _Entry, *, cause: BaseException) -> None:
-        """Activation just failed on a freshly-built handle. Roll back
-        the cache state and try to close the handle. Any close failure
-        is logged (don't mask the original activation cause)."""
+    def _discard_entry(self, entry: _Entry, *, cause: BaseException) -> None:
+        """Activation failed (freshly-built or previously-cached). Roll
+        back the cache state, drop the LRU entry, and best-effort close
+        the handle. Any close failure is logged (don't mask the original
+        activation cause)."""
         key = entry.spec.key
         handle = entry.handle
         bytes_to_free = entry.cache_bytes
         entry.handle = None
         entry.cache_bytes = 0
-        # Was never added to LRU (freshly-built path skips it), but be
-        # defensive in case future refactors change that.
         self._lru.pop(key, None)
         self._used_bytes -= bytes_to_free
         if handle is not None:
@@ -610,7 +657,7 @@ class ModelCache:
             except BaseException as close_exc:
                 self._stats.close_errors += 1
                 logger.error(
-                    "close() raised while discarding freshly-built %r whose activate() "
+                    "close() raised while discarding %r whose activate() "
                     "had already failed; original activation error will still propagate. "
                     "close error=%r",
                     key,

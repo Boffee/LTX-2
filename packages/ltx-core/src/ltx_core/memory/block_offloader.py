@@ -213,11 +213,14 @@ class BlockPinnedStore:
             self._param_bufs.append(block_bufs)
             self._param_locs.append(block_locs)
 
-            # Capture (buffer_obj, cpu_clone) — clone owns CPU storage so
-            # the GPU-side .data swap on load doesn't lose the source.
+            # Capture (buffer_obj, cpu_clone) — clone owns pinned CPU
+            # storage so (a) cache_bytes accounting is honest and (b) the
+            # non_blocking=True .to(device) calls in load_block aren't
+            # silently demoted to synchronous (PyTorch requires pinned
+            # source for true async H2D copies).
             buf_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
             for _name, b in layer.named_buffers():
-                cpu_clone = b.data.clone()
+                cpu_clone = b.data.clone(memory_format=torch.contiguous_format).pin_memory()
                 b.data = cpu_clone
                 buf_pairs.append((b, cpu_clone))
             self._buf_pairs.append(buf_pairs)
@@ -463,13 +466,25 @@ class BlockOffloader:
 
     Caveats
     -------
-    - **Tied weights are not deduplicated within or across blocks.** Two
-      ``nn.Parameter`` objects sharing the same storage are cloned into
-      separate pinned buffers, doubling pinned memory and breaking the
-      tying invariant on GPU. LTX-2 transformer blocks have no tied
-      weights so this is a latent concern; cross-region tied weights
-      (block ↔ non-block) and tied-weight detection are handled in a
-      planned follow-up.
+    - **Cross-region and intra-block tied weights are rejected at
+      :meth:`prepare`.** Frozen storage shared across blocks, or
+      between a block and a non-block sibling, can't be preserved by
+      slot-local streaming. Storage shared across two slots within the
+      same block can't be preserved by ``BlockPinnedStore``'s
+      duplicate-removed iteration either. Non-block-internal ties
+      (the standard ``tie_weights()`` embed↔head pattern) are handled
+      correctly via the composed :class:`PinnedWeights`'s storage-key
+      dedup. Models with unsupported tying must untie or use
+      whole-model :class:`PinnedWeights` instead.
+    - **Buffer mutations during forward are discarded on
+      :meth:`deactivate`.** Both block-internal buffers and non-block
+      buffers (via composed :class:`PinnedWeights`) get a pinned CPU
+      copy that overwrites any GPU-side mutations on the round-trip.
+      Suitable for inference of stateless modules and for buffers
+      that only hold derived constants (RoPE tables, sinusoidal
+      embeddings); not suitable for models that need persistent
+      buffer state across calls (BatchNorm running stats updated in
+      training mode, RNN/SSM hidden state, KV cache, etc.).
 
     Parameters
     ----------
@@ -606,6 +621,13 @@ class BlockOffloader:
         # the two pinning regimes either.
         self._detect_cross_region_tied_weights()
 
+        # Direct frozen state on parent modules (params/buffers attached
+        # to the parent itself rather than via a child module) isn't
+        # reachable through the named_children() walk in
+        # _build_non_block_wrapper. Detect and reject so the user can
+        # refactor (wrap the param in a sub-module).
+        self._detect_direct_parent_state()
+
         # Move all blocks AND non-block siblings to CPU. Trainable params
         # come along for the ride (PinnedWeights skips them; block-side
         # trainable will be re-moved to GPU on activate). After prepare()
@@ -680,38 +702,48 @@ class BlockOffloader:
 
     def _detect_cross_region_tied_weights(self) -> None:
         """Group all params across regions (each block + non_block) by
-        storage identity; raise if any group spans regions, regardless
-        of grad state.
+        storage identity; raise on any unsupported tying configuration.
 
-        Cross-region ties are unsupported for two reasons:
+        Three categories are unsupported:
 
-        - Frozen ↔ frozen across regions: the two pinning regimes
-          (per-block ``BlockPinnedStore``, whole-non-block
-          ``PinnedWeights``) can't coordinate to share storage.
-        - Mixed (frozen + trainable) across regions: the frozen side
-          gets pinned and slot-swapped while the trainable side is
-          moved separately on activate, breaking the sharing invariant
-          silently.
+        - **Cross-region ties** (block↔block, block↔non_block): the two
+          pinning regimes (per-block ``BlockPinnedStore`` and
+          whole-non-block composed ``PinnedWeights``) can't coordinate
+          to share storage.
+        - **Mixed frozen/trainable ties** across any region boundary:
+          the frozen side gets pinned and slot-swapped while the
+          trainable side is moved separately on activate, breaking the
+          sharing invariant silently.
+        - **Intra-block ties** (two slots in the same block sharing
+          storage): ``BlockPinnedStore`` uses ``named_parameters()``
+          with default duplicate removal and only swaps one alias slot,
+          leaving the other pointing at non-pinned data. Reject rather
+          than silently break.
 
-        Block-internal ties stay within ``block:N`` and are passed
-        through to ``BlockPinnedStore`` (which doesn't deduplicate but
-        also doesn't break correctness for intra-block sharing — the
-        block always loads as a unit). Non-block-internal ties go to
-        :class:`PinnedWeights` which handles them.
+        Non-block-internal ties go to :class:`PinnedWeights` which
+        handles them via storage-key dedup.
         """
         assert self._layers is not None
         assert self._block_leaf_names is not None
-        # storage_key -> list of (region_label, qualified_name, requires_grad)
-        groups: dict[tuple, list[tuple[str, str, bool]]] = {}
+        # storage_key -> list of (region_label, qualified_name, requires_grad,
+        #                         id(parent), leaf)
+        groups: dict[tuple, list[tuple[str, str, bool, int, str]]] = {}
 
         for block_idx, layer in enumerate(self._layers):
             region = f"block:{block_idx}"
+            modules_map = dict(layer.named_modules(remove_duplicate=False))
             for qual_name, p in layer.named_parameters(remove_duplicate=False):
                 if p.numel() == 0:
                     continue
+                parts = qual_name.rsplit(".", 1)
+                if len(parts) == 2:
+                    parent_obj, leaf = modules_map[parts[0]], parts[1]
+                else:
+                    parent_obj, leaf = layer, qual_name
                 skey = storage_key(p.data)
                 groups.setdefault(skey, []).append(
-                    (region, f"{region}.{qual_name}", p.requires_grad)
+                    (region, f"{region}.{qual_name}", p.requires_grad,
+                     id(parent_obj), leaf)
                 )
 
         for parent_path in self._compute_parent_paths():
@@ -720,18 +752,50 @@ class BlockOffloader:
                 if name in self._block_leaf_names:
                     continue
                 prefix = f"{parent_path}.{name}" if parent_path else name
+                child_modules = dict(child.named_modules(remove_duplicate=False))
                 for qual_name, p in child.named_parameters(prefix=prefix, remove_duplicate=False):
                     if p.numel() == 0:
                         continue
+                    # Strip the prefix to get the path within `child`.
+                    rel_name = qual_name[len(prefix):].lstrip(".")
+                    parts = rel_name.rsplit(".", 1)
+                    if len(parts) == 2:
+                        parent_obj, leaf = child_modules[parts[0]], parts[1]
+                    else:
+                        parent_obj, leaf = child, rel_name
                     skey = storage_key(p.data)
                     groups.setdefault(skey, []).append(
-                        ("non_block", qual_name, p.requires_grad)
+                        ("non_block", qual_name, p.requires_grad,
+                         id(parent_obj), leaf)
                     )
 
+        # Direct params attached to parent / ancestor modules themselves
+        # (rather than via a child). Frozen ones are rejected later by
+        # `_detect_direct_parent_state` since they're unmanageable, but
+        # we still scan them here so a direct *trainable* param tied to
+        # a managed frozen param surfaces as a cross-region mixed tie
+        # rather than silently breaking on activate.
+        ancestor_paths: set[str] = set()
+        for parent_path in self._compute_parent_paths():
+            parts = parent_path.split(".") if parent_path else []
+            for i in range(len(parts) + 1):
+                ancestor_paths.add(".".join(parts[:i]))
+        for path in ancestor_paths:
+            module = _resolve_dotted(self._model, path) if path else self._model
+            for name, p in module._parameters.items():
+                if p is None or p.numel() == 0:
+                    continue
+                qual_name = f"{path}.{name}" if path else name
+                skey = storage_key(p.data)
+                groups.setdefault(skey, []).append(
+                    (f"direct_parent:{path or '<root>'}", qual_name,
+                     p.requires_grad, id(module), name)
+                )
+
         for members in groups.values():
-            regions = {region for region, _, _ in members}
+            regions = {region for region, _, _, _, _ in members}
+            names = sorted(name for _, name, _, _, _ in members)
             if len(regions) > 1:
-                names = sorted(name for _, name, _ in members)
                 raise ValueError(
                     f"BlockOffloader does not support tied parameters across "
                     f"streamed regions: storage shared by {names}. Slot-local "
@@ -739,6 +803,68 @@ class BlockOffloader:
                     "(neither frozen↔frozen nor frozen↔trainable). Use "
                     "whole-model PinnedWeights, disable block streaming, or "
                     "untie the parameters."
+                )
+            # Intra-block ties: a single block region with multiple
+            # distinct (parent, leaf) slot locations means the same
+            # storage is referenced at multiple places within the block
+            # and BlockPinnedStore would only swap one of them.
+            sole_region = next(iter(regions))
+            if sole_region.startswith("block:"):
+                slot_locs = {(pid, leaf) for _, _, _, pid, leaf in members}
+                if len(slot_locs) > 1:
+                    raise ValueError(
+                        f"BlockOffloader does not support intra-block tied "
+                        f"parameters: storage shared by {names} within "
+                        f"{sole_region}. BlockPinnedStore cannot preserve "
+                        "the tying invariant — one alias would stay pointing "
+                        "at non-pinned data. Untie the parameters or use "
+                        "whole-model PinnedWeights instead."
+                    )
+
+    def _detect_direct_parent_state(self) -> None:
+        """Reject direct frozen params/buffers attached to a parent or
+        ancestor module itself (not via a child).
+
+        ``_build_non_block_wrapper`` only walks ``parent.named_children()``
+        for each module in ``_compute_parent_paths()``. Any param or
+        buffer registered directly on one of those parent modules — or
+        on any ancestor up to the root — would be unreachable. Activate
+        would leave it on whatever device it was constructed on,
+        silently breaking the "deactivate releases all GPU footprint"
+        contract. Easier to reject and ask the caller to wrap it in a
+        sub-module.
+        """
+        assert self._model is not None
+        assert self._block_leaf_names is not None
+        # Build the union of parent_paths and all ancestor paths up to
+        # the root, so direct state on the root is checked even when
+        # layers_attr is nested (e.g. "encoder.blocks" → check both
+        # "encoder" and the root "").
+        paths_to_check: set[str] = set()
+        for parent_path in self._compute_parent_paths():
+            parts = parent_path.split(".") if parent_path else []
+            for i in range(len(parts) + 1):
+                paths_to_check.add(".".join(parts[:i]))
+        for path in paths_to_check:
+            parent = _resolve_dotted(self._model, path) if path else self._model
+            for name, p in parent._parameters.items():
+                if p is None or p.requires_grad:
+                    continue
+                raise ValueError(
+                    f"BlockOffloader does not support frozen parameters "
+                    f"attached directly to a parent module. Found "
+                    f"{name!r} on {path or '<model root>'}. Wrap it "
+                    "in a sub-module (e.g. `nn.ParameterDict({'w': p})`) so "
+                    "it's reachable via named_children()."
+                )
+            for name, b in parent._buffers.items():
+                if b is None:
+                    continue
+                raise ValueError(
+                    f"BlockOffloader does not support buffers attached "
+                    f"directly to a parent module. Found {name!r} on "
+                    f"{path or '<model root>'}. Wrap it in a "
+                    "sub-module so it's reachable via named_children()."
                 )
 
     def activate(self) -> nn.Module:

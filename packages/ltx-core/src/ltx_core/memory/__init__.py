@@ -50,6 +50,23 @@ use whole-model ``PinnedWeights`` instead.
 strategies with LRU eviction, an active-set with refcounted leases, and
 transactional admission. See its docstring for design notes.
 
+Compatibility
+-------------
+- **``torch.compile`` is not supported** for managed modules.
+  :class:`PinnedWeights` and :class:`BlockOffloader` swap parameter
+  slots (``module._parameters[leaf] = new_param``) on every
+  activate/deactivate, and :class:`BlockOffloader` registers
+  forward-pre hooks that mutate slots on every block call. Both
+  invalidate the tensor-identity assumptions ``torch.compile`` makes
+  about its trace, producing recompiles or graph breaks at best,
+  silent miscompilation at worst. Compile the surrounding code if
+  needed, but never compile a module that's wrapped by these
+  strategies.
+- **Wrap before DDP/FSDP**, not after. Those wrappers manage parameter
+  storage themselves and conflict with the slot-swap pattern.
+- **Single-thread / sequential.** No internal locking; concurrent use
+  on the same strategy or cache is undefined behavior.
+
 Designed to be a self-contained subpackage so it can be lifted out
 into its own library when a second consumer appears (no LTX imports
 here).
