@@ -1,4 +1,4 @@
-"""Whole-model pinned-CPU weight cache for fast bulk DMA.
+"""Whole-model pinned-CPU weight cache for fast bulk DMA to GPU.
 
 Holds a model's frozen weights in pinned CPU memory so that subsequent
 GPU loads are bulk DMA (~200 ms for a 12 GB Gemma at PCIe Gen5 x16)
@@ -6,28 +6,28 @@ instead of re-reading the safetensors from disk (~3-5 s per call).
 
 Use case: a model that fits on GPU when active but should be evicted
 between calls — e.g., the text encoder during diffusion. Different from
-``streaming.BlockOffloader``: no per-block streaming, no forward hooks,
-no LRU. The whole model goes to GPU on context entry and back to its
-pinned CPU buffers on exit.
+:class:`BlockOffloader`: no per-block streaming, no forward hooks, no
+LRU. The whole model goes to GPU on context entry; on exit, parameter
+``.data`` is repointed back at the pinned CPU buffers so the GPU
+storage is released by refcount once no caller still holds a reference.
 
-Example
+Caveats
 -------
->>> from ltx_core.memory import PinnedWeights
->>> import torch
->>>
->>> model = build_text_encoder(device="cpu")        # build on CPU
->>> cache = PinnedWeights(model, torch.device("cuda"))
->>> # Model now holds its weights in pinned CPU memory.
->>>
->>> with cache.on_gpu() as gpu_model:
-...     embeddings = gpu_model.encode(prompt)
->>> # Weights repointed back to pinned CPU; GPU memory freed.
->>>
->>> # Next call: bulk DMA, no disk read.
->>> with cache.on_gpu() as gpu_model:
-...     embeddings = gpu_model.encode(another_prompt)
->>>
->>> cache.teardown()                                # release pinned RAM
+- The constructor *mutates* the wrapped ``model`` — its frozen ``.data``
+  tensors are repointed at pinned CPU buffers and its registered
+  buffers are replaced with pinned copies. Only use the model via
+  :meth:`on_gpu` after wrapping.
+- Buffer mutations during forward (RNN/SSM state, KV cache,
+  training-mode BatchNorm running stats) are *discarded* on exit.
+  Suitable for inference of stateless modules; not suitable for
+  models that need persistent buffer state across calls.
+- Incompatible with ``torch.compile`` (compile traces capture tensor
+  identity; ``.data`` swaps invalidate the trace).
+- Wrap the model *before* DDP/FSDP — those wrappers manage ``.data``
+  themselves and conflict with this class.
+- ``on_gpu()`` is not re-entrant: nested calls raise ``RuntimeError``.
+- Not thread-safe: concurrent callers on the same instance race on
+  ``.data`` assignment.
 """
 
 from __future__ import annotations
@@ -40,46 +40,42 @@ from typing import Any
 import torch
 from torch import nn
 
-from ltx_core.memory.streaming import _PinnedParamBuffer
+from ltx_core.memory._buffers import PinnedParamBuffer
 
 logger = logging.getLogger(__name__)
 
 
-def _set_buffer(model: nn.Module, dotted_name: str, value: torch.Tensor) -> None:
-    """Replace a registered buffer in-place by its dotted name."""
-    parent: Any = model
-    parts = dotted_name.split(".")
-    for part in parts[:-1]:
-        parent = getattr(parent, part)
-    parent.register_buffer(parts[-1], value, persistent=False)
+def _set_buffer(module: nn.Module, name: str, value: torch.Tensor, persistent: bool) -> None:
+    """Replace a registered buffer in-place by its leaf name on ``module``,
+    preserving the original ``persistent`` flag so ``state_dict()``
+    behavior survives the swap."""
+    module.register_buffer(name, value, persistent=persistent)
 
 
 class PinnedWeights:
     """Whole-model pinned-CPU weight cache with bulk GPU transfer.
 
     On construction, every frozen ``nn.Parameter`` (and optionally every
-    registered buffer) of ``model`` is cloned into pinned CPU memory and
-    the model's tensors are repointed at those pinned buffers. The
-    :meth:`on_gpu` context manager bulk-DMAs everything to ``target_device``
-    for the duration of the with-block, then repoints back to the pinned
-    buffers on exit.
-
-    Trainable parameters (``requires_grad=True``) are *not* pinned — they
-    stay on whatever device they were on when ``PinnedWeights`` was built.
-    For typical inference flows that's a non-issue (everything is frozen);
-    for training flows use :class:`BlockOffloader` instead.
+    registered buffer) is cloned into pinned CPU memory and the model's
+    tensors are repointed at those pinned buffers. The :meth:`on_gpu`
+    context manager bulk-DMAs everything to ``target_device`` for the
+    duration of the with-block, then repoints back to the pinned buffers
+    on exit. Trainable parameters (``requires_grad=True``) are not
+    pinned; constructing on a model with no frozen parameters raises.
 
     Parameters
     ----------
     model:
-        The model to cache. Should be on CPU when passed in (we won't move
-        it for you — that lets the caller control build-time device).
+        The model to cache. Should be on CPU when passed in (we won't
+        move it for you — that lets the caller control build-time
+        device).
     target_device:
         GPU device to bulk-transfer to in :meth:`on_gpu`.
     include_buffers:
         Also cache registered buffers (LayerNorm running stats, position
-        embeddings stored as buffers, etc.). Default True. Set False for
-        models with very large mutable buffers you'd rather rebuild.
+        embeddings stored as buffers, etc.). Default True. Set False
+        for models with very large mutable buffers you'd rather rebuild
+        on each call.
     """
 
     def __init__(
@@ -91,31 +87,55 @@ class PinnedWeights:
         self._model = model
         self._device = target_device
         self._include_buffers = include_buffers
+        self._active = False  # guards re-entry of on_gpu() and teardown-while-active
 
-        # Pin every frozen parameter; trainable params left untouched.
-        self._param_pins: dict[str, _PinnedParamBuffer] = {}
+        # Pin every frozen parameter. Trainable params are left untouched —
+        # PinnedWeights is for inference / frozen-base flows. Use
+        # BlockOffloader for training where some params have grad.
+        self._param_pins: dict[str, PinnedParamBuffer] = {}
         for name, p in model.named_parameters():
             if p.requires_grad:
                 continue
-            self._param_pins[name] = _PinnedParamBuffer(name, p)
+            self._param_pins[name] = PinnedParamBuffer(name, p)
 
-        # Repoint each frozen param's .data at its pinned buffer.
-        # Also reconstruct the quanto wrapper if applicable so the layer's
-        # forward keeps seeing a quantized tensor (not a raw byte buffer).
+        if not self._param_pins:
+            raise ValueError(
+                "PinnedWeights requires at least one frozen parameter to cache. "
+                "All params on the wrapped model have requires_grad=True — for "
+                "training flows use ltx_core.memory.BlockOffloader instead."
+            )
+
+        # Cache (param_obj, buf) pairs once so per-call moves don't re-walk
+        # named_parameters() — saves a bit of overhead and removes name
+        # lookups on the hot path.
+        self._frozen_params: list[tuple[nn.Parameter, PinnedParamBuffer]] = []
         for name, p in model.named_parameters():
-            if name not in self._param_pins:
-                continue
-            buf = self._param_pins[name]
-            p.data = buf.cpu_param.data
+            buf = self._param_pins.get(name)
+            if buf is not None:
+                p.data = buf.cpu_param.data
+                self._frozen_params.append((p, buf))
 
-        # Cache buffers if requested. Buffers are simple tensors; we just
-        # clone+pin and reassign via register_buffer.
-        self._buffer_pins: dict[str, torch.Tensor] = {}
+        # Cache buffers if requested. Capture each buffer's original
+        # ``persistent`` flag so the swap doesn't silently demote it
+        # — without this, a persistent buffer would drop out of
+        # state_dict() after the first on_gpu() restoration.
+        self._buffer_pins: list[tuple[nn.Module, str, torch.Tensor, bool]] = []
         if include_buffers:
-            for name, b in list(model.named_buffers()):
+            for full_name, b in list(model.named_buffers()):
+                parent = self._resolve_parent(model, full_name)
+                leaf = full_name.rsplit(".", 1)[-1]
+                persistent = leaf not in parent._non_persistent_buffers_set
                 pinned = b.detach().clone(memory_format=torch.contiguous_format).pin_memory()
-                self._buffer_pins[name] = pinned
-                _set_buffer(model, name, pinned)
+                _set_buffer(parent, leaf, pinned, persistent)
+                self._buffer_pins.append((parent, leaf, pinned, persistent))
+
+    @staticmethod
+    def _resolve_parent(model: nn.Module, dotted_name: str) -> nn.Module:
+        parent: Any = model
+        parts = dotted_name.split(".")
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        return parent
 
     @property
     def pinned_bytes(self) -> int:
@@ -125,53 +145,74 @@ class PinnedWeights:
             total += buf.pinned_data.numel() * buf.pinned_data.element_size()
             if buf.pinned_scale is not None:
                 total += buf.pinned_scale.numel() * buf.pinned_scale.element_size()
-        for b in self._buffer_pins.values():
-            total += b.numel() * b.element_size()
+        for _, _, pinned, _ in self._buffer_pins:
+            total += pinned.numel() * pinned.element_size()
         return total
 
     @contextlib.contextmanager
     def on_gpu(self) -> Iterator[nn.Module]:
         """Bulk-DMA pinned weights to GPU; yield model; restore on exit.
 
-        On entry: every cached param + buffer is transferred to
-        ``target_device`` (non-blocking, then a single ``cuda.synchronize``).
-        Inside the with-block, the model is fully GPU-resident and can be
-        called normally. On exit, ``.data`` is repointed back to the pinned
-        CPU buffers — the GPU storage is released by Python refcount once
-        no caller still holds a reference to it.
+        On entry, every cached param and buffer is transferred to
+        ``target_device`` (non-blocking, then a single
+        ``cuda.synchronize`` to make the writes visible). Inside the
+        with-block, the model is fully GPU-resident. On exit,
+        parameter ``.data`` is repointed back at the pinned CPU
+        buffers — the GPU storage is released by refcount once no
+        caller still holds a reference to it.
+
+        Not re-entrant; nested calls raise ``RuntimeError``.
         """
-        self._move_to_gpu()
+        if self._active:
+            raise RuntimeError(
+                "PinnedWeights.on_gpu() is not re-entrant. The wrapped model "
+                "is already inside an active on_gpu() context."
+            )
+        if not self._param_pins:
+            raise RuntimeError(
+                "PinnedWeights has been torn down — pinned buffers are released."
+            )
+        self._active = True
         try:
-            yield self._model
+            self._move_to_gpu()
+            try:
+                yield self._model
+            finally:
+                self._move_to_pinned()
         finally:
-            self._move_to_pinned()
+            self._active = False
 
     def _move_to_gpu(self) -> None:
-        for name, p in self._model.named_parameters():
-            if name not in self._param_pins:
-                continue
-            gpu_param = self._param_pins[name].load_to_gpu(self._device, non_blocking=True)
-            p.data = gpu_param.data
+        for p, buf in self._frozen_params:
+            p.data = buf.load_to_gpu(self._device, non_blocking=True).data
         if self._include_buffers:
-            for name in list(self._buffer_pins):
-                _set_buffer(
-                    self._model,
-                    name,
-                    self._buffer_pins[name].to(self._device, non_blocking=True),
-                )
+            for parent, leaf, pinned, persistent in self._buffer_pins:
+                _set_buffer(parent, leaf, pinned.to(self._device, non_blocking=True), persistent)
         if self._device.type == "cuda":
+            # Single device-wide sync makes the non-blocking H2D copies
+            # visible to subsequent kernels. Stream-level sync would be
+            # finer-grained but transfers ran on the current stream, so
+            # device sync is sufficient and parallel-stream-safe.
             torch.cuda.synchronize(self._device)
 
     def _move_to_pinned(self) -> None:
-        for name, p in self._model.named_parameters():
-            if name not in self._param_pins:
-                continue
-            p.data = self._param_pins[name].cpu_param.data
+        for p, buf in self._frozen_params:
+            p.data = buf.cpu_param.data
         if self._include_buffers:
-            for name, pinned in self._buffer_pins.items():
-                _set_buffer(self._model, name, pinned)
+            for parent, leaf, pinned, persistent in self._buffer_pins:
+                _set_buffer(parent, leaf, pinned, persistent)
 
     def teardown(self) -> None:
-        """Release pinned CPU buffers. The wrapped model is unusable after."""
+        """Release pinned CPU buffers. The wrapped model is unusable
+        after teardown. Raises if called while inside an ``on_gpu()``
+        context — call would leave the model holding GPU tensors with
+        no path back."""
+        if self._active:
+            raise RuntimeError(
+                "PinnedWeights.teardown() called while on_gpu() is active - "
+                "exit the context first or the model would be left holding "
+                "GPU tensors that cannot be restored."
+            )
         self._param_pins.clear()
+        self._frozen_params.clear()
         self._buffer_pins.clear()

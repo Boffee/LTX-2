@@ -172,8 +172,9 @@ class DiffusionStage:
         # Optional user-provided wrapper around the freshly-built transformer.
         # Receives the CPU-resident transformer and returns a context manager
         # that yields the wrapped (or same) module to use for inference. Lets
-        # callers swap in heavier offloaders (e.g. ltx_core.block_offloader.
-        # BlockOffloader) without modifying ltx-pipelines source.
+        # callers swap in heavier offloaders (e.g. ltx_core.memory.
+        # BlockOffloader / PinnedWeights) without modifying ltx-pipelines
+        # source.
         # When set, takes precedence over the built-in streaming_prefetch_count
         # path. When None, the existing LayerStreamingWrapper / gpu_model
         # behavior is preserved.
