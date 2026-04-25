@@ -43,7 +43,7 @@ from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
-from ltx_trainer.block_offloader import TrainingBlockOffloader
+from ltx_core.block_offloader import BlockOffloader
 from ltx_trainer.training_strategies import get_training_strategy
 from ltx_trainer.utils import open_image_as_srgb, save_image
 from ltx_trainer.validation_sampler import CachedPromptEmbeddings, GenerationConfig, ValidationSampler
@@ -704,7 +704,7 @@ class LtxvTrainer:
         # Embedding connectors are already on GPU from _load_text_encoder_and_cache_embeddings
 
         # Set up block offloading (must happen before accelerator.prepare while weights are on CPU)
-        self._block_offloader: TrainingBlockOffloader | None = None
+        self._block_offloader: BlockOffloader | None = None
         blocks_to_swap = self._config.acceleration.blocks_to_swap
         if blocks_to_swap is not None and blocks_to_swap > 0:
             if self._accelerator.distributed_type == DistributedType.FSDP or self._accelerator.num_processes > 1:
@@ -720,7 +720,7 @@ class LtxvTrainer:
                 if hasattr(self._transformer, "get_base_model")
                 else self._transformer
             )
-            self._block_offloader = TrainingBlockOffloader(
+            self._block_offloader = BlockOffloader(
                 model=base_transformer,
                 target_device=self._accelerator.device,
                 blocks_to_swap=blocks_to_swap,

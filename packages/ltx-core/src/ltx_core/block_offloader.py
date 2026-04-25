@@ -1,4 +1,4 @@
-"""Block-level CPU offloading for memory-efficient LoRA training.
+"""Block-level CPU offloading for memory-efficient training and inference.
 
 Keeps most frozen transformer block weights on CPU in persistent pinned
 memory buffers. Uses a background thread and dedicated CUDA stream to
@@ -9,9 +9,11 @@ Quanto ``WeightQBytesTensor`` weights are decomposed into their inner
 then reconstructed on GPU via ``WeightQBytesTensor.create()``.
 
 Uses LRU eviction so the pre_hook works regardless of traversal direction
-(forward 0→47 or backward recomputation 47→0).
+(forward 0→47 or backward recomputation 47→0 with gradient checkpointing).
 
-LoRA parameters stay on GPU permanently.
+Trainable parameters (e.g. LoRA adapters with ``requires_grad=True``) stay
+on GPU permanently so the offload doesn't disrupt backward. For inference
+with frozen LoRA adapters, merge the LoRA into the base weights first.
 """
 
 from __future__ import annotations
@@ -490,8 +492,8 @@ def _move_lora_to_device(layer: nn.Module, device: torch.device) -> None:
 # ---------------------------------------------------------------------------
 
 
-class TrainingBlockOffloader:
-    """Streams frozen transformer blocks between CPU and GPU for LoRA training.
+class BlockOffloader:
+    """Streams frozen transformer blocks between CPU and GPU.
 
     Frozen weights are kept in persistent pinned CPU buffers. Prefetch uses
     a background thread and dedicated CUDA stream to overlap DMA with compute.
@@ -499,7 +501,9 @@ class TrainingBlockOffloader:
     DMA and reconstructed on GPU.
 
     A pre-allocated GPU buffer pool avoids CUDA malloc/free overhead during
-    training and provides explicit multi-stream safety via per-slot events.
+    training/inference and provides explicit multi-stream safety via per-slot
+    events. Trainable parameters (e.g. LoRA adapters added via PEFT) stay on
+    GPU permanently, so backward through them is unaffected by the offload.
 
     Parameters
     ----------
@@ -736,3 +740,6 @@ class TrainingBlockOffloader:
     def reset_peak(self) -> None:
         if self._tracker is not None:
             self._tracker.peak_gpu_blocks = len(self._tracker._on_gpu) + len(self._pending)
+
+# Back-compat alias — old name from when this lived in ltx-trainer.
+TrainingBlockOffloader = BlockOffloader
