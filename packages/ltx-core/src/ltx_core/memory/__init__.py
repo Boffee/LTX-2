@@ -14,9 +14,9 @@ Two complementary offload strategies:
   buffers and the GPU storage is released by refcount. No GPU→CPU DMA
   is needed because the pinned buffer is the persistent source of truth.
 
-Both classes share the underlying pinned-buffer machinery from
-``_buffers.PinnedParamBuffer`` (clone + pin + optional quanto
-decomposition), so quantized models work with either.
+Both classes share the underlying packed-slab machinery from
+``_buffers`` (:class:`PinnedSlab` + :class:`GpuSlab`, with optional
+quanto decomposition), so quantized models work with either.
 
 Designed to be a self-contained subpackage so it can be lifted out
 into its own library when a second consumer appears (no LTX imports

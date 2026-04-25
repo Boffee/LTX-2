@@ -5,27 +5,21 @@ Internal to the ``ltx_core.memory`` subpackage. Not part of the public
 API, but lives in its own module so both consumers can reach it without
 crossing each other's private namespaces.
 
-Two designs coexist here during the v1→v2 storage migration:
+Two complementary types:
 
-* ``PinnedParamBuffer`` (legacy): per-parameter pinned CPU clone +
-  ``cpu_param`` ``nn.Parameter`` wrapper. Each consumer holds 1 clone
-  per param; for the streaming offloader, a downstream ``_PackedSlab``
-  re-clones into a packed flat buffer for fast bulk DMA — leading to
-  ~2× the CPU pinned RAM (~92 GB on the 22B bf16 + offload config).
-* ``PinnedSlab`` / ``GpuSlab`` (new): a single packed pinned-CPU buffer
-  per dtype group serves as both the source of truth (param.data is
-  set to an ``as_strided`` view into it) and the bulk DMA source.
-  Eliminates the redundant per-param clone entirely.
-
-Both are exposed during the migration. The existing ``BlockOffloader``
-and ``PinnedWeights`` still consume ``PinnedParamBuffer``; subsequent
-phases will move them onto ``PinnedSlab``/``GpuSlab`` and the legacy
-class will be removed.
+* :class:`PinnedSlab` — packed pinned-CPU storage for a group of
+  frozen ``nn.Parameter`` s, grouped by dtype. Single source of
+  truth: ``install_into_params()`` repoints each model param.data
+  at an ``as_strided`` view into the slab.
+* :class:`GpuSlab` — matching GPU-side storage with the same layout.
+  ``PinnedSlab.bulk_to_gpu`` does one ``copy_()`` per dtype group;
+  per-param view tensors on the GPU side are built once at
+  construction and remain stable across loads.
 
 Quanto ``WeightQBytesTensor`` is decomposed into its ``_data`` and
-``_scale`` components so the pinned buffer holds exactly two contiguous
-CPU tensors (which can be DMA'd in one ``copy_()`` each) and the
-quantized wrapper is reconstructed on GPU at load time.
+``_scale`` components so they pack into separate dtype groups; the
+quantized wrapper is reconstructed via ``WeightQBytesTensor.create``
+around the slab views on both CPU and GPU sides.
 """
 
 from __future__ import annotations
@@ -51,57 +45,7 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Legacy: per-parameter pinned clone
-# ---------------------------------------------------------------------------
-
-
-class PinnedParamBuffer:
-    """[Legacy] Pinned CPU storage for one frozen parameter.
-
-    Used by ``BlockOffloader`` and ``PinnedWeights`` today. Will be
-    replaced by ``PinnedSlab`` once the migration phases land.
-    """
-
-    __slots__ = (
-        "act_qt", "axis", "cpu_param", "is_quanto", "name",
-        "pinned_data", "pinned_scale", "qtype", "size", "stride",
-    )
-
-    def __init__(self, name: str, param: nn.Parameter) -> None:
-        self.name = name
-        t = param.data
-        if _QUANTO_AVAILABLE and isinstance(t, WeightQBytesTensor):
-            self.is_quanto = True
-            self.pinned_data = t._data.clone(memory_format=torch.contiguous_format).pin_memory()
-            self.pinned_scale = t._scale.clone(memory_format=torch.contiguous_format).pin_memory()
-            self.qtype = t.qtype
-            self.axis = t.axis
-            self.size = t.size()
-            self.stride = t.stride()
-            self.act_qt = getattr(t, "activation_qtype", None)
-            qt = WeightQBytesTensor.create(
-                self.qtype, self.axis, self.size, self.stride,
-                self.pinned_data, self.pinned_scale, self.act_qt,
-            )
-            self.cpu_param = nn.Parameter(qt, requires_grad=False)
-        else:
-            self.is_quanto = False
-            self.pinned_data = t.data.clone(memory_format=torch.contiguous_format).pin_memory()
-            self.pinned_scale = None
-            self.qtype = self.axis = self.size = self.stride = self.act_qt = None
-            self.cpu_param = nn.Parameter(self.pinned_data, requires_grad=False)
-
-    def load_to_gpu(self, device: torch.device, non_blocking: bool = False) -> nn.Parameter:
-        if self.is_quanto:
-            gd = self.pinned_data.to(device, non_blocking=non_blocking)
-            gs = self.pinned_scale.to(device, non_blocking=non_blocking)
-            qt = WeightQBytesTensor.create(self.qtype, self.axis, self.size, self.stride, gd, gs, self.act_qt)
-            return nn.Parameter(qt, requires_grad=False)
-        return nn.Parameter(self.pinned_data.to(device, non_blocking=non_blocking), requires_grad=False)
-
-
-# ---------------------------------------------------------------------------
-# New: packed slab storage with per-param views
+# Packed slab storage with per-param views
 # ---------------------------------------------------------------------------
 
 
