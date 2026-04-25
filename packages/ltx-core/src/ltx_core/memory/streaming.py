@@ -218,26 +218,34 @@ class _BlockPinnedStore:
 
     def _blocks_are_homogeneous(self) -> bool:
         """All blocks must have identical layouts (same param names,
-        shapes, dtypes, quanto specs) for pool slot reuse to be safe."""
+        shapes, dtypes, quanto specs including activation_qtype and
+        outer size/stride) for pool slot reuse to be safe.
+
+        Outer ``size``/``stride`` and ``act_qt`` are part of the quanto
+        wrapper that ``make_gpu_param`` reconstructs from a template;
+        if any block has a different outer layout the slot's cached
+        Parameter would describe a tensor that no longer matches its
+        own backing storage, so pool reuse must fall back to per-load
+        allocation.
+        """
         if len(self._param_bufs) <= 1:
             return True
         ref = self._param_bufs[0]
-        ref_keys = [
-            (b.name, b.pinned_data.shape, b.pinned_data.dtype, b.is_quanto,
-             b.pinned_scale.shape if b.pinned_scale is not None else None,
-             b.pinned_scale.dtype if b.pinned_scale is not None else None,
-             b.qtype, b.axis)
-            for b in ref
-        ]
+
+        def _key(b: PinnedParamBuffer) -> tuple:
+            return (
+                b.name, b.pinned_data.shape, b.pinned_data.dtype, b.is_quanto,
+                b.pinned_scale.shape if b.pinned_scale is not None else None,
+                b.pinned_scale.dtype if b.pinned_scale is not None else None,
+                b.qtype, b.axis, b.act_qt, b.size, b.stride,
+            )
+
+        ref_keys = [_key(b) for b in ref]
         for block in self._param_bufs[1:]:
             if len(block) != len(ref_keys):
                 return False
             for ref_tup, b in zip(ref_keys, block, strict=True):
-                cur = (b.name, b.pinned_data.shape, b.pinned_data.dtype, b.is_quanto,
-                       b.pinned_scale.shape if b.pinned_scale is not None else None,
-                       b.pinned_scale.dtype if b.pinned_scale is not None else None,
-                       b.qtype, b.axis)
-                if cur != ref_tup:
+                if _key(b) != ref_tup:
                     return False
         return True
 
@@ -383,6 +391,15 @@ class BlockOffloader:
     training/inference and provides explicit multi-stream safety via per-slot
     events. Trainable parameters (e.g. LoRA adapters added via PEFT) stay on
     GPU permanently, so backward through them is unaffected by the offload.
+
+    Caveats
+    -------
+    - **Tied weights are not deduplicated.** Two ``nn.Parameter`` objects
+      sharing the same storage (rare in transformer block lists, but
+      possible in some architectures) are cloned into separate pinned
+      buffers, doubling pinned memory and breaking the tying invariant on
+      GPU. LTX-2 transformer blocks have no tied weights so this is a
+      latent concern; restore explicit dedup if a consumer hits it.
 
     Parameters
     ----------

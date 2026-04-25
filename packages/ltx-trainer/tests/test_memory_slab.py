@@ -68,8 +68,10 @@ class TestPinnedParamBuffer:
         buf.copy_to_gpu(gpu_data, gpu_scale, non_blocking=True)
         torch.cuda.synchronize()
         assert torch.equal(gpu_data.cpu(), new_vals)
-        # Stable Parameter object — gpu_param identity preserved.
-        assert gpu_param is gpu_param  # tautology; documents intent
+        # Stable storage — gpu_param wraps the same GPU bytes as gpu_data.
+        # _GpuSlot relies on this: build the Parameter wrapper once at slot
+        # construction, mutate underlying storage in place on each load.
+        assert gpu_param.data_ptr() == gpu_data.data_ptr()
 
     def test_contiguous_format_forced(self) -> None:
         # A view of a transposed tensor is non-contiguous. clone() with
@@ -92,3 +94,89 @@ class TestPinnedParamBuffer:
         buf = PinnedParamBuffer("w", p)
         ptr_before = buf.cpu_param.data.data_ptr()
         assert ptr_before == buf.pinned_data.data_ptr()
+
+    @CUDA
+    def test_slot_param_identity_stable_across_loads(self) -> None:
+        # _GpuSlot caches the Parameter wrapping its GPU storage; copy_from
+        # must not churn that wrapper. Hooks repointing submod._parameters
+        # at slot.get_param() observe a stable object across reloads — the
+        # whole point of the pool-slot pattern over per-load allocation.
+        from ltx_core.memory.streaming import _GpuSlot
+
+        p1 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
+        p2 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
+        block = [PinnedParamBuffer("a", p1), PinnedParamBuffer("b", p2)]
+        slot = _GpuSlot(block, torch.device("cuda"))
+
+        a_first = slot.get_param("a")
+        b_first = slot.get_param("b")
+        slot.copy_from(block, non_blocking=False)
+        torch.cuda.synchronize()
+        assert slot.get_param("a") is a_first
+        assert slot.get_param("b") is b_first
+        slot.copy_from(block, non_blocking=False)
+        torch.cuda.synchronize()
+        assert slot.get_param("a") is a_first
+        assert slot.get_param("b") is b_first
+
+
+# ---------------------------------------------------------------------------
+# Quanto path — only nontrivial branch in PinnedParamBuffer
+# ---------------------------------------------------------------------------
+
+
+class TestPinnedParamBufferQuanto:
+    def test_pin_decomposes_data_and_scale(self) -> None:
+        # Quanto WeightQBytesTensor must be decomposed into _data + _scale
+        # and the cpu_param wrapper reconstructed from the pinned tensors.
+        # A naive tensor.clone() would silently dequantize via the dispatch
+        # fallback — that bug is the reason _buffers.py exists.
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols = 4, 8
+        data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8)
+        scale = torch.rand(rows, 1, dtype=torch.bfloat16)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+        )
+        p = nn.Parameter(qt, requires_grad=False)
+        buf = PinnedParamBuffer("w", p)
+
+        assert buf.is_quanto
+        assert buf.pinned_data.is_pinned()
+        assert buf.pinned_data.is_contiguous()
+        assert buf.pinned_data.dtype == torch.int8
+        assert buf.pinned_scale is not None
+        assert buf.pinned_scale.is_pinned()
+        assert buf.qtype is quanto.qint8
+        assert buf.axis == 0
+        assert tuple(buf.size) == (rows, cols)
+        assert buf.stride == (cols, 1)
+        assert buf.act_qt is None
+        # cpu_param wraps a quanto tensor pointing at the pinned tensors.
+        assert isinstance(buf.cpu_param.data, WeightQBytesTensor)
+        assert buf.cpu_param.data._data.data_ptr() == buf.pinned_data.data_ptr()
+        assert buf.cpu_param.data._scale.data_ptr() == buf.pinned_scale.data_ptr()
+
+    @CUDA
+    def test_load_to_gpu_round_trip(self) -> None:
+        quanto = pytest.importorskip("optimum.quanto")
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        rows, cols = 4, 8
+        data = torch.randint(-128, 127, (rows, cols), dtype=torch.int8)
+        scale = torch.rand(rows, 1, dtype=torch.bfloat16)
+        qt = WeightQBytesTensor.create(
+            quanto.qint8, 0, (rows, cols), (cols, 1), data, scale, None,
+        )
+        p = nn.Parameter(qt, requires_grad=False)
+        buf = PinnedParamBuffer("w", p)
+
+        gpu_param = buf.load_to_gpu(torch.device("cuda"))
+        torch.cuda.synchronize()
+        assert isinstance(gpu_param.data, WeightQBytesTensor)
+        assert gpu_param.data._data.is_cuda
+        assert gpu_param.data._scale.is_cuda
+        assert torch.equal(gpu_param.data._data.cpu(), buf.pinned_data)
+        assert torch.equal(gpu_param.data._scale.cpu(), buf.pinned_scale)

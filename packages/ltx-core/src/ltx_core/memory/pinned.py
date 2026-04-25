@@ -28,6 +28,12 @@ Caveats
 - ``on_gpu()`` is not re-entrant: nested calls raise ``RuntimeError``.
 - Not thread-safe: concurrent callers on the same instance race on
   ``.data`` assignment.
+- **Tied weights are not deduplicated.** Two ``nn.Parameter`` objects
+  sharing the same storage (e.g. embedding ↔ output projection in some
+  Gemma variants and image LLMs) are cloned into separate pinned
+  buffers, doubling pinned memory and breaking the tying invariant
+  on GPU. Skip this class for such models or untie the weights first;
+  restore explicit ``data_ptr()`` dedup at construction if needed.
 """
 
 from __future__ import annotations
