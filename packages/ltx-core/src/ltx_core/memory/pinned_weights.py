@@ -8,32 +8,45 @@ Use case: a model that fits on GPU when active but should be evicted
 between calls — text encoder during diffusion, VAE between encode and
 decode phases, etc. Different from :class:`BlockOffloader`: no per-block
 streaming, no forward hooks, no LRU. The whole model goes to GPU on
-context entry; on exit, parameter ``.data`` is repointed back at the
-pinned CPU storage so the GPU storage is released by refcount.
+:meth:`PinnedWeights.activate` and the GPU storage is released on
+:meth:`PinnedWeights.deactivate` by repointing each module's parameter
+slot back at a Parameter that wraps pinned CPU storage.
+
+Implements :class:`~ltx_core.memory.strategy.ModelStrategy` so it plugs
+into a model cache directly.
 
 Caveats
 -------
-- The constructor *mutates* the wrapped ``model`` — its frozen
-  ``.data`` tensors are repointed at pinned CPU buffers and its
-  registered buffers are replaced with pinned copies. Only use the
-  model via :meth:`on_gpu` after wrapping.
+- The constructor *mutates* the wrapped ``model`` — each frozen
+  parameter slot (``module._parameters[leaf]``) is replaced with a
+  Parameter wrapping pinned CPU storage, and registered buffers are
+  replaced with pinned copies. Only use the model via :meth:`activate`
+  or context-manager entry after wrapping.
+- Slot replacement (rather than ``param.data`` swap) is required for
+  correctness with quanto ``WeightQBytesTensor``: assigning
+  ``param.data = new_quanto_tensor`` is a no-op for the inner ``_data``
+  / ``_scale`` storages, so the model would silently keep referencing
+  the original (non-pinned) quanto wrapper.
 - Buffer mutations during forward (RNN/SSM state, KV cache,
-  training-mode BatchNorm running stats) are *discarded* on exit.
-  Suitable for inference of stateless modules; not suitable for
-  models that need persistent buffer state across calls.
+  training-mode BatchNorm running stats) are *discarded* on
+  :meth:`deactivate`. Suitable for inference of stateless modules; not
+  suitable for models that need persistent buffer state across calls.
 - Incompatible with ``torch.compile`` (compile traces capture tensor
-  identity; ``.data`` swaps invalidate the trace).
-- Wrap the model *before* DDP/FSDP — those wrappers manage ``.data``
-  themselves and conflict with this class.
-- ``on_gpu()`` is not re-entrant: nested calls raise ``RuntimeError``.
-- Not thread-safe: concurrent callers on the same instance race on
-  ``.data`` assignment.
-- **Tied weights are not deduplicated.** Two ``nn.Parameter`` objects
-  sharing the same storage (e.g. embedding ↔ output projection in some
-  Gemma variants and image LLMs) are cloned into separate pinned
-  buffers, doubling pinned memory and breaking the tying invariant
-  on GPU. Skip this class for such models or untie the weights first;
-  restore explicit ``data_ptr()`` dedup at construction if needed.
+  identity; slot swaps invalidate the trace).
+- Wrap the model *before* DDP/FSDP — those wrappers manage parameter
+  storage themselves and conflict with this class.
+- :meth:`activate` is not re-entrant: nested calls raise ``RuntimeError``.
+- Not thread-safe: concurrent callers on the same instance race on slot
+  assignment.
+- :meth:`close` is destructive: it moves the wrapped model to the
+  ``meta`` device to release storage references. The model object is
+  unusable after ``close()``; callers must rebuild to use it again.
+- Tied weights *are* deduplicated. Two parameter slots whose values
+  share underlying storage — whether the standard ``tie_weights()``
+  pattern (one ``Parameter`` under multiple names) or the rarer case
+  of distinct quanto wrappers around shared inner ``_data`` — share a
+  single :class:`PinnedParamBuffer` and a single Parameter wrapper on
+  activation, preserving the tying invariant on GPU.
 """
 
 from __future__ import annotations
@@ -41,6 +54,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from collections.abc import Iterator
+from types import TracebackType
 from typing import Any
 
 import torch
@@ -50,6 +64,14 @@ from ltx_core.memory.pinned_buffer import PinnedParamBuffer
 
 logger = logging.getLogger(__name__)
 
+_QUANTO_AVAILABLE = False
+try:
+    from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+    _QUANTO_AVAILABLE = True
+except ImportError:
+    pass
+
 
 def _set_buffer(module: nn.Module, name: str, value: torch.Tensor, persistent: bool) -> None:
     """Replace a registered buffer in-place by its leaf name on
@@ -58,16 +80,59 @@ def _set_buffer(module: nn.Module, name: str, value: torch.Tensor, persistent: b
     module.register_buffer(name, value, persistent=persistent)
 
 
+def _storage_key(t: torch.Tensor) -> tuple[Any, ...]:
+    """Identity key for tied-weight detection.
+
+    Two tensors that produce the same key represent the same logical
+    tensor backed by the same storage region with the same view layout
+    and (for quanto) the same quant metadata; they can be deduplicated
+    into a single :class:`PinnedParamBuffer`.
+
+    Note: pure storage identity is not sufficient — two views into the
+    same parent tensor with different shape/stride/offset must not
+    dedup. The key incorporates view layout for that reason.
+    """
+    if _QUANTO_AVAILABLE and isinstance(t, WeightQBytesTensor):
+        return (
+            "quanto",
+            t._data.data_ptr(),
+            t._data.dtype,
+            tuple(t._data.shape),
+            t._data.stride(),
+            t._data.storage_offset(),
+            t._scale.data_ptr(),
+            t._scale.dtype,
+            tuple(t._scale.shape),
+            t._scale.stride(),
+            t._scale.storage_offset(),
+            t.qtype,
+            t.axis,
+            tuple(t.size()),
+            t.stride(),
+            getattr(t, "activation_qtype", None),
+        )
+    return (
+        "plain",
+        t.data_ptr(),
+        t.dtype,
+        tuple(t.shape),
+        t.stride(),
+        t.storage_offset(),
+    )
+
+
 class PinnedWeights:
     """Whole-model pinned-CPU weight cache with bulk GPU transfer.
 
-    On construction, every frozen ``nn.Parameter`` is wrapped in a
-    :class:`PinnedParamBuffer` (handling quanto decomposition where
-    applicable) and the model's ``param.data`` is repointed at the
-    pinned ``cpu_param``. The :meth:`on_gpu` context manager transfers
-    every pinned buffer to ``target_device`` for the duration of the
-    with-block, then repoints back to the pinned CPU storage on exit
-    so the GPU storage is released by refcount.
+    Implements :class:`~ltx_core.memory.strategy.ModelStrategy`.
+
+    On construction, every frozen parameter slot is replaced with a
+    Parameter wrapping pinned CPU storage (handling quanto decomposition
+    and tied-weight dedup). :meth:`activate` allocates GPU tensors for
+    each unique pinned buffer, swaps the matching Parameter into every
+    slot that pointed at that buffer, and returns the model;
+    :meth:`deactivate` swaps the slots back at the pinned-CPU
+    Parameters so the GPU storage is released by refcount.
 
     Trainable parameters (``requires_grad=True``) are not pinned;
     constructing on a model with no frozen parameters raises.
@@ -79,7 +144,7 @@ class PinnedWeights:
         move it for you — that lets the caller control build-time
         device).
     target_device:
-        GPU device to bulk-transfer to in :meth:`on_gpu`.
+        GPU device to bulk-transfer to in :meth:`activate`.
     include_buffers:
         Also cache registered buffers (LayerNorm running stats, position
         embeddings stored as buffers, etc.). Default True. Set False
@@ -93,45 +158,120 @@ class PinnedWeights:
         target_device: torch.device,
         include_buffers: bool = True,
     ) -> None:
-        self._model = model
+        self._model: nn.Module | None = model
         self._device = target_device
         self._include_buffers = include_buffers
-        self._active = False  # guards re-entry of on_gpu() and teardown-while-active
+        self._active = False  # guards re-entry of activate() and close-while-active
+        self._closed = False
 
-        # Pin every frozen parameter via PinnedParamBuffer (quanto-aware).
-        self._param_bufs: dict[str, PinnedParamBuffer] = {}
-        for name, p in model.named_parameters():
-            if p.requires_grad:
-                continue
-            self._param_bufs[name] = PinnedParamBuffer(name, p)
+        # Tied-weight aware pinning. We walk both named_modules and
+        # named_parameters with remove_duplicate=False so:
+        #   - shared submodule aliases (m.a is m.b) get visited at every
+        #     alias rather than just one canonical name
+        #   - the standard tie_weights() pattern (one Parameter under
+        #     multiple names) shows up at every name
+        # We then group by storage identity and validate requires_grad
+        # uniformity per group: a tied group with mixed
+        # trainable/frozen members would silently break the tying
+        # invariant if we pinned only the frozen members, so we raise.
+        # All-trainable groups are skipped (PinnedWeights only manages
+        # frozen weights). All-frozen groups become one PinnedParamBuffer
+        # whose slot-location list is deduped by (id(parent), leaf) so
+        # we don't double-write into shared submodules.
+        modules_map = dict(model.named_modules(remove_duplicate=False))
+        # storage_key -> list of (name, param, parent_module, leaf)
+        groups: dict[tuple[Any, ...], list[tuple[str, nn.Parameter, nn.Module, str]]] = {}
+        for name, p in model.named_parameters(remove_duplicate=False):
+            parts = name.rsplit(".", 1)
+            if len(parts) == 2:
+                parent_path, leaf = parts
+                parent = modules_map[parent_path]
+            else:
+                parent, leaf = model, name
+            if p.numel() == 0:
+                # Zero-sized tensors all share data_ptr()==0; key by id(p)
+                # to keep them in independent groups rather than spuriously
+                # collapsing them.
+                skey = ("__empty__", id(p), name)
+            else:
+                skey = _storage_key(p.data)
+            groups.setdefault(skey, []).append((name, p, parent, leaf))
 
-        if not self._param_bufs:
+        # Per unique buffer: (PinnedParamBuffer, list of (parent, leaf)).
+        self._slots: list[tuple[PinnedParamBuffer, list[tuple[nn.Module, str]]]] = []
+        for members in groups.values():
+            grad_states = {p.requires_grad for _, p, _, _ in members}
+            if len(grad_states) > 1:
+                names = [n for n, _, _, _ in members]
+                raise ValueError(
+                    f"Tied storage spans both trainable and frozen parameters: "
+                    f"{names}. PinnedWeights cannot pin a tied group with mixed "
+                    "requires_grad without breaking the tying invariant. Untie "
+                    "the parameters or freeze/unfreeze them consistently."
+                )
+            if True in grad_states:
+                continue  # all trainable — PinnedWeights does not manage these
+            first_name, first_p = members[0][0], members[0][1]
+            buf = PinnedParamBuffer(first_name, first_p)
+            seen_locs: set[tuple[int, str]] = set()
+            locs: list[tuple[nn.Module, str]] = []
+            for _, _, parent, leaf in members:
+                key = (id(parent), leaf)
+                if key in seen_locs:
+                    continue
+                seen_locs.add(key)
+                locs.append((parent, leaf))
+            self._slots.append((buf, locs))
+
+        if not self._slots:
             raise ValueError(
                 "PinnedWeights requires at least one frozen parameter to cache. "
                 "All params on the wrapped model have requires_grad=True - for "
                 "training flows use ltx_core.memory.BlockOffloader instead."
             )
 
-        # Cache (param, buf) pairs once so per-call moves don't re-walk
-        # named_parameters().
-        self._frozen_params: list[tuple[nn.Parameter, PinnedParamBuffer]] = []
-        for name, p in model.named_parameters():
-            buf = self._param_bufs.get(name)
-            if buf is not None:
-                p.data = buf.cpu_param.data
-                self._frozen_params.append((p, buf))
+        # Initial repoint: every frozen slot now references the pinned
+        # cpu_param. Tied slots all reference the same Parameter object,
+        # which is stronger than the pre-PinnedWeights tying invariant
+        # (those may have been distinct Parameter objects sharing storage).
+        for buf, locs in self._slots:
+            for parent, leaf in locs:
+                parent._parameters[leaf] = buf.cpu_param
 
-        # Cache buffers if requested. Capture each buffer's original
-        # persistent flag so the swap doesn't silently demote it.
-        self._buffer_pins: list[tuple[nn.Module, str, torch.Tensor, bool]] = []
+        # Cache buffers if requested. Same alias-aware grouping as
+        # parameters: shared buffer instances visible at multiple
+        # (parent, leaf) paths get one pinned clone shared across all
+        # locations, with each location's persistent flag preserved
+        # independently (the shared buffer might be persistent in one
+        # parent and non-persistent in another).
+        # Per unique buffer: (pinned_tensor, list of (parent, leaf, persistent))
+        self._buffer_slots: list[
+            tuple[torch.Tensor, list[tuple[nn.Module, str, bool]]]
+        ] = []
         if include_buffers:
-            for full_name, b in list(model.named_buffers()):
+            buf_groups: dict[
+                tuple[Any, ...],
+                tuple[torch.Tensor, list[tuple[nn.Module, str, bool]]],
+            ] = {}
+            for full_name, b in list(model.named_buffers(remove_duplicate=False)):
                 parent = self._resolve_parent(model, full_name)
                 leaf = full_name.rsplit(".", 1)[-1]
                 persistent = leaf not in parent._non_persistent_buffers_set
-                pinned = b.detach().clone(memory_format=torch.contiguous_format).pin_memory()
+                if b.numel() == 0:
+                    skey = ("__empty_buf__", id(b), full_name)
+                else:
+                    skey = _storage_key(b)
+                existing = buf_groups.get(skey)
+                if existing is None:
+                    pinned = b.detach().clone(memory_format=torch.contiguous_format).pin_memory()
+                    buf_groups[skey] = (pinned, [(parent, leaf, persistent)])
+                else:
+                    pinned = existing[0]
+                    seen_locs = {(id(p), l) for p, l, _ in existing[1]}
+                    if (id(parent), leaf) not in seen_locs:
+                        existing[1].append((parent, leaf, persistent))
                 _set_buffer(parent, leaf, pinned, persistent)
-                self._buffer_pins.append((parent, leaf, pinned, persistent))
+            self._buffer_slots = list(buf_groups.values())
 
     @staticmethod
     def _resolve_parent(model: nn.Module, dotted_name: str) -> nn.Module:
@@ -141,77 +281,166 @@ class PinnedWeights:
             parent = getattr(parent, part)
         return parent
 
+    # ------------------------------------------------------------------
+    # ModelStrategy protocol
+    # ------------------------------------------------------------------
+
+    @property
+    def cache_bytes(self) -> int:
+        """Total pinned host bytes held. Tied weights counted once."""
+        return self.pinned_bytes
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def activate(self) -> nn.Module:
+        """Bulk-DMA pinned weights to GPU and return the model.
+
+        Per-tensor ``.to()`` (non-blocking), then a single
+        ``cuda.synchronize`` to make the writes visible. Tied parameter
+        slots all receive the same GPU Parameter.
+
+        Not re-entrant; nested calls raise ``RuntimeError``. Call
+        :meth:`deactivate` before activating again.
+        """
+        if self._closed:
+            raise RuntimeError("PinnedWeights is closed and cannot be activated.")
+        if self._active:
+            raise RuntimeError(
+                "PinnedWeights.activate() is not re-entrant. Call deactivate() "
+                "before activating again."
+            )
+        assert self._model is not None
+        self._active = True
+        try:
+            self._move_to_gpu()
+        except BaseException:
+            # Best-effort rollback so slots end up referencing pinned CPU
+            # again. If rollback itself fails, log it but re-raise the
+            # original exception so the caller sees the actual cause.
+            try:
+                self._move_to_pinned()
+            except BaseException as rollback_exc:
+                logger.error(
+                    "PinnedWeights.activate() rollback failed; original error "
+                    "will still propagate. rollback=%r",
+                    rollback_exc,
+                    exc_info=True,
+                )
+            self._active = False
+            raise
+        return self._model
+
+    def deactivate(self) -> None:
+        """Repoint slots back at pinned-CPU Parameters. GPU storage is
+        released by refcount as soon as no other references remain."""
+        if not self._active:
+            return
+        try:
+            self._move_to_pinned()
+        finally:
+            self._active = False
+
+    def close(self) -> None:
+        """Release pinned CPU storage and invalidate the wrapped model.
+
+        Moves the model to the ``meta`` device so its parameters and
+        buffers no longer reference the pinned tensors, then drops the
+        pinned buffers so their pages can be returned to the host
+        allocator. Idempotent. The wrapped model object is unusable
+        after this call — request a fresh strategy to use it again.
+
+        If ``model.to("meta")`` raises (a custom subclass with a
+        broken ``_apply``, etc.), the strategy is *not* marked closed
+        and pinned references are *not* dropped, so the caller can
+        retry or perform manual cleanup. Raises ``RuntimeError`` if
+        called while active; deactivate first.
+        """
+        if self._closed:
+            return
+        if self._active:
+            raise RuntimeError(
+                "PinnedWeights.close() called while activate() is in effect - "
+                "deactivate first or the model would be left holding stale "
+                "GPU tensors that cannot be restored."
+            )
+        if self._model is not None:
+            # Let this raise without clearing state — preserves the
+            # ability to retry close() or hand-clean.
+            self._model.to("meta")
+        self._model = None
+        self._slots.clear()
+        self._buffer_slots.clear()
+        self._closed = True
+
+    def __enter__(self) -> nn.Module:
+        return self.activate()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.deactivate()
+
+    # ------------------------------------------------------------------
+    # Back-compat aliases (pre-ModelStrategy public API)
+    # ------------------------------------------------------------------
+
     @property
     def pinned_bytes(self) -> int:
-        """Total pinned CPU memory currently held."""
+        """Total pinned CPU memory currently held. Tied weights counted once."""
         total = 0
-        for buf in self._param_bufs.values():
+        for buf, _ in self._slots:
             total += buf.pinned_data.numel() * buf.pinned_data.element_size()
             if buf.pinned_scale is not None:
                 total += buf.pinned_scale.numel() * buf.pinned_scale.element_size()
-        for _, _, pinned, _ in self._buffer_pins:
+        for pinned, _ in self._buffer_slots:
             total += pinned.numel() * pinned.element_size()
         return total
 
     @contextlib.contextmanager
     def on_gpu(self) -> Iterator[nn.Module]:
-        """Bulk-DMA pinned weights to GPU; yield model; restore on exit.
-
-        On entry, every pinned param + buffer is transferred to
-        ``target_device`` (per-tensor ``.to()``, non-blocking, then a
-        single ``cuda.synchronize`` to make the writes visible).
-        Inside the with-block, the model is fully GPU-resident. On
-        exit, parameter ``.data`` is repointed back at the pinned CPU
-        storage so GPU storage is released by refcount.
-
-        Not re-entrant; nested calls raise ``RuntimeError``.
-        """
-        if self._active:
-            raise RuntimeError(
-                "PinnedWeights.on_gpu() is not re-entrant. The wrapped model "
-                "is already inside an active on_gpu() context."
-            )
-        if not self._param_bufs:
-            raise RuntimeError(
-                "PinnedWeights has been torn down - pinned buffers are released."
-            )
-        self._active = True
+        """Back-compat context manager around :meth:`activate` /
+        :meth:`deactivate`. Prefer ``with strategy as model:`` going
+        forward."""
+        model = self.activate()
         try:
-            self._move_to_gpu()
-            try:
-                yield self._model
-            finally:
-                self._move_to_pinned()
+            yield model
         finally:
-            self._active = False
+            self.deactivate()
+
+    def teardown(self) -> None:
+        """Back-compat alias for :meth:`close`. Prefer ``close()``."""
+        self.close()
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
 
     def _move_to_gpu(self) -> None:
-        for p, buf in self._frozen_params:
+        # One GPU Parameter per unique buffer. Tied slots all receive
+        # the same Parameter object so the tying invariant survives on
+        # device.
+        for buf, locs in self._slots:
             gpu_param = buf.load_to_gpu(self._device, non_blocking=True)
-            p.data = gpu_param.data
+            for parent, leaf in locs:
+                parent._parameters[leaf] = gpu_param
         if self._include_buffers:
-            for parent, leaf, pinned, persistent in self._buffer_pins:
-                _set_buffer(parent, leaf, pinned.to(self._device, non_blocking=True), persistent)
+            for pinned, locs in self._buffer_slots:
+                gpu = pinned.to(self._device, non_blocking=True)
+                for parent, leaf, persistent in locs:
+                    _set_buffer(parent, leaf, gpu, persistent)
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)
 
     def _move_to_pinned(self) -> None:
-        for p, buf in self._frozen_params:
-            p.data = buf.cpu_param.data
+        for buf, locs in self._slots:
+            for parent, leaf in locs:
+                parent._parameters[leaf] = buf.cpu_param
         if self._include_buffers:
-            for parent, leaf, pinned, persistent in self._buffer_pins:
-                _set_buffer(parent, leaf, pinned, persistent)
-
-    def teardown(self) -> None:
-        """Release pinned CPU buffers. The wrapped model is unusable
-        after teardown. Raises if called while inside an ``on_gpu()``
-        context."""
-        if self._active:
-            raise RuntimeError(
-                "PinnedWeights.teardown() called while on_gpu() is active - "
-                "exit the context first or the model would be left holding "
-                "GPU tensors that cannot be restored."
-            )
-        self._param_bufs.clear()
-        self._frozen_params.clear()
-        self._buffer_pins.clear()
+            for pinned, locs in self._buffer_slots:
+                for parent, leaf, persistent in locs:
+                    _set_buffer(parent, leaf, pinned, persistent)

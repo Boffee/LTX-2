@@ -10,13 +10,21 @@ Two complementary offload strategies:
 - :class:`PinnedWeights` — whole-model pinned-CPU bulk cache. Use for
   models that fit on GPU when active but should be evicted between
   calls (e.g., text encoder during diffusion). One CPU→GPU transfer
-  per use; on exit, parameters are repointed back at the pinned CPU
-  storage and the GPU storage is released by refcount.
+  per use; on deactivate, parameter slots are repointed at pinned
+  CPU storage and the GPU storage is released by refcount.
 
 Both classes share the underlying per-parameter pinned storage from
 :class:`~ltx_core.memory.pinned_buffer.PinnedParamBuffer` (clone + pin
 + optional quanto ``WeightQBytesTensor`` decomposition), so quantized
 models work with either.
+
+:class:`PinnedWeights` implements the :class:`ModelStrategy` Protocol —
+the plug-in contract for storage/placement strategies that a future
+``ModelCache`` will consume. :class:`BlockOffloader` does not yet
+implement it (its setup/teardown lifecycle is being split into the
+required ``activate``/``deactivate``/``close`` methods in a follow-up).
+New strategies (disk-mmap, NVMe-paged, multi-GPU shard, etc.) just
+satisfy the protocol.
 
 Designed to be a self-contained subpackage so it can be lifted out
 into its own library when a second consumer appears (no LTX imports
@@ -25,8 +33,10 @@ here).
 
 from ltx_core.memory.block_offloader import BlockOffloader, TrainingBlockOffloader  # noqa: F401
 from ltx_core.memory.pinned_weights import PinnedWeights
+from ltx_core.memory.strategy import ModelStrategy
 
 __all__ = [
     "BlockOffloader",
+    "ModelStrategy",
     "PinnedWeights",
 ]
