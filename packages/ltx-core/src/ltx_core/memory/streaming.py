@@ -6,7 +6,9 @@ prefetch upcoming blocks, overlapping DMA with compute.
 
 Quanto ``WeightQBytesTensor`` weights are decomposed into their inner
 ``_data`` (int8) and ``_scale`` (float) components for pinned-buffer DMA,
-then reconstructed on GPU via ``WeightQBytesTensor.create()``.
+then reconstructed on GPU via ``WeightQBytesTensor.create()``. A naive
+``param.data.clone()`` on a quanto tensor silently dequantizes it; the
+explicit decomposition is required for quantized configurations.
 
 Uses LRU eviction so the pre_hook works regardless of traversal direction
 (forward 0→47 or backward recomputation 47→0 with gradient checkpointing).
@@ -27,12 +29,9 @@ from typing import Any
 import torch
 from torch import nn
 
-from ltx_core.memory._buffers import GpuSlab, PinnedSlab, _QUANTO_AVAILABLE
+from ltx_core.memory._buffers import PinnedParamBuffer
 
 logger = logging.getLogger(__name__)
-
-if _QUANTO_AVAILABLE:
-    from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor  # noqa: F401
 
 
 def _resolve_attr(module: nn.Module, dotted_path: str) -> nn.ModuleList:
@@ -56,29 +55,63 @@ def _resolve_dotted(module: nn.Module, dotted_path: str) -> nn.Module:
 # ---------------------------------------------------------------------------
 
 
-class _GpuSlabPool:
-    """Pool of pre-allocated :class:`GpuSlab` slots, one per pool slot.
+class _GpuSlot:
+    """Pre-allocated GPU storage for one block's frozen params.
 
-    All blocks share the same parameter structure (in homogeneous mode),
-    so one template :class:`PinnedSlab` is used to construct ``num_slots``
-    identical GPU slabs. Slots are acquired on load and released on
-    eviction. Per-slot CUDA events enforce multi-stream safety: the
-    prefetch stream waits for compute to finish reading a slot before
-    overwriting it with new data.
+    For each ``PinnedParamBuffer`` template, allocates matching GPU
+    tensors (data + optional scale for quanto) once at construction
+    and builds a stable ``nn.Parameter`` wrapping each. Subsequent
+    ``copy_from`` calls write the pinned bytes into the pre-allocated
+    GPU tensors in place — no malloc on the hot path, and the
+    Parameter wrappers stay identity-stable across loads (required
+    for PEFT compatibility and to avoid Python ref churn).
+    """
 
-    Replaces the legacy ``_GpuPool`` + ``_GpuSlot`` + ``_PackedSlab``
-    machinery; the storage is identical (per-dtype packed GPU buffers
-    with stable per-param view tensors), but the pinned-CPU side no
-    longer has a redundant per-param clone alongside the packed slab.
+    __slots__ = ("_gpu_data", "_gpu_scale", "_gpu_params")
+
+    def __init__(self, template: list[PinnedParamBuffer], device: torch.device) -> None:
+        self._gpu_data: dict[str, torch.Tensor] = {}
+        self._gpu_scale: dict[str, torch.Tensor | None] = {}
+        self._gpu_params: dict[str, nn.Parameter] = {}
+        for buf in template:
+            gpu_data, gpu_scale = buf.allocate_gpu_storage(device)
+            self._gpu_data[buf.name] = gpu_data
+            self._gpu_scale[buf.name] = gpu_scale
+            self._gpu_params[buf.name] = buf.make_gpu_param(gpu_data, gpu_scale)
+
+    def copy_from(self, bufs: list[PinnedParamBuffer], non_blocking: bool = False) -> None:
+        for buf in bufs:
+            buf.copy_to_gpu(
+                self._gpu_data[buf.name],
+                self._gpu_scale[buf.name],
+                non_blocking=non_blocking,
+            )
+
+    def get_param(self, name: str) -> nn.Parameter:
+        return self._gpu_params[name]
+
+
+class _GpuSlotPool:
+    """Pool of pre-allocated :class:`_GpuSlot` instances.
+
+    All blocks share the same parameter structure (in homogeneous
+    mode), so one template list of ``PinnedParamBuffer`` is used to
+    construct ``num_slots`` identical GPU slots. Slots are acquired
+    on load and released on eviction. Per-slot CUDA events enforce
+    multi-stream safety: the prefetch stream waits for compute to
+    finish reading a slot before overwriting it with new data. Uses
+    ``event.query()`` to skip the GPU-side dependency when the
+    compute event is already signaled (almost always the case for
+    LRU victims last read many blocks ago).
     """
 
     def __init__(
         self,
-        template: PinnedSlab,
+        template: list[PinnedParamBuffer],
         num_slots: int,
         device: torch.device,
     ) -> None:
-        self._slots: list[GpuSlab] = [GpuSlab(template, device) for _ in range(num_slots)]
+        self._slots = [_GpuSlot(template, device) for _ in range(num_slots)]
         self._free: list[int] = list(range(num_slots))
         self._events: list[torch.cuda.Event | None] = [None] * num_slots
 
@@ -88,19 +121,13 @@ class _GpuSlabPool:
     def release(self, slot_id: int) -> None:
         self._free.append(slot_id)
 
-    def slot(self, slot_id: int) -> GpuSlab:
+    def slot(self, slot_id: int) -> _GpuSlot:
         return self._slots[slot_id]
 
     def set_compute_event(self, slot_id: int, event: torch.cuda.Event) -> None:
         self._events[slot_id] = event
 
     def wait_if_needed(self, slot_id: int, stream: torch.cuda.Stream | None) -> None:
-        """Ensure compute is done reading from this slot before it is reused.
-
-        Uses ``event.query()`` to skip the GPU-side dependency when the
-        compute event is already signaled (which is almost always the case
-        for LRU victims that were last read 20+ blocks ago).
-        """
         ev = self._events[slot_id]
         if ev is not None:
             if stream is not None and not ev.query():
@@ -114,23 +141,23 @@ class _GpuSlabPool:
 
 
 class _BlockPinnedStore:
-    """Manages pinned buffers for all frozen params and buffers in a set of blocks.
+    """Per-block pinned CPU + per-slot GPU storage for frozen weights.
 
-    Each block's frozen parameters are packed into a single :class:`PinnedSlab`
-    on construction; ``install_into_params`` repoints each ``param.data``
-    at an ``as_strided`` view into that slab. There is no per-param clone
-    — the slab is the sole CPU-side storage for the block's frozen
-    weights.
+    For each transformer block, one ``PinnedParamBuffer`` per frozen
+    parameter holds the pinned-CPU clone (decomposing quanto into
+    ``_data`` + ``_scale`` if applicable). The model's ``param.data``
+    is repointed at the pinned buffer's ``cpu_param`` so the block
+    can run on CPU without any extra storage when offloaded.
 
-    When ``num_gpu_slots > 0`` and the blocks are layout-compatible, a
-    :class:`_GpuSlabPool` is allocated to avoid CUDA malloc/free during
-    training. Otherwise falls back to per-load :class:`GpuSlab`
-    allocation (legacy heterogeneous-blocks path).
+    When ``num_gpu_slots > 0``, a :class:`_GpuSlotPool` is allocated
+    to avoid CUDA malloc/free during training. Slot reuse via
+    in-place ``copy_()`` keeps the GPU footprint bounded at
+    ``num_slots × block_size`` regardless of model depth.
 
     Buffers (registered via ``register_buffer``) are kept simple:
-    per-buffer CPU clone, per-buffer ``.to(device)`` on load. Buffers
-    are typically tiny (norm eps, RoPE position tables) so the
-    launch-overhead saving from slabbing them is in the noise.
+    per-buffer CPU clone, per-buffer ``.to(device)`` on load. They
+    are typically tiny (norm eps, RoPE position tables) so a slab
+    abstraction would be over-engineering.
     """
 
     def __init__(
@@ -140,62 +167,78 @@ class _BlockPinnedStore:
         device: torch.device | None = None,
     ) -> None:
         self._layers = list(layers)
-
-        # Per block: PinnedSlab packing all frozen params, with installed views.
-        self._pinned_slabs: list[PinnedSlab] = []
-        # Per block: list of (qualified_name, submod, local_name) triples for
-        # direct _parameters assignment on load/evict.
+        # Per block: list of PinnedParamBuffer (one per frozen param).
+        self._param_bufs: list[list[PinnedParamBuffer]] = []
+        # Per block: list of (qual_name, submod, local_name) for direct
+        # _parameters assignment on load/evict. Resolved once at init so
+        # the hot path doesn't re-walk named_modules.
         self._param_locs: list[list[tuple[str, nn.Module, str]]] = []
-        # Per block: list of (buffer_obj, cpu_clone) — buffers are not slabbed.
+        # Per block: list of (buffer_obj, cpu_clone). Buffers are not slabbed;
+        # per-buffer .to() on load.
         self._buf_pairs: list[list[tuple[torch.Tensor, torch.Tensor]]] = []
 
         for layer in self._layers:
-            named = [(n, p) for n, p in layer.named_parameters() if not p.requires_grad]
-            slab = PinnedSlab(named)
-            slab.install_into_params()
-            self._pinned_slabs.append(slab)
-
-            # Resolve (qualified_name, submodule, local_name) triples once
-            # so per-block load/evict don't have to walk named_modules again.
             modules_map = dict(layer.named_modules())
-            locs: list[tuple[str, nn.Module, str]] = []
-            for qual_name, _ in named:
+            block_bufs: list[PinnedParamBuffer] = []
+            block_locs: list[tuple[str, nn.Module, str]] = []
+            for qual_name, p in layer.named_parameters():
+                if p.requires_grad:
+                    continue
+                buf = PinnedParamBuffer(qual_name, p)
+                # Repoint the model's param at the pinned cpu_param so the
+                # block can run on CPU without extra storage when offloaded.
+                p.data = buf.cpu_param.data
+                block_bufs.append(buf)
                 parts = qual_name.rsplit(".", 1)
                 if len(parts) == 2:
-                    locs.append((qual_name, modules_map[parts[0]], parts[1]))
+                    submod, local_name = modules_map[parts[0]], parts[1]
                 else:
-                    locs.append((qual_name, layer, qual_name))
-            self._param_locs.append(locs)
+                    submod, local_name = layer, qual_name
+                block_locs.append((qual_name, submod, local_name))
+            self._param_bufs.append(block_bufs)
+            self._param_locs.append(block_locs)
 
             # Capture (buffer_obj, cpu_clone) — clone owns CPU storage so
             # the GPU-side .data swap on load doesn't lose the source.
             buf_pairs: list[tuple[torch.Tensor, torch.Tensor]] = []
-            for _name, buf in layer.named_buffers():
-                cpu_clone = buf.data.clone()
-                buf.data = cpu_clone  # repoint to the CPU clone
-                buf_pairs.append((buf, cpu_clone))
+            for _name, b in layer.named_buffers():
+                cpu_clone = b.data.clone()
+                b.data = cpu_clone
+                buf_pairs.append((b, cpu_clone))
             self._buf_pairs.append(buf_pairs)
 
-        self._pool: _GpuSlabPool | None = None
+        self._device = device
+        self._pool: _GpuSlotPool | None = None
         self._block_to_slot: dict[int, int] = {}
-        if num_gpu_slots > 0 and device is not None and self._pinned_slabs:
-            if self._slabs_are_compatible():
-                self._pool = _GpuSlabPool(self._pinned_slabs[0], num_gpu_slots, device)
+        if num_gpu_slots > 0 and device is not None and self._param_bufs:
+            if self._blocks_are_homogeneous():
+                self._pool = _GpuSlotPool(self._param_bufs[0], num_gpu_slots, device)
             else:
-                logger.info("Blocks have heterogeneous slab layouts; using per-load GPU allocation")
+                logger.info("Blocks have heterogeneous structure; using per-load GPU allocation")
 
-    def _slabs_are_compatible(self) -> bool:
-        """All blocks must have identical PinnedSlab layouts (same dtype groups,
-        sizes, and per-param specs) for pool slot reuse to be safe."""
-        if len(self._pinned_slabs) <= 1:
+    def _blocks_are_homogeneous(self) -> bool:
+        """All blocks must have identical layouts (same param names,
+        shapes, dtypes, quanto specs) for pool slot reuse to be safe."""
+        if len(self._param_bufs) <= 1:
             return True
-        ref = self._pinned_slabs[0]
-        ref_buffer_sizes = {d: b.numel() for d, b in ref.buffers.items()}
-        for slab in self._pinned_slabs[1:]:
-            if {d: b.numel() for d, b in slab.buffers.items()} != ref_buffer_sizes:
+        ref = self._param_bufs[0]
+        ref_keys = [
+            (b.name, b.pinned_data.shape, b.pinned_data.dtype, b.is_quanto,
+             b.pinned_scale.shape if b.pinned_scale is not None else None,
+             b.pinned_scale.dtype if b.pinned_scale is not None else None,
+             b.qtype, b.axis)
+            for b in ref
+        ]
+        for block in self._param_bufs[1:]:
+            if len(block) != len(ref_keys):
                 return False
-            if slab.specs != ref.specs:
-                return False
+            for ref_tup, b in zip(ref_keys, block, strict=True):
+                cur = (b.name, b.pinned_data.shape, b.pinned_data.dtype, b.is_quanto,
+                       b.pinned_scale.shape if b.pinned_scale is not None else None,
+                       b.pinned_scale.dtype if b.pinned_scale is not None else None,
+                       b.qtype, b.axis)
+                if cur != ref_tup:
+                    return False
         return True
 
     # -- load / evict ---------------------------------------------------------
@@ -213,39 +256,28 @@ class _BlockPinnedStore:
         else:
             self._load_alloc(idx, device, non_blocking)
 
-    # -- internal -------------------------------------------------------------
-
     def _load_pooled(self, idx: int, non_blocking: bool, stream: torch.cuda.Stream | None) -> None:
         slot_id = self._block_to_slot.get(idx)
         if slot_id is None:
             slot_id = self._pool.acquire()
             self._block_to_slot[idx] = slot_id
-
         self._pool.wait_if_needed(slot_id, stream)
         slot = self._pool.slot(slot_id)
-        # Bulk-copy this block's pinned slab into the GPU slab — one
-        # copy_() per dtype group.
-        self._pinned_slabs[idx].bulk_to_gpu(slot, non_blocking=non_blocking)
+        slot.copy_from(self._param_bufs[idx], non_blocking=non_blocking)
 
-        # Repoint each frozen param at the GPU slot's stable Parameter.
         for qual_name, submod, local_name in self._param_locs[idx]:
             submod._parameters[local_name] = slot.get_param(qual_name)
-        # Buffers: per-buffer .to(device). Tiny enough that slab packing
-        # would be over-engineering.
         for mod_buf, cpu_data in self._buf_pairs[idx]:
-            mod_buf.data = cpu_data.to(slot.device, non_blocking=non_blocking)
+            mod_buf.data = cpu_data.to(self._device, non_blocking=non_blocking)
 
     def _load_alloc(self, idx: int, device: torch.device, non_blocking: bool) -> None:
-        """Heterogeneous-blocks fallback: allocate a GpuSlab per call.
-
-        Slower (cudaMalloc/free per load) but works when blocks have
-        different layouts and pool slot reuse isn't safe.
-        """
-        slab = self._pinned_slabs[idx]
-        gpu_slab = GpuSlab(slab, device)
-        slab.bulk_to_gpu(gpu_slab, non_blocking=non_blocking)
-        for qual_name, submod, local_name in self._param_locs[idx]:
-            submod._parameters[local_name] = gpu_slab.get_param(qual_name)
+        """Heterogeneous-blocks fallback: allocate GPU storage per call.
+        Slower (cudaMalloc/free per load) but works when blocks aren't
+        layout-compatible."""
+        for buf, (_qn, submod, local_name) in zip(
+            self._param_bufs[idx], self._param_locs[idx], strict=True,
+        ):
+            submod._parameters[local_name] = buf.load_to_gpu(device, non_blocking=non_blocking)
         for mod_buf, cpu_data in self._buf_pairs[idx]:
             mod_buf.data = cpu_data.to(device, non_blocking=non_blocking)
 
@@ -262,12 +294,12 @@ class _BlockPinnedStore:
 
     def evict_block(self, idx: int, _layer: nn.Module) -> None:
         """Release GPU slot AND restore CPU params (teardown / validation path)."""
-        slab = self._pinned_slabs[idx]
-        for qual_name, submod, local_name in self._param_locs[idx]:
-            submod._parameters[local_name] = slab.get_param(qual_name)
+        for buf, (_qn, submod, local_name) in zip(
+            self._param_bufs[idx], self._param_locs[idx], strict=True,
+        ):
+            submod._parameters[local_name] = buf.cpu_param
         for mod_buf, cpu_data in self._buf_pairs[idx]:
             mod_buf.data = cpu_data
-
         if self._pool is not None:
             slot_id = self._block_to_slot.pop(idx, None)
             if slot_id is not None:
@@ -434,7 +466,7 @@ class BlockOffloader:
             layer.to("cpu")
             _move_lora_to_device(layer, self._target_device)
 
-        # Create pinned buffers and GPU pool from the CPU state
+        # Create pinned buffers and GPU pool from the CPU state.
         num_gpu_slots = num_resident + self._prefetch_count
         self._store = _BlockPinnedStore(self._layers, num_gpu_slots=num_gpu_slots, device=self._target_device)
 
@@ -587,6 +619,7 @@ class BlockOffloader:
     def reset_peak(self) -> None:
         if self._tracker is not None:
             self._tracker.peak_gpu_blocks = len(self._tracker._on_gpu) + len(self._pending)
+
 
 # Back-compat alias — old name from when this lived in ltx-trainer.
 TrainingBlockOffloader = BlockOffloader
