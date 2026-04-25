@@ -19,12 +19,16 @@ Both classes share the underlying per-parameter pinned storage from
 models work with either.
 
 :class:`PinnedWeights` implements the :class:`ModelStrategy` Protocol —
-the plug-in contract for storage/placement strategies that a future
-``ModelCache`` will consume. :class:`BlockOffloader` does not yet
+the plug-in contract for storage/placement strategies that
+:class:`ModelCache` consumes. :class:`BlockOffloader` does not yet
 implement it (its setup/teardown lifecycle is being split into the
 required ``activate``/``deactivate``/``close`` methods in a follow-up).
 New strategies (disk-mmap, NVMe-paged, multi-GPU shard, etc.) just
 satisfy the protocol.
+
+:class:`ModelCache` manages the cached backing storage of multiple
+strategies with LRU eviction, an active-set with refcounted leases, and
+transactional admission. See its docstring for design notes.
 
 Designed to be a self-contained subpackage so it can be lifted out
 into its own library when a second consumer appears (no LTX imports
@@ -32,11 +36,37 @@ here).
 """
 
 from ltx_core.memory.block_offloader import BlockOffloader, TrainingBlockOffloader  # noqa: F401
+from ltx_core.memory.model_cache import (
+    ActivationError,
+    DuplicateModelKeyError,
+    ModelCache,
+    ModelCacheError,
+    ModelCacheSnapshot,
+    ModelCacheStats,
+    ModelEvictionError,
+    ModelInfo,
+    ModelInUseError,
+    ModelNotRegisteredError,
+    ModelSpec,
+    ModelTooLargeError,
+)
 from ltx_core.memory.pinned_weights import PinnedWeights
 from ltx_core.memory.strategy import ModelStrategy
 
 __all__ = [
+    "ActivationError",
     "BlockOffloader",
+    "DuplicateModelKeyError",
+    "ModelCache",
+    "ModelCacheError",
+    "ModelCacheSnapshot",
+    "ModelCacheStats",
+    "ModelEvictionError",
+    "ModelInUseError",
+    "ModelInfo",
+    "ModelNotRegisteredError",
+    "ModelSpec",
     "ModelStrategy",
+    "ModelTooLargeError",
     "PinnedWeights",
 ]

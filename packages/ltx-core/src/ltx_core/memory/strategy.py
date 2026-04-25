@@ -79,7 +79,13 @@ class ModelStrategy(Protocol):
         ...
 
     def deactivate(self) -> None:
-        """Undo :meth:`activate`. ``cache_bytes`` remains held."""
+        """Undo :meth:`activate`. ``cache_bytes`` remains held.
+
+        Should be infallible under normal use: the cache treats a
+        raising ``deactivate()`` as a poisoned strategy and discards
+        the entry (calls :meth:`close` on it) since the strategy's
+        internal state is unknown after the failure.
+        """
         ...
 
     def close(self) -> None:
