@@ -7,20 +7,25 @@ hooks, mmap regions, etc.). It is the plug-in contract used by
 need to know how any particular strategy works.
 
 Implementations in this package: :class:`~ltx_core.memory.PinnedWeights`
-(whole-model bulk DMA between pinned CPU and GPU). A
+(whole-model bulk DMA between pinned CPU and GPU) and
 :class:`~ltx_core.memory.BlockOffloader` (block-level streaming for
-models too big for GPU) implementation is planned once its lifecycle is
-split into the required ``activate`` / ``deactivate`` / ``close``
-methods. Future strategies (disk-mmap, NVMe-paged, multi-GPU shard)
-just have to satisfy this protocol.
+models too big for GPU). Future strategies (disk-mmap, NVMe-paged,
+multi-GPU shard) just have to satisfy this protocol.
 
 Lifecycle
 ---------
-``__init__`` (constructs and pins backing storage) →
+``__init__`` (and possibly an explicit ``prepare()`` step, depending
+on the strategy) sets up backing storage →
 ``activate()`` (make model usable, returns the ``nn.Module``) →
 ``deactivate()`` (release transient compute resources, keep
 ``cache_bytes`` resident) → ``close()`` (release ``cache_bytes``;
 the wrapped model is unusable afterward).
+
+Strategies that defer pinning until an explicit ``prepare()`` (e.g.
+:class:`~ltx_core.memory.BlockOffloader` with ``auto_setup=False``)
+must have ``prepare()`` called before being handed to
+:class:`~ltx_core.memory.model_cache.ModelCache` so the cache reads a
+correct ``cache_bytes`` immediately.
 
 ``close()`` is idempotent. ``activate()/deactivate()`` may be repeated
 between construction and ``close()``. The strategy is also a context

@@ -14,8 +14,17 @@ Uses LRU eviction so the pre_hook works regardless of traversal direction
 (forward 0→47 or backward recomputation 47→0 with gradient checkpointing).
 
 Trainable parameters (e.g. LoRA adapters with ``requires_grad=True``) stay
-on GPU permanently so the offload doesn't disrupt backward. For inference
-with frozen LoRA adapters, merge the LoRA into the base weights first.
+on GPU permanently while the offloader is active so the offload doesn't
+disrupt backward. For inference with frozen LoRA adapters, merge the LoRA
+into the base weights first.
+
+Implements :class:`~ltx_core.memory.strategy.ModelStrategy` via the
+``prepare`` / ``activate`` / ``deactivate`` / ``close`` lifecycle so it
+plugs into :class:`~ltx_core.memory.model_cache.ModelCache`. The legacy
+``setup()`` / ``teardown()`` API is preserved as deprecated aliases —
+``setup()`` does ``prepare(); activate()`` and ``teardown()`` does
+``close()`` (destructive). Long-lived training keeps using the existing
+construct-then-train-then-teardown pattern unchanged via ``auto_setup=True``.
 """
 
 from __future__ import annotations
@@ -24,6 +33,7 @@ import functools
 import logging
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
+from types import TracebackType
 from typing import Any
 
 import torch
@@ -136,23 +146,29 @@ class GpuSlotPool:
 
 
 # ---------------------------------------------------------------------------
-# Block store: pinned CPU + GPU pool
+# Block store: pinned CPU + (optional) GPU pool
 # ---------------------------------------------------------------------------
 
 
 class BlockPinnedStore:
-    """Per-block pinned CPU + per-slot GPU storage for frozen weights.
+    """Per-block pinned CPU + (when activated) per-slot GPU storage.
 
-    For each transformer block, one ``PinnedParamBuffer`` per frozen
-    parameter holds the pinned-CPU clone (decomposing quanto into
-    ``_data`` + ``_scale`` if applicable). The model's ``param.data``
-    is repointed at the pinned buffer's ``cpu_param`` so the block
-    can run on CPU without any extra storage when offloaded.
+    Lifecycle:
 
-    When ``num_gpu_slots > 0``, a :class:`GpuSlotPool` is allocated
-    to avoid CUDA malloc/free during training. Slot reuse via
-    in-place ``copy_()`` keeps the GPU footprint bounded at
-    ``num_slots × block_size`` regardless of model depth.
+    - ``__init__`` pins CPU only. Each frozen block parameter slot is
+      replaced with a :class:`PinnedParamBuffer`'s ``cpu_param``
+      Parameter so the model can run on CPU without extra storage when
+      offloaded. Buffers (registered via ``register_buffer``) get a
+      pinned CPU clone in place. No GPU allocation occurs.
+
+    - :meth:`activate_pool` allocates a :class:`GpuSlotPool` for
+      bounded GPU residency. Block layouts must be homogeneous for
+      pool reuse; heterogeneous configurations fall back to per-load
+      ``cudaMalloc`` (slower).
+
+    - :meth:`deactivate_pool` releases the pool. Block params/buffers
+      may still reference GPU storage from the last activation cycle
+      until callers run :meth:`evict_block` for each block.
 
     Buffers (registered via ``register_buffer``) are kept simple:
     per-buffer CPU clone, per-buffer ``.to(device)`` on load. They
@@ -160,12 +176,7 @@ class BlockPinnedStore:
     abstraction would be over-engineering.
     """
 
-    def __init__(
-        self,
-        layers: list[nn.Module] | nn.ModuleList,
-        num_gpu_slots: int = 0,
-        device: torch.device | None = None,
-    ) -> None:
+    def __init__(self, layers: list[nn.Module] | nn.ModuleList) -> None:
         self._layers = list(layers)
         # Per block: list of PinnedParamBuffer (one per frozen param).
         self._param_bufs: list[list[PinnedParamBuffer]] = []
@@ -185,15 +196,19 @@ class BlockPinnedStore:
                 if p.requires_grad:
                     continue
                 buf = PinnedParamBuffer(qual_name, p)
-                # Repoint the model's param at the pinned cpu_param so the
-                # block can run on CPU without extra storage when offloaded.
-                p.data = buf.cpu_param.data
-                block_bufs.append(buf)
                 parts = qual_name.rsplit(".", 1)
                 if len(parts) == 2:
                     submod, local_name = modules_map[parts[0]], parts[1]
                 else:
                     submod, local_name = layer, qual_name
+                # Repoint the model's param SLOT at the pinned cpu_param
+                # so the block can run on CPU without extra storage when
+                # offloaded. _parameters[leaf] swap (rather than p.data
+                # assignment) is required for correctness with quanto
+                # WeightQBytesTensor; the .data path is silently a no-op
+                # for the inner _data/_scale storages.
+                submod._parameters[local_name] = buf.cpu_param
+                block_bufs.append(buf)
                 block_locs.append((qual_name, submod, local_name))
             self._param_bufs.append(block_bufs)
             self._param_locs.append(block_locs)
@@ -207,14 +222,60 @@ class BlockPinnedStore:
                 buf_pairs.append((b, cpu_clone))
             self._buf_pairs.append(buf_pairs)
 
-        self._device = device
+        self._device: torch.device | None = None
         self._pool: GpuSlotPool | None = None
         self._block_to_slot: dict[int, int] = {}
-        if num_gpu_slots > 0 and device is not None and self._param_bufs:
-            if self._blocks_are_homogeneous():
-                self._pool = GpuSlotPool(self._param_bufs[0], num_gpu_slots, device)
-            else:
+        # Captured on first activate_pool() so a mismatched re-activation
+        # raises rather than silently reusing the wrong pool.
+        self._pool_config: tuple[int, torch.device] | None = None
+
+    @property
+    def cache_bytes(self) -> int:
+        """Total pinned host bytes held across all blocks."""
+        total = 0
+        for block in self._param_bufs:
+            for buf in block:
+                total += buf.pinned_data.numel() * buf.pinned_data.element_size()
+                if buf.pinned_scale is not None:
+                    total += buf.pinned_scale.numel() * buf.pinned_scale.element_size()
+        for block_pairs in self._buf_pairs:
+            for _, cpu_clone in block_pairs:
+                total += cpu_clone.numel() * cpu_clone.element_size()
+        return total
+
+    def activate_pool(self, num_gpu_slots: int, device: torch.device) -> None:
+        """Allocate a homogeneous-block GPU slot pool (no-op for
+        heterogeneous layouts; per-load alloc is used instead).
+
+        Idempotent when the same ``(num_gpu_slots, device)`` is
+        requested back-to-back. Raises ``ValueError`` if a second call
+        requests a different configuration — the existing pool's slot
+        layout would no longer match.
+        """
+        if self._pool_config is not None:
+            existing = self._pool_config
+            if existing != (num_gpu_slots, device):
+                raise ValueError(
+                    f"BlockPinnedStore pool already activated with "
+                    f"{existing}; cannot re-activate with ({num_gpu_slots}, "
+                    f"{device}). Call deactivate_pool() first."
+                )
+            return
+        self._device = device
+        self._pool_config = (num_gpu_slots, device)
+        if num_gpu_slots > 0 and self._param_bufs and self._blocks_are_homogeneous():
+            self._pool = GpuSlotPool(self._param_bufs[0], num_gpu_slots, device)
+        else:
+            if num_gpu_slots > 0 and self._param_bufs:
                 logger.info("Blocks have heterogeneous structure; using per-load GPU allocation")
+
+    def deactivate_pool(self) -> None:
+        """Drop the GPU slot pool reference. Caller is responsible for
+        having evicted any block→slot mappings via :meth:`evict_block`
+        so the slot Parameters are no longer referenced from the model."""
+        self._pool = None
+        self._block_to_slot.clear()
+        self._pool_config = None
 
     def _blocks_are_homogeneous(self) -> bool:
         """All blocks must have identical layouts (same param names,
@@ -361,11 +422,11 @@ class BlockTracker:
 
 
 # ---------------------------------------------------------------------------
-# LoRA param restore after module-level moves
+# LoRA / trainable param restore after module-level moves
 # ---------------------------------------------------------------------------
 
 
-def _move_lora_to_device(layer: nn.Module, device: torch.device) -> None:
+def _move_trainable_to_device(layer: nn.Module, device: torch.device) -> None:
     for p in layer.parameters():
         if p.requires_grad:
             if p.data.device != device:
@@ -390,16 +451,27 @@ class BlockOffloader:
     A pre-allocated GPU buffer pool avoids CUDA malloc/free overhead during
     training/inference and provides explicit multi-stream safety via per-slot
     events. Trainable parameters (e.g. LoRA adapters added via PEFT) stay on
-    GPU permanently, so backward through them is unaffected by the offload.
+    GPU permanently while active, so backward through them is unaffected by
+    the offload.
+
+    Implements :class:`~ltx_core.memory.strategy.ModelStrategy` via the
+    ``prepare`` / ``activate`` / ``deactivate`` / ``close`` lifecycle. The
+    legacy ``setup()`` / ``teardown()`` API is preserved as deprecated
+    aliases — ``setup()`` does ``prepare(); activate()`` and ``teardown()``
+    does ``close()`` (destructive — moves the model to ``meta`` and releases
+    pinned storage). ``shard_orchestrator.py`` and other consumers that
+    call ``teardown()`` between shards depend on this destructive
+    semantics for breaking forward-hook reference cycles.
 
     Caveats
     -------
-    - **Tied weights are not deduplicated.** Two ``nn.Parameter`` objects
-      sharing the same storage (rare in transformer block lists, but
-      possible in some architectures) are cloned into separate pinned
-      buffers, doubling pinned memory and breaking the tying invariant on
-      GPU. LTX-2 transformer blocks have no tied weights so this is a
-      latent concern; restore explicit dedup if a consumer hits it.
+    - **Tied weights are not deduplicated within or across blocks.** Two
+      ``nn.Parameter`` objects sharing the same storage are cloned into
+      separate pinned buffers, doubling pinned memory and breaking the
+      tying invariant on GPU. LTX-2 transformer blocks have no tied
+      weights so this is a latent concern; cross-region tied weights
+      (block ↔ non-block) and tied-weight detection are handled in a
+      planned follow-up.
 
     Parameters
     ----------
@@ -417,6 +489,14 @@ class BlockOffloader:
         prefix (e.g. ``"base_model.model.transformer_blocks"``).
     prefetch_count:
         How many blocks ahead to prefetch on a background thread.
+    auto_setup:
+        When ``True`` (default), runs ``prepare(); activate()`` immediately
+        in the constructor — preserving the pre-lifecycle-split behavior
+        for trainer/shard-orchestrator/etc. Pass ``False`` when you want
+        to control the lifecycle yourself (e.g., handing off to
+        :class:`~ltx_core.memory.model_cache.ModelCache`); in that case
+        the factory must call ``prepare()`` before returning the
+        offloader so the cache reads the correct ``cache_bytes``.
     """
 
     def __init__(
@@ -426,16 +506,27 @@ class BlockOffloader:
         blocks_to_swap: int,
         layers_attr: str | list[str],
         prefetch_count: int = 3,
+        *,
+        auto_setup: bool = True,
     ) -> None:
-        self._model = model
+        self._model: nn.Module | None = model
         self._target_device = target_device
         self._blocks_to_swap = blocks_to_swap
         self._prefetch_count = prefetch_count
         self._layers_attrs = [layers_attr] if isinstance(layers_attr, str) else list(layers_attr)
 
+        # Lifecycle flags
+        self._prepared = False
+        self._active = False
+        self._closed = False
+
+        # Resources owned at "prepared" lifetime
         self._layers: list[nn.Module] | None = None
-        self._tracker: BlockTracker | None = None
+        self._block_leaf_names: set[str] | None = None
         self._store: BlockPinnedStore | None = None
+
+        # Resources owned at "active" lifetime
+        self._tracker: BlockTracker | None = None
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._executor: ThreadPoolExecutor | None = None
         self._stream: torch.cuda.Stream | None = None
@@ -443,31 +534,63 @@ class BlockOffloader:
         self._prefetch_events: dict[int, torch.cuda.Event] = {}
         self._last_idx: int = -1
 
-        self.setup()
+        if auto_setup:
+            self.setup()
 
     # ------------------------------------------------------------------
-    # Setup / teardown
+    # ModelStrategy lifecycle
     # ------------------------------------------------------------------
 
-    def setup(self) -> None:
-        """Initialize offloading state. Re-callable after ``teardown()``."""
-        if self._tracker is not None or self._hooks:
-            self.teardown()
+    @property
+    def cache_bytes(self) -> int:
+        """Total pinned host bytes held by the pinned store. ``0`` before
+        :meth:`prepare` and after :meth:`close`."""
+        return self._store.cache_bytes if self._store is not None else 0
 
-        self._layers, block_leaf_names = self._resolve_all_layers()
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def prepare(self) -> None:
+        """Resolve layers, pin frozen block weights to CPU.
+
+        Idempotent if already prepared (does nothing). Raises if closed.
+
+        PR 3a caveat
+        ------------
+        This phase still moves frozen non-block modules and trainable
+        params to ``target_device`` — the legacy behavior, preserved
+        unchanged for the lifecycle-only refactor. A truly inactive
+        prepared state (everything on pinned CPU until :meth:`activate`)
+        requires non-block ``PinnedWeights`` composition, which lands in
+        the follow-up PR. Until then, the prepared state is pinned
+        block CPU + non-block GPU + trainable GPU.
+
+        For :class:`~ltx_core.memory.model_cache.ModelCache` integration
+        the factory must call ``prepare()`` before returning the handle
+        so the cache can read the correct ``cache_bytes``::
+
+            def factory():
+                off = BlockOffloader(..., auto_setup=False)
+                off.prepare()
+                return off
+        """
+        if self._closed:
+            raise RuntimeError("BlockOffloader is closed and cannot be re-prepared.")
+        if self._prepared:
+            return
+        assert self._model is not None
+
+        self._layers, self._block_leaf_names = self._resolve_all_layers()
         num_layers = len(self._layers)
         if self._blocks_to_swap >= num_layers:
-            raise ValueError(f"blocks_to_swap ({self._blocks_to_swap}) must be < num_layers ({num_layers})")
+            raise ValueError(
+                f"blocks_to_swap ({self._blocks_to_swap}) must be < num_layers ({num_layers})"
+            )
 
-        num_resident = num_layers - self._blocks_to_swap
-        self._tracker = BlockTracker(num_layers)
-        self._executor = ThreadPoolExecutor(max_workers=1)
-        self._stream = torch.cuda.Stream(device=self._target_device, priority=-1)
-        self._pending = {}
-        self._prefetch_events = {i: torch.cuda.Event() for i in range(num_layers)}
-        self._last_idx = -1
-
-        # Move non-block modules to GPU
+        # Move non-block modules to GPU permanently while active. PR 3b will
+        # convert these to pinned-CPU + activate-time DMA via composition
+        # with PinnedWeights.
         parent_paths: set[str] = set()
         for attr_path in self._layers_attrs:
             parts = attr_path.split(".")
@@ -475,57 +598,233 @@ class BlockOffloader:
         for parent_path in parent_paths:
             parent = _resolve_dotted(self._model, parent_path) if parent_path else self._model
             for name, child in parent.named_children():
-                if name not in block_leaf_names:
+                if name not in self._block_leaf_names:
                     child.to(self._target_device)
 
-        # Move all blocks to CPU (LoRA stays on GPU)
+        # Move all blocks to CPU; keep trainable (LoRA) params on GPU so
+        # backward pass through them works.
         for layer in self._layers:
             layer.to("cpu")
-            _move_lora_to_device(layer, self._target_device)
+            _move_trainable_to_device(layer, self._target_device)
 
-        # Create pinned buffers and GPU pool from the CPU state.
+        # Pin block weights (CPU only — pool allocated in activate()).
+        self._store = BlockPinnedStore(self._layers)
+
+        self._prepared = True
+
+    def activate(self) -> nn.Module:
+        """Allocate per-activation resources and return the model.
+
+        Auto-prepares if constructed. Allocates GPU slot pool, CUDA
+        stream/events, prefetch executor, registers forward hooks, and
+        pre-loads the resident block window. Not re-entrant: nested
+        calls raise ``RuntimeError``. On failure, rolls back to
+        ``prepared`` so the caller can retry or close cleanly.
+        """
+        if self._closed:
+            raise RuntimeError("BlockOffloader is closed and cannot be activated.")
+        if self._active:
+            raise RuntimeError(
+                "BlockOffloader.activate() is not re-entrant. Call deactivate() "
+                "before activating again."
+            )
+        if not self._prepared:
+            self.prepare()
+        assert self._model is not None
+        assert self._layers is not None
+        assert self._store is not None
+
+        num_layers = len(self._layers)
+        num_resident = num_layers - self._blocks_to_swap
         num_gpu_slots = num_resident + self._prefetch_count
-        self._store = BlockPinnedStore(self._layers, num_gpu_slots=num_gpu_slots, device=self._target_device)
 
-        # Pre-load initial resident window (synchronous)
-        for idx in range(min(num_resident, num_layers)):
-            self._store.load_block(idx, self._layers[idx], self._target_device)
-            self._tracker.mark_on_gpu(idx)
+        self._active = True
+        try:
+            self._tracker = BlockTracker(num_layers)
+            self._executor = ThreadPoolExecutor(max_workers=1)
+            self._stream = torch.cuda.Stream(device=self._target_device, priority=-1)
+            self._pending = {}
+            self._prefetch_events = {i: torch.cuda.Event() for i in range(num_layers)}
+            self._last_idx = -1
 
-        self._register_hooks(num_resident)
+            self._store.activate_pool(num_gpu_slots, self._target_device)
 
-        # Seed peak to reflect the pre-loaded resident window. Since cb83965,
-        # peak_gpu_blocks is only updated inside the forward-pre hook; without
-        # this seed, peak stays at 0 between setup() and the first forward,
-        # which matters for teardown/setup cycles (validation) where a
-        # post-validation callback may read peak before any new forward runs.
-        self.reset_peak()
+            # Pre-load initial resident window (synchronous).
+            for idx in range(min(num_resident, num_layers)):
+                self._store.load_block(idx, self._layers[idx], self._target_device)
+                self._tracker.mark_on_gpu(idx)
 
-        logger.info(
-            f"Block offloading active: {self._blocks_to_swap}/{num_layers} blocks on CPU, "
-            f"{num_resident} resident on GPU, prefetch={self._prefetch_count}, "
-            f"gpu_pool_slots={num_gpu_slots}"
-        )
+            self._register_hooks(num_resident)
+
+            # Seed peak to reflect the pre-loaded resident window. Since cb83965,
+            # peak_gpu_blocks is only updated inside the forward-pre hook; without
+            # this seed, peak stays at 0 between activate() and the first forward,
+            # which matters for deactivate/activate cycles where a callback may
+            # read peak before any new forward runs.
+            self.reset_peak()
+
+            logger.info(
+                f"Block offloading active: {self._blocks_to_swap}/{num_layers} blocks on CPU, "
+                f"{num_resident} resident on GPU, prefetch={self._prefetch_count}, "
+                f"gpu_pool_slots={num_gpu_slots}"
+            )
+            return self._model
+        except BaseException:
+            # Best-effort rollback to prepared state. If rollback
+            # itself fails, leave _active=True so a later close() will
+            # re-attempt cleanup of the partially-installed resources
+            # (hooks, pool slots, executor, stream). The original
+            # activation exception is always re-raised.
+            try:
+                self._teardown_active_resources(suppress_prefetch_errors=True)
+            except BaseException as rollback_exc:
+                logger.error(
+                    "BlockOffloader.activate() rollback failed; offloader stays "
+                    "in active state with leaked resources — call close() to "
+                    "reclaim. Original error will still propagate. rollback=%r",
+                    rollback_exc,
+                    exc_info=True,
+                )
+            else:
+                self._active = False
+            raise
+
+    def deactivate(self) -> None:
+        """Release GPU pool, hooks, executor, stream. Pinned CPU stays.
+
+        Idempotent. Drains any pending prefetch futures so
+        deactivate-then-activate cycles don't see stale CUDA work. If a
+        pending prefetch future raises (CUDA OOM, mid-DMA error,
+        etc.), best-effort cleanup still runs but the first such
+        exception is re-raised after — :class:`ModelCache` treats this
+        as a poisoned strategy.
+        """
+        if not self._active:
+            return
+        prefetch_exc = self._teardown_active_resources(suppress_prefetch_errors=False)
+        # Cleanup itself succeeded (or we wouldn't reach this line);
+        # mark inactive before surfacing any captured prefetch error so
+        # ``close()`` doesn't try to re-deactivate.
+        self._active = False
+        if prefetch_exc is not None:
+            raise prefetch_exc
+
+    def close(self) -> None:
+        """Destructive: deactivate, move model to ``meta``, release pinned.
+
+        Idempotent. After ``close()``, the wrapped model is unusable —
+        callers must rebuild a fresh BlockOffloader to use it again.
+        Also the path the legacy ``teardown()`` alias takes, which is
+        what ``shard_orchestrator.py`` relies on to break the
+        offloader → forward-hook → block → offloader reference cycle
+        between shards.
+        """
+        if self._closed:
+            return
+        if self._active:
+            # Suppress prefetch errors during close — close() is the
+            # destructive endpoint; surfacing a prefetch failure would
+            # block the host-allocator flush. Logged in cleanup.
+            self._teardown_active_resources(suppress_prefetch_errors=True)
+            self._active = False
+        if self._model is not None:
+            # Move to meta to break model-side references to pinned storage.
+            # Let this raise without clearing state — preserves the ability
+            # to retry close() or hand-clean (matches PinnedWeights.close()
+            # semantics).
+            self._model.to("meta")
+        self._model = None
+        self._layers = None
+        self._block_leaf_names = None
+        self._store = None
+        self._prepared = False
+        self._closed = True
+
+    def __enter__(self) -> nn.Module:
+        return self.activate()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.deactivate()
+
+    # ------------------------------------------------------------------
+    # Back-compat aliases (pre-lifecycle-split public API)
+    # ------------------------------------------------------------------
+
+    def setup(self) -> None:
+        """Back-compat: ``prepare(); activate()``. Behavior depends on
+        current state:
+
+        - constructed → prepare + activate
+        - prepared → activate
+        - active → no-op
+        - closed → raise ``RuntimeError``
+        """
+        if self._closed:
+            raise RuntimeError("BlockOffloader is closed; create a fresh instance.")
+        if self._active:
+            return
+        if not self._prepared:
+            self.prepare()
+        self.activate()
+
+    def teardown(self) -> None:
+        """Back-compat alias for :meth:`close`. Destructive — moves the
+        model to ``meta`` and releases all pinned storage. This is what
+        ``shard_orchestrator.py`` calls between shards to break the
+        forward-hook reference cycle."""
+        self.close()
+
+    # ------------------------------------------------------------------
+    # Internals
+    # ------------------------------------------------------------------
 
     def _resolve_all_layers(self) -> tuple[list[nn.Module], set[str]]:
         flat: list[nn.Module] = []
         leaf_names: set[str] = set()
+        assert self._model is not None
         for attr_path in self._layers_attrs:
             module_list = _resolve_attr(self._model, attr_path)
             flat.extend(module_list)
             leaf_names.add(attr_path.split(".")[-1])
         return flat, leaf_names
 
-    def teardown(self) -> None:
-        """Remove hooks, wait for pending work, evict all blocks to CPU."""
+    def _teardown_active_resources(
+        self,
+        *,
+        suppress_prefetch_errors: bool,
+    ) -> BaseException | None:
+        """Reverses everything ``activate()`` allocates. Used by
+        ``deactivate()``, ``activate()``'s rollback path, and ``close()``.
+
+        Returns the first captured prefetch exception (or None if there
+        was none / ``suppress_prefetch_errors=True``). Cleanup-itself
+        failures (CUDA sync errors, hook removal failures, etc.) raise
+        immediately and skip the return — leaving the caller's
+        ``_active`` flag at True so close() can retry.
+        """
         for h in self._hooks:
             h.remove()
         self._hooks.clear()
 
-        # Wait for pending prefetches and mark them as on-GPU so teardown saves them
-        for idx, future in self._pending.items():
-            future.result()
-            if self._tracker is not None:
+        # Wait for pending prefetches and mark them as on-GPU so the
+        # eviction-restore loop below saves their CPU state. Capture
+        # the first exception (if any) without short-circuiting the
+        # rest of the cleanup.
+        first_prefetch_exc: BaseException | None = None
+        if self._tracker is not None:
+            for idx, future in self._pending.items():
+                try:
+                    future.result()
+                except BaseException as exc:
+                    if first_prefetch_exc is None:
+                        first_prefetch_exc = exc
+                    if suppress_prefetch_errors:
+                        logger.warning("pending prefetch raised during cleanup: %r", exc)
                 self._tracker.mark_on_gpu(idx)
         self._pending.clear()
         self._prefetch_events.clear()
@@ -538,7 +837,7 @@ class BlockOffloader:
             self._stream.synchronize()
             self._stream = None
 
-        if self._tracker is not None and self._store is not None:
+        if self._tracker is not None and self._store is not None and self._layers is not None:
             torch.cuda.synchronize(device=self._target_device)
             # Restore CPU params for ALL blocks. Fast-evicted blocks still
             # have module params pointing at (now-stale) GPU slot data.
@@ -546,9 +845,19 @@ class BlockOffloader:
                 self._store.evict_block(idx, layer)
             self._tracker.clear()
 
+        if self._store is not None:
+            self._store.deactivate_pool()
+
         self._tracker = None
-        self._store = None
-        self._layers = None
+        self._last_idx = -1
+
+        # Return the captured prefetch exception (if any) so the caller
+        # can decide whether to surface it (deactivate path) or
+        # suppress it (activate-rollback / close path). Cleanup-itself
+        # failures already raised mid-method.
+        if suppress_prefetch_errors:
+            return None
+        return first_prefetch_exc
 
     # ------------------------------------------------------------------
     # Block transfer

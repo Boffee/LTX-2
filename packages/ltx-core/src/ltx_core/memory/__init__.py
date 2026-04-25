@@ -18,13 +18,30 @@ Both classes share the underlying per-parameter pinned storage from
 + optional quanto ``WeightQBytesTensor`` decomposition), so quantized
 models work with either.
 
-:class:`PinnedWeights` implements the :class:`ModelStrategy` Protocol —
-the plug-in contract for storage/placement strategies that
-:class:`ModelCache` consumes. :class:`BlockOffloader` does not yet
-implement it (its setup/teardown lifecycle is being split into the
-required ``activate``/``deactivate``/``close`` methods in a follow-up).
-New strategies (disk-mmap, NVMe-paged, multi-GPU shard, etc.) just
-satisfy the protocol.
+Both :class:`PinnedWeights` and :class:`BlockOffloader` implement the
+:class:`ModelStrategy` Protocol — the plug-in contract for
+storage/placement strategies that :class:`ModelCache` consumes. New
+strategies (disk-mmap, NVMe-paged, multi-GPU shard, etc.) just satisfy
+the protocol.
+
+:class:`BlockOffloader`'s legacy ``setup()`` / ``teardown()`` API is
+preserved as deprecated aliases for the new ``prepare`` / ``activate``
+/ ``deactivate`` / ``close`` lifecycle. ``auto_setup=True`` (the
+default) makes existing long-lived callers work unchanged.
+
+For :class:`ModelCache` integration, BlockOffloader factories must call
+``prepare()`` before returning the handle so the cache can read the
+correct ``cache_bytes`` immediately::
+
+    def factory():
+        off = BlockOffloader(..., auto_setup=False)
+        off.prepare()
+        return off
+
+A future revision will lift the legacy non-block-on-GPU residency in
+``prepare()`` so the prepared state is fully inactive (everything on
+pinned CPU until ``activate()``); today the prepared state still pins
+blocks but keeps non-block modules and trainable params on GPU.
 
 :class:`ModelCache` manages the cached backing storage of multiple
 strategies with LRU eviction, an active-set with refcounted leases, and
