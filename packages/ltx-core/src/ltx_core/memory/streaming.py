@@ -29,7 +29,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from ltx_core.memory._buffers import PinnedParamBuffer
+from ltx_core.memory.buffers import PinnedParamBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ def _resolve_dotted(module: nn.Module, dotted_path: str) -> nn.Module:
 # ---------------------------------------------------------------------------
 
 
-class _GpuSlot:
+class GpuSlot:
     """Pre-allocated GPU storage for one block's frozen params.
 
     For each ``PinnedParamBuffer`` template, allocates matching GPU
@@ -91,8 +91,8 @@ class _GpuSlot:
         return self._gpu_params[name]
 
 
-class _GpuSlotPool:
-    """Pool of pre-allocated :class:`_GpuSlot` instances.
+class GpuSlotPool:
+    """Pool of pre-allocated :class:`GpuSlot` instances.
 
     All blocks share the same parameter structure (in homogeneous
     mode), so one template list of ``PinnedParamBuffer`` is used to
@@ -111,7 +111,7 @@ class _GpuSlotPool:
         num_slots: int,
         device: torch.device,
     ) -> None:
-        self._slots = [_GpuSlot(template, device) for _ in range(num_slots)]
+        self._slots = [GpuSlot(template, device) for _ in range(num_slots)]
         self._free: list[int] = list(range(num_slots))
         self._events: list[torch.cuda.Event | None] = [None] * num_slots
 
@@ -121,7 +121,7 @@ class _GpuSlotPool:
     def release(self, slot_id: int) -> None:
         self._free.append(slot_id)
 
-    def slot(self, slot_id: int) -> _GpuSlot:
+    def slot(self, slot_id: int) -> GpuSlot:
         return self._slots[slot_id]
 
     def set_compute_event(self, slot_id: int, event: torch.cuda.Event) -> None:
@@ -140,7 +140,7 @@ class _GpuSlotPool:
 # ---------------------------------------------------------------------------
 
 
-class _BlockPinnedStore:
+class BlockPinnedStore:
     """Per-block pinned CPU + per-slot GPU storage for frozen weights.
 
     For each transformer block, one ``PinnedParamBuffer`` per frozen
@@ -149,7 +149,7 @@ class _BlockPinnedStore:
     is repointed at the pinned buffer's ``cpu_param`` so the block
     can run on CPU without any extra storage when offloaded.
 
-    When ``num_gpu_slots > 0``, a :class:`_GpuSlotPool` is allocated
+    When ``num_gpu_slots > 0``, a :class:`GpuSlotPool` is allocated
     to avoid CUDA malloc/free during training. Slot reuse via
     in-place ``copy_()`` keeps the GPU footprint bounded at
     ``num_slots × block_size`` regardless of model depth.
@@ -208,11 +208,11 @@ class _BlockPinnedStore:
             self._buf_pairs.append(buf_pairs)
 
         self._device = device
-        self._pool: _GpuSlotPool | None = None
+        self._pool: GpuSlotPool | None = None
         self._block_to_slot: dict[int, int] = {}
         if num_gpu_slots > 0 and device is not None and self._param_bufs:
             if self._blocks_are_homogeneous():
-                self._pool = _GpuSlotPool(self._param_bufs[0], num_gpu_slots, device)
+                self._pool = GpuSlotPool(self._param_bufs[0], num_gpu_slots, device)
             else:
                 logger.info("Blocks have heterogeneous structure; using per-load GPU allocation")
 
@@ -326,7 +326,7 @@ class _BlockPinnedStore:
 # ---------------------------------------------------------------------------
 
 
-class _BlockTracker:
+class BlockTracker:
     def __init__(self, num_layers: int) -> None:
         self.num_layers = num_layers
         self._on_gpu: set[int] = set()
@@ -434,8 +434,8 @@ class BlockOffloader:
         self._layers_attrs = [layers_attr] if isinstance(layers_attr, str) else list(layers_attr)
 
         self._layers: list[nn.Module] | None = None
-        self._tracker: _BlockTracker | None = None
-        self._store: _BlockPinnedStore | None = None
+        self._tracker: BlockTracker | None = None
+        self._store: BlockPinnedStore | None = None
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._executor: ThreadPoolExecutor | None = None
         self._stream: torch.cuda.Stream | None = None
@@ -460,7 +460,7 @@ class BlockOffloader:
             raise ValueError(f"blocks_to_swap ({self._blocks_to_swap}) must be < num_layers ({num_layers})")
 
         num_resident = num_layers - self._blocks_to_swap
-        self._tracker = _BlockTracker(num_layers)
+        self._tracker = BlockTracker(num_layers)
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._stream = torch.cuda.Stream(device=self._target_device, priority=-1)
         self._pending = {}
@@ -485,7 +485,7 @@ class BlockOffloader:
 
         # Create pinned buffers and GPU pool from the CPU state.
         num_gpu_slots = num_resident + self._prefetch_count
-        self._store = _BlockPinnedStore(self._layers, num_gpu_slots=num_gpu_slots, device=self._target_device)
+        self._store = BlockPinnedStore(self._layers, num_gpu_slots=num_gpu_slots, device=self._target_device)
 
         # Pre-load initial resident window (synchronous)
         for idx in range(min(num_resident, num_layers)):

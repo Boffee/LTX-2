@@ -46,7 +46,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from ltx_core.memory._buffers import PinnedParamBuffer
+from ltx_core.memory.buffers import PinnedParamBuffer
 
 logger = logging.getLogger(__name__)
 

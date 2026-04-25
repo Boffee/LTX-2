@@ -1,4 +1,4 @@
-"""Tests for ``ltx_core.memory._buffers.PinnedParamBuffer``.
+"""Tests for ``ltx_core.memory.buffers.PinnedParamBuffer``.
 
 Lives in ltx-trainer/tests because that's where the project's pytest
 infrastructure currently sits; ltx-core itself has no tests directory.
@@ -15,7 +15,7 @@ import pytest
 import torch
 from torch import nn
 
-from ltx_core.memory._buffers import PinnedParamBuffer
+from ltx_core.memory.buffers import PinnedParamBuffer
 
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -49,7 +49,7 @@ class TestPinnedParamBuffer:
 
     @CUDA
     def test_pool_pattern_allocate_and_copy(self) -> None:
-        # Mirrors how _GpuSlot uses PinnedParamBuffer: allocate GPU
+        # Mirrors how GpuSlot uses PinnedParamBuffer: allocate GPU
         # storage once, then copy_to_gpu in place on each load.
         p = nn.Parameter(torch.randn(16, dtype=torch.bfloat16), requires_grad=False)
         buf = PinnedParamBuffer("w", p)
@@ -69,7 +69,7 @@ class TestPinnedParamBuffer:
         torch.cuda.synchronize()
         assert torch.equal(gpu_data.cpu(), new_vals)
         # Stable storage — gpu_param wraps the same GPU bytes as gpu_data.
-        # _GpuSlot relies on this: build the Parameter wrapper once at slot
+        # GpuSlot relies on this: build the Parameter wrapper once at slot
         # construction, mutate underlying storage in place on each load.
         assert gpu_param.data_ptr() == gpu_data.data_ptr()
 
@@ -97,16 +97,16 @@ class TestPinnedParamBuffer:
 
     @CUDA
     def test_slot_param_identity_stable_across_loads(self) -> None:
-        # _GpuSlot caches the Parameter wrapping its GPU storage; copy_from
+        # GpuSlot caches the Parameter wrapping its GPU storage; copy_from
         # must not churn that wrapper. Hooks repointing submod._parameters
         # at slot.get_param() observe a stable object across reloads — the
         # whole point of the pool-slot pattern over per-load allocation.
-        from ltx_core.memory.streaming import _GpuSlot
+        from ltx_core.memory.streaming import GpuSlot
 
         p1 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
         p2 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
         block = [PinnedParamBuffer("a", p1), PinnedParamBuffer("b", p2)]
-        slot = _GpuSlot(block, torch.device("cuda"))
+        slot = GpuSlot(block, torch.device("cuda"))
 
         a_first = slot.get_param("a")
         b_first = slot.get_param("b")
@@ -130,7 +130,7 @@ class TestPinnedParamBufferQuanto:
         # Quanto WeightQBytesTensor must be decomposed into _data + _scale
         # and the cpu_param wrapper reconstructed from the pinned tensors.
         # A naive tensor.clone() would silently dequantize via the dispatch
-        # fallback — that bug is the reason _buffers.py exists.
+        # fallback — that bug is the reason buffers.py exists.
         quanto = pytest.importorskip("optimum.quanto")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 

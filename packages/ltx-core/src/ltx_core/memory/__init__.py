@@ -14,7 +14,7 @@ Two complementary offload strategies:
   storage and the GPU storage is released by refcount.
 
 Both classes share the underlying per-parameter pinned storage from
-:class:`~ltx_core.memory._buffers.PinnedParamBuffer` (clone + pin +
+:class:`~ltx_core.memory.buffers.PinnedParamBuffer` (clone + pin +
 optional quanto ``WeightQBytesTensor`` decomposition), so quantized
 models work with either.
 
