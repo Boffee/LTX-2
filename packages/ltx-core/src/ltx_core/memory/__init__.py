@@ -14,8 +14,8 @@ Two complementary offload strategies:
   storage and the GPU storage is released by refcount.
 
 Both classes share the underlying per-parameter pinned storage from
-:class:`~ltx_core.memory.buffers.PinnedParamBuffer` (clone + pin +
-optional quanto ``WeightQBytesTensor`` decomposition), so quantized
+:class:`~ltx_core.memory.pinned_buffer.PinnedParamBuffer` (clone + pin
++ optional quanto ``WeightQBytesTensor`` decomposition), so quantized
 models work with either.
 
 Designed to be a self-contained subpackage so it can be lifted out
@@ -23,8 +23,8 @@ into its own library when a second consumer appears (no LTX imports
 here).
 """
 
-from ltx_core.memory.pinned import PinnedWeights
-from ltx_core.memory.streaming import BlockOffloader, TrainingBlockOffloader  # noqa: F401
+from ltx_core.memory.block_offloader import BlockOffloader, TrainingBlockOffloader  # noqa: F401
+from ltx_core.memory.pinned_weights import PinnedWeights
 
 __all__ = [
     "BlockOffloader",

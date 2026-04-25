@@ -1,13 +1,4 @@
-"""Tests for ``ltx_core.memory.buffers.PinnedParamBuffer``.
-
-Lives in ltx-trainer/tests because that's where the project's pytest
-infrastructure currently sits; ltx-core itself has no tests directory.
-The tests exercise ltx-core types directly.
-
-(Filename retained for git-history continuity even though the slab
-abstraction it originally tested has been replaced by the simpler
-per-parameter ``PinnedParamBuffer``.)
-"""
+"""Tests for ``ltx_core.memory.pinned_buffer.PinnedParamBuffer``."""
 
 from __future__ import annotations
 
@@ -15,8 +6,7 @@ import pytest
 import torch
 from torch import nn
 
-from ltx_core.memory.buffers import PinnedParamBuffer
-
+from ltx_core.memory.pinned_buffer import PinnedParamBuffer
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -101,7 +91,7 @@ class TestPinnedParamBuffer:
         # must not churn that wrapper. Hooks repointing submod._parameters
         # at slot.get_param() observe a stable object across reloads — the
         # whole point of the pool-slot pattern over per-load allocation.
-        from ltx_core.memory.streaming import GpuSlot
+        from ltx_core.memory.block_offloader import GpuSlot
 
         p1 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
         p2 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
@@ -130,7 +120,7 @@ class TestPinnedParamBufferQuanto:
         # Quanto WeightQBytesTensor must be decomposed into _data + _scale
         # and the cpu_param wrapper reconstructed from the pinned tensors.
         # A naive tensor.clone() would silently dequantize via the dispatch
-        # fallback — that bug is the reason buffers.py exists.
+        # fallback — that bug is the reason pinned_buffer.py exists.
         quanto = pytest.importorskip("optimum.quanto")
         from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
 

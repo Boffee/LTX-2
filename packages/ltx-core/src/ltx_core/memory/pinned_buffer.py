@@ -1,5 +1,5 @@
-"""Pinned CPU + GPU storage primitives shared between ``streaming``
-(per-block streaming) and ``pinned`` (whole-model bulk).
+"""Pinned-CPU storage primitive shared between ``block_offloader``
+(per-block streaming) and ``pinned_weights`` (whole-model bulk).
 
 Internal to the ``ltx_core.memory`` subpackage. Not part of the public
 API, but lives in its own module so both consumers can reach it without
