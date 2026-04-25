@@ -60,17 +60,9 @@ from typing import Any
 import torch
 from torch import nn
 
-from ltx_core.memory.pinned_buffer import PinnedParamBuffer
+from ltx_core.memory.pinned_buffer import PinnedParamBuffer, storage_key
 
 logger = logging.getLogger(__name__)
-
-_QUANTO_AVAILABLE = False
-try:
-    from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
-
-    _QUANTO_AVAILABLE = True
-except ImportError:
-    pass
 
 
 def _set_buffer(module: nn.Module, name: str, value: torch.Tensor, persistent: bool) -> None:
@@ -78,47 +70,6 @@ def _set_buffer(module: nn.Module, name: str, value: torch.Tensor, persistent: b
     ``module``, preserving the original ``persistent`` flag so
     ``state_dict()`` behavior survives the swap."""
     module.register_buffer(name, value, persistent=persistent)
-
-
-def _storage_key(t: torch.Tensor) -> tuple[Any, ...]:
-    """Identity key for tied-weight detection.
-
-    Two tensors that produce the same key represent the same logical
-    tensor backed by the same storage region with the same view layout
-    and (for quanto) the same quant metadata; they can be deduplicated
-    into a single :class:`PinnedParamBuffer`.
-
-    Note: pure storage identity is not sufficient — two views into the
-    same parent tensor with different shape/stride/offset must not
-    dedup. The key incorporates view layout for that reason.
-    """
-    if _QUANTO_AVAILABLE and isinstance(t, WeightQBytesTensor):
-        return (
-            "quanto",
-            t._data.data_ptr(),
-            t._data.dtype,
-            tuple(t._data.shape),
-            t._data.stride(),
-            t._data.storage_offset(),
-            t._scale.data_ptr(),
-            t._scale.dtype,
-            tuple(t._scale.shape),
-            t._scale.stride(),
-            t._scale.storage_offset(),
-            t.qtype,
-            t.axis,
-            tuple(t.size()),
-            t.stride(),
-            getattr(t, "activation_qtype", None),
-        )
-    return (
-        "plain",
-        t.data_ptr(),
-        t.dtype,
-        tuple(t.shape),
-        t.stride(),
-        t.storage_offset(),
-    )
 
 
 class PinnedWeights:
@@ -134,8 +85,13 @@ class PinnedWeights:
     :meth:`deactivate` swaps the slots back at the pinned-CPU
     Parameters so the GPU storage is released by refcount.
 
-    Trainable parameters (``requires_grad=True``) are not pinned;
-    constructing on a model with no frozen parameters raises.
+    Trainable parameters (``requires_grad=True``) are not pinned.
+    Buffer-only modules (only registered buffers, no frozen params)
+    are valid — common for sibling tables like RoPE/positional
+    embeddings managed via :class:`BlockOffloader`'s non-block
+    composition. Construction raises only if there is *nothing* to
+    manage — neither frozen params nor (with ``include_buffers=True``)
+    registered buffers.
 
     Parameters
     ----------
@@ -194,7 +150,7 @@ class PinnedWeights:
                 # collapsing them.
                 skey = ("__empty__", id(p), name)
             else:
-                skey = _storage_key(p.data)
+                skey = storage_key(p.data)
             groups.setdefault(skey, []).append((name, p, parent, leaf))
 
         # Per unique buffer: (PinnedParamBuffer, list of (parent, leaf)).
@@ -222,13 +178,6 @@ class PinnedWeights:
                 seen_locs.add(key)
                 locs.append((parent, leaf))
             self._slots.append((buf, locs))
-
-        if not self._slots:
-            raise ValueError(
-                "PinnedWeights requires at least one frozen parameter to cache. "
-                "All params on the wrapped model have requires_grad=True - for "
-                "training flows use ltx_core.memory.BlockOffloader instead."
-            )
 
         # Initial repoint: every frozen slot now references the pinned
         # cpu_param. Tied slots all reference the same Parameter object,
@@ -260,7 +209,7 @@ class PinnedWeights:
                 if b.numel() == 0:
                     skey = ("__empty_buf__", id(b), full_name)
                 else:
-                    skey = _storage_key(b)
+                    skey = storage_key(b)
                 existing = buf_groups.get(skey)
                 if existing is None:
                     pinned = b.detach().clone(memory_format=torch.contiguous_format).pin_memory()
@@ -272,6 +221,22 @@ class PinnedWeights:
                         existing[1].append((parent, leaf, persistent))
                 _set_buffer(parent, leaf, pinned, persistent)
             self._buffer_slots = list(buf_groups.values())
+
+        # Reject only if there is nothing at all to manage — neither
+        # frozen params nor (when include_buffers=True) registered
+        # buffers. Buffer-only modules (e.g., a pure RoPE/positional
+        # table sibling) are valid: PinnedWeights still gives them
+        # pinned-CPU storage and the activate/deactivate round-trip,
+        # which is exactly what BlockOffloader's non-block composition
+        # needs.
+        if not self._slots and not self._buffer_slots:
+            raise ValueError(
+                "PinnedWeights requires at least one frozen parameter or, "
+                "when include_buffers=True, at least one registered buffer "
+                "to cache. The wrapped model has neither — for training "
+                "flows use ltx_core.memory.BlockOffloader instead, or "
+                "leave the model unwrapped."
+            )
 
     @staticmethod
     def _resolve_parent(model: nn.Module, dotted_name: str) -> nn.Module:

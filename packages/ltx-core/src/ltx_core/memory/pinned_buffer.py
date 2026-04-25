@@ -21,6 +21,7 @@ wrapper around the GPU tensors at load time.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import torch
 from torch import nn
@@ -34,6 +35,52 @@ try:
     _QUANTO_AVAILABLE = True
 except ImportError:
     pass
+
+
+def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
+    """Identity key for tied-weight detection.
+
+    Two tensors that produce the same key represent the same logical
+    tensor backed by the same storage region with the same view layout
+    and (for quanto) the same quant metadata; they can be deduplicated
+    into a single :class:`PinnedParamBuffer`.
+
+    Used by both :class:`~ltx_core.memory.PinnedWeights` (for handle-
+    level dedup of tied frozen params) and
+    :class:`~ltx_core.memory.BlockOffloader` (for cross-region tied-
+    weight detection across blocks and non-block modules).
+
+    Note: pure storage identity is not sufficient — two views into the
+    same parent tensor with different shape/stride/offset must not
+    dedup. The key incorporates view layout for that reason.
+    """
+    if _QUANTO_AVAILABLE and isinstance(t, WeightQBytesTensor):
+        return (
+            "quanto",
+            t._data.data_ptr(),
+            t._data.dtype,
+            tuple(t._data.shape),
+            t._data.stride(),
+            t._data.storage_offset(),
+            t._scale.data_ptr(),
+            t._scale.dtype,
+            tuple(t._scale.shape),
+            t._scale.stride(),
+            t._scale.storage_offset(),
+            t.qtype,
+            t.axis,
+            tuple(t.size()),
+            t.stride(),
+            getattr(t, "activation_qtype", None),
+        )
+    return (
+        "plain",
+        t.data_ptr(),
+        t.dtype,
+        tuple(t.shape),
+        t.stride(),
+        t.storage_offset(),
+    )
 
 
 class PinnedParamBuffer:

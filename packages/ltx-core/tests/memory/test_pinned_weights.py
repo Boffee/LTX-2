@@ -252,10 +252,28 @@ class TestOnGpuBackCompat:
 
 
 class TestConstruction:
-    def test_rejects_all_trainable_model(self) -> None:
-        m = nn.Linear(4, 4)  # default requires_grad=True
+    def test_rejects_all_trainable_model_with_no_buffers(self) -> None:
+        m = nn.Linear(4, 4)  # default requires_grad=True, no buffers
         with pytest.raises(ValueError, match="at least one frozen parameter"):
             PinnedWeights(m, torch.device("cpu"))
+
+    def test_accepts_buffer_only_module(self) -> None:
+        # A module with only registered buffers (no frozen params) is a
+        # legitimate target — common for things like RoPE position tables
+        # or sinusoidal embeddings. PinnedWeights should pin the buffers
+        # and behave as a no-op for params.
+        class BufferOnly(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("table", torch.randn(8, 4))
+
+        m = BufferOnly()
+        pw = PinnedWeights(m, torch.device("cpu"))
+        try:
+            assert pw.cache_bytes == 8 * 4 * 4  # float32
+            assert m.table.is_pinned()
+        finally:
+            pw.close()
 
 
 # ---------------------------------------------------------------------------

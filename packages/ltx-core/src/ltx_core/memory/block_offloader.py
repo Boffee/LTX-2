@@ -39,7 +39,8 @@ from typing import Any
 import torch
 from torch import nn
 
-from ltx_core.memory.pinned_buffer import PinnedParamBuffer
+from ltx_core.memory.pinned_buffer import PinnedParamBuffer, storage_key
+from ltx_core.memory.pinned_weights import PinnedWeights
 
 logger = logging.getLogger(__name__)
 
@@ -524,6 +525,14 @@ class BlockOffloader:
         self._layers: list[nn.Module] | None = None
         self._block_leaf_names: set[str] | None = None
         self._store: BlockPinnedStore | None = None
+        # Non-block frozen params/buffers are managed via PinnedWeights
+        # composition: a synthetic wrapper module references the non-block
+        # children of each parent, then PinnedWeights pins them and
+        # handles the GPU round-trip on activate/deactivate. None when the
+        # model has no non-block siblings or all non-block params are
+        # trainable.
+        self._non_block_wrapper: nn.Module | None = None
+        self._non_block_pinned: PinnedWeights | None = None
 
         # Resources owned at "active" lifetime
         self._tracker: BlockTracker | None = None
@@ -543,28 +552,32 @@ class BlockOffloader:
 
     @property
     def cache_bytes(self) -> int:
-        """Total pinned host bytes held by the pinned store. ``0`` before
-        :meth:`prepare` and after :meth:`close`."""
-        return self._store.cache_bytes if self._store is not None else 0
+        """Total pinned host bytes held: block store + non-block
+        pinned weights. ``0`` before :meth:`prepare` and after
+        :meth:`close`."""
+        total = 0
+        if self._store is not None:
+            total += self._store.cache_bytes
+        if self._non_block_pinned is not None:
+            total += self._non_block_pinned.cache_bytes
+        return total
 
     @property
     def closed(self) -> bool:
         return self._closed
 
     def prepare(self) -> None:
-        """Resolve layers, pin frozen block weights to CPU.
+        """Resolve layers, pin frozen weights to CPU. Truly inactive:
+        no GPU allocation, no hooks, no executor.
 
-        Idempotent if already prepared (does nothing). Raises if closed.
+        Frozen block weights go into a :class:`BlockPinnedStore` (per-block
+        pinned CPU + on-demand slot pool when active). Frozen non-block
+        siblings (patchifier, output projection, norms, etc.) are pinned
+        via a composed :class:`PinnedWeights` so they leave GPU on
+        :meth:`deactivate`. Trainable params (e.g. LoRA) stay on CPU
+        until :meth:`activate` moves them to GPU.
 
-        PR 3a caveat
-        ------------
-        This phase still moves frozen non-block modules and trainable
-        params to ``target_device`` — the legacy behavior, preserved
-        unchanged for the lifecycle-only refactor. A truly inactive
-        prepared state (everything on pinned CPU until :meth:`activate`)
-        requires non-block ``PinnedWeights`` composition, which lands in
-        the follow-up PR. Until then, the prepared state is pinned
-        block CPU + non-block GPU + trainable GPU.
+        Idempotent if already prepared. Raises if closed.
 
         For :class:`~ltx_core.memory.model_cache.ModelCache` integration
         the factory must call ``prepare()`` before returning the handle
@@ -588,29 +601,147 @@ class BlockOffloader:
                 f"blocks_to_swap ({self._blocks_to_swap}) must be < num_layers ({num_layers})"
             )
 
-        # Move non-block modules to GPU permanently while active. PR 3b will
-        # convert these to pinned-CPU + activate-time DMA via composition
-        # with PinnedWeights.
-        parent_paths: set[str] = set()
-        for attr_path in self._layers_attrs:
-            parts = attr_path.split(".")
-            parent_paths.add(".".join(parts[:-1]) if len(parts) > 1 else "")
-        for parent_path in parent_paths:
-            parent = _resolve_dotted(self._model, parent_path) if parent_path else self._model
-            for name, child in parent.named_children():
-                if name not in self._block_leaf_names:
-                    child.to(self._target_device)
+        # Detect cross-region tied frozen weights BEFORE any pinning runs
+        # (pinning clones storage, which would silently break the sharing
+        # invariant). Cross-block ties can't be preserved by slot-local
+        # streaming, and block↔non-block ties can't be preserved across
+        # the two pinning regimes either.
+        self._detect_cross_region_tied_weights()
 
-        # Move all blocks to CPU; keep trainable (LoRA) params on GPU so
-        # backward pass through them works.
+        # Move all blocks AND non-block siblings to CPU. Trainable params
+        # come along for the ride (PinnedWeights skips them; block-side
+        # trainable will be re-moved to GPU on activate). After prepare()
+        # the entire model is GPU-inactive — pinned CPU + trainable CPU.
         for layer in self._layers:
             layer.to("cpu")
-            _move_trainable_to_device(layer, self._target_device)
+
+        self._non_block_wrapper = self._build_non_block_wrapper()
+        if self._non_block_wrapper is not None:
+            self._non_block_wrapper.to("cpu")
+            # Only construct PinnedWeights if there's something to pin
+            # (frozen params or registered buffers). A pure-trainable
+            # wrapper has nothing for PinnedWeights to manage; trainable
+            # params still move to GPU on activate via the whole-model
+            # _move_trainable_to_device walk. Pre-check rather than
+            # catching the constructor's ValueError so genuine errors
+            # (mixed trainable/frozen tied storage, etc.) propagate.
+            has_frozen = any(
+                not p.requires_grad for p in self._non_block_wrapper.parameters()
+            )
+            has_buffer = any(True for _ in self._non_block_wrapper.buffers())
+            if has_frozen or has_buffer:
+                self._non_block_pinned = PinnedWeights(
+                    self._non_block_wrapper, self._target_device,
+                )
+            else:
+                self._non_block_pinned = None
 
         # Pin block weights (CPU only — pool allocated in activate()).
         self._store = BlockPinnedStore(self._layers)
 
         self._prepared = True
+
+    # ------------------------------------------------------------------
+    # Non-block wrapper + cross-region tied detection
+    # ------------------------------------------------------------------
+
+    def _compute_parent_paths(self) -> set[str]:
+        paths: set[str] = set()
+        for attr_path in self._layers_attrs:
+            parts = attr_path.split(".")
+            paths.add(".".join(parts[:-1]) if len(parts) > 1 else "")
+        return paths
+
+    def _build_non_block_wrapper(self) -> nn.Module | None:
+        """Build a synthetic ``nn.Module`` that references all non-block
+        sibling submodules (preserving object identity, so mutations on
+        the wrapper propagate to the outer model). Returns ``None`` if
+        there are no non-block siblings.
+        """
+        assert self._model is not None
+        assert self._block_leaf_names is not None
+        wrapper = nn.Module()
+        attached = False
+        seen_module_ids: set[int] = set()
+        for parent_path in self._compute_parent_paths():
+            parent = _resolve_dotted(self._model, parent_path) if parent_path else self._model
+            for name, child in parent.named_children():
+                if name in self._block_leaf_names:
+                    continue
+                if id(child) in seen_module_ids:
+                    # Same submodule reachable from multiple parent paths;
+                    # attach once.
+                    continue
+                seen_module_ids.add(id(child))
+                # Unique attribute name to avoid collisions when multiple
+                # parent paths have same-named non-block siblings.
+                unique = f"{parent_path.replace('.', '_')}__{name}" if parent_path else name
+                setattr(wrapper, unique, child)
+                attached = True
+        return wrapper if attached else None
+
+    def _detect_cross_region_tied_weights(self) -> None:
+        """Group all params across regions (each block + non_block) by
+        storage identity; raise if any group spans regions, regardless
+        of grad state.
+
+        Cross-region ties are unsupported for two reasons:
+
+        - Frozen ↔ frozen across regions: the two pinning regimes
+          (per-block ``BlockPinnedStore``, whole-non-block
+          ``PinnedWeights``) can't coordinate to share storage.
+        - Mixed (frozen + trainable) across regions: the frozen side
+          gets pinned and slot-swapped while the trainable side is
+          moved separately on activate, breaking the sharing invariant
+          silently.
+
+        Block-internal ties stay within ``block:N`` and are passed
+        through to ``BlockPinnedStore`` (which doesn't deduplicate but
+        also doesn't break correctness for intra-block sharing — the
+        block always loads as a unit). Non-block-internal ties go to
+        :class:`PinnedWeights` which handles them.
+        """
+        assert self._layers is not None
+        assert self._block_leaf_names is not None
+        # storage_key -> list of (region_label, qualified_name, requires_grad)
+        groups: dict[tuple, list[tuple[str, str, bool]]] = {}
+
+        for block_idx, layer in enumerate(self._layers):
+            region = f"block:{block_idx}"
+            for qual_name, p in layer.named_parameters(remove_duplicate=False):
+                if p.numel() == 0:
+                    continue
+                skey = storage_key(p.data)
+                groups.setdefault(skey, []).append(
+                    (region, f"{region}.{qual_name}", p.requires_grad)
+                )
+
+        for parent_path in self._compute_parent_paths():
+            parent = _resolve_dotted(self._model, parent_path) if parent_path else self._model
+            for name, child in parent.named_children():
+                if name in self._block_leaf_names:
+                    continue
+                prefix = f"{parent_path}.{name}" if parent_path else name
+                for qual_name, p in child.named_parameters(prefix=prefix, remove_duplicate=False):
+                    if p.numel() == 0:
+                        continue
+                    skey = storage_key(p.data)
+                    groups.setdefault(skey, []).append(
+                        ("non_block", qual_name, p.requires_grad)
+                    )
+
+        for members in groups.values():
+            regions = {region for region, _, _ in members}
+            if len(regions) > 1:
+                names = sorted(name for _, name, _ in members)
+                raise ValueError(
+                    f"BlockOffloader does not support tied parameters across "
+                    f"streamed regions: storage shared by {names}. Slot-local "
+                    "block streaming cannot preserve cross-region tying "
+                    "(neither frozen↔frozen nor frozen↔trainable). Use "
+                    "whole-model PinnedWeights, disable block streaming, or "
+                    "untie the parameters."
+                )
 
     def activate(self) -> nn.Module:
         """Allocate per-activation resources and return the model.
@@ -640,6 +771,18 @@ class BlockOffloader:
 
         self._active = True
         try:
+            # Bring frozen non-block weights to GPU first (whole-model
+            # bulk DMA via the composed PinnedWeights). After this the
+            # patchifier, output projection, norms, etc. are all GPU-
+            # resident; only the block list streams.
+            if self._non_block_pinned is not None:
+                self._non_block_pinned.activate()
+
+            # Move trainable params (LoRA, etc.) to GPU. Walks the whole
+            # model, so both block-internal and non-block trainable
+            # params are covered.
+            _move_trainable_to_device(self._model, self._target_device)
+
             self._tracker = BlockTracker(num_layers)
             self._executor = ThreadPoolExecutor(max_workers=1)
             self._stream = torch.cuda.Stream(device=self._target_device, priority=-1)
@@ -727,6 +870,19 @@ class BlockOffloader:
             # block the host-allocator flush. Logged in cleanup.
             self._teardown_active_resources(suppress_prefetch_errors=True)
             self._active = False
+        # Close the inner non-block PinnedWeights first. Its close()
+        # moves the wrapper (and therefore the referenced non-block
+        # children) to meta and drops its pinned refs. The subsequent
+        # outer .to("meta") then walks blocks, with non-block already
+        # meta-ified.
+        #
+        # If inner close() raises, leave _non_block_pinned in place so a
+        # retry can complete it — clearing it would orphan the only
+        # handle to its pinned storage. Same retryability pattern as
+        # PinnedWeights.close().
+        if self._non_block_pinned is not None:
+            self._non_block_pinned.close()
+            self._non_block_pinned = None
         if self._model is not None:
             # Move to meta to break model-side references to pinned storage.
             # Let this raise without clearing state — preserves the ability
@@ -737,6 +893,7 @@ class BlockOffloader:
         self._layers = None
         self._block_leaf_names = None
         self._store = None
+        self._non_block_wrapper = None
         self._prepared = False
         self._closed = True
 
@@ -847,6 +1004,15 @@ class BlockOffloader:
 
         if self._store is not None:
             self._store.deactivate_pool()
+
+        # Return frozen non-block weights to pinned CPU and move
+        # trainable params off the GPU so the deactivated state truly
+        # has no GPU footprint. Order matters: PinnedWeights.deactivate
+        # restores Parameter slots before we strip trainable .data refs.
+        if self._non_block_pinned is not None:
+            self._non_block_pinned.deactivate()
+        if self._model is not None:
+            _move_trainable_to_device(self._model, torch.device("cpu"))
 
         self._tracker = None
         self._last_idx = -1

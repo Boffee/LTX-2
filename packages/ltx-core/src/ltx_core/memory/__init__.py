@@ -38,10 +38,15 @@ correct ``cache_bytes`` immediately::
         off.prepare()
         return off
 
-A future revision will lift the legacy non-block-on-GPU residency in
-``prepare()`` so the prepared state is fully inactive (everything on
-pinned CPU until ``activate()``); today the prepared state still pins
-blocks but keeps non-block modules and trainable params on GPU.
+The prepared state is fully GPU-inactive: block frozen weights live in
+the per-block pinned store, non-block frozen siblings (patchifier,
+output projection, norms, etc.) are pinned via composed
+``PinnedWeights``, and trainable params sit on CPU. ``activate()``
+brings everything to GPU; ``deactivate()`` returns it to pinned CPU.
+Cross-region tied parameters (block ↔ non-block, cross-block, or
+mixed trainable/frozen across regions) are detected at ``prepare()``
+and raise — slot-local block streaming cannot preserve such ties;
+use whole-model ``PinnedWeights`` instead.
 
 :class:`ModelCache` manages the cached backing storage of multiple
 strategies with LRU eviction, an active-set with refcounted leases, and

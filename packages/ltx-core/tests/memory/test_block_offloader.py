@@ -613,6 +613,284 @@ class TestPrefetchFailureOnDeactivate:
 
 
 # ---------------------------------------------------------------------------
+# PR 3b: prepared state truly inactive — non-block on pinned CPU
+# ---------------------------------------------------------------------------
+
+
+class TestPreparedStateInactive:
+    """Verifies that the 'prepared but not active' state has no GPU
+    footprint — the payoff of PR 3b's non-block PinnedWeights composition.
+    Without it, non-block siblings (embed, head, norms) would sit on
+    target_device permanently, defeating ModelCache eviction."""
+
+    @CUDA
+    def test_prepared_has_no_params_on_target_device(self) -> None:
+        m = _make_block_model(num_blocks=4, width=8)
+        target = torch.device("cuda")
+        off = BlockOffloader(
+            m, target, blocks_to_swap=2,
+            layers_attr="transformer_blocks", auto_setup=False,
+        )
+        try:
+            off.prepare()
+            # No frozen params on target device — block params are pinned
+            # CPU, non-block params are pinned CPU via the inner
+            # PinnedWeights, trainable (none here) would be on CPU too.
+            for p in m.parameters():
+                assert p.device != target, (
+                    f"prepared state leaked GPU residency: {p.shape}@{p.device}"
+                )
+        finally:
+            off.close()
+
+    @CUDA
+    def test_non_block_pinned_after_prepare(self) -> None:
+        m = _make_block_model(num_blocks=4, width=8)
+        off = BlockOffloader(
+            m, torch.device("cuda"), blocks_to_swap=2,
+            layers_attr="transformer_blocks", auto_setup=False,
+        )
+        try:
+            off.prepare()
+            # Non-block PinnedWeights instance was created (embed + head
+            # are frozen and non-block).
+            assert off._non_block_pinned is not None
+            assert off._non_block_pinned.cache_bytes > 0
+            # cache_bytes includes both block and non-block contributions.
+            assert off.cache_bytes > off._store.cache_bytes
+        finally:
+            off.close()
+
+    @CUDA
+    def test_activate_brings_non_block_to_gpu(self) -> None:
+        m = _make_block_model(num_blocks=4, width=8)
+        target = torch.device("cuda")
+        off = BlockOffloader(
+            m, target, blocks_to_swap=2, layers_attr="transformer_blocks",
+        )
+        try:
+            # After activate, embed and head (non-block) are on GPU.
+            assert m.embed.weight.is_cuda
+            assert m.head.weight.is_cuda
+        finally:
+            off.close()
+
+    @CUDA
+    def test_deactivate_returns_non_block_to_pinned(self) -> None:
+        m = _make_block_model(num_blocks=4, width=8)
+        target = torch.device("cuda")
+        off = BlockOffloader(
+            m, target, blocks_to_swap=2,
+            layers_attr="transformer_blocks", auto_setup=False,
+        )
+        try:
+            off.prepare()
+            off.activate()
+            assert m.embed.weight.is_cuda
+            off.deactivate()
+            # Back to pinned CPU, NOT on target device.
+            assert m.embed.weight.device != target
+            assert m.embed.weight.is_pinned()
+            assert m.head.weight.is_pinned()
+        finally:
+            off.close()
+
+    @CUDA
+    def test_buffer_only_non_block_module(self) -> None:
+        # A non-block sibling with only registered buffers (e.g., a
+        # RoPE position table) and no learnable params. Previously
+        # PinnedWeights would refuse to wrap it and we'd silently
+        # leave the buffers on CPU — forward with CUDA inputs would
+        # crash. Now PinnedWeights pins buffer-only modules and the
+        # buffers correctly round-trip on activate/deactivate.
+        class RopeTable(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("table", torch.randn(8, 4))
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.rope = RopeTable()
+                self.transformer_blocks = nn.ModuleList(
+                    [nn.Linear(4, 4, bias=False) for _ in range(4)]
+                )
+
+        m = M()
+        for p in m.parameters():
+            p.requires_grad = False
+        target = torch.device("cuda")
+        off = BlockOffloader(
+            m, target, blocks_to_swap=2,
+            layers_attr="transformer_blocks", auto_setup=False,
+        )
+        try:
+            off.prepare()
+            # PinnedWeights was constructed for the buffer-only RoPE
+            # sibling — buffers are now pinned CPU.
+            assert off._non_block_pinned is not None
+            assert m.rope.table.is_pinned()
+            off.activate()
+            # On activate, the buffer is moved to GPU.
+            assert m.rope.table.is_cuda
+            off.deactivate()
+            # And back to pinned CPU on deactivate.
+            assert m.rope.table.is_pinned()
+        finally:
+            off.close()
+
+    def test_block_only_model_has_no_non_block_pinned(self) -> None:
+        # Edge case: model whose only top-level child IS the block list
+        # (no patchifier/head/etc). Non-block wrapper is None; cache_bytes
+        # comes purely from blocks.
+        class BlockOnly(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [nn.Linear(4, 4, bias=False) for _ in range(4)]
+                )
+
+        m = BlockOnly()
+        for p in m.parameters():
+            p.requires_grad = False
+        off = BlockOffloader(
+            m, torch.device("cpu"), blocks_to_swap=2,
+            layers_attr="transformer_blocks", auto_setup=False,
+        )
+        try:
+            off.prepare()
+            assert off._non_block_pinned is None
+            assert off._non_block_wrapper is None
+            assert off.cache_bytes > 0  # block bytes only
+        finally:
+            off.close()
+
+
+# ---------------------------------------------------------------------------
+# Cross-region tied-weight detection
+# ---------------------------------------------------------------------------
+
+
+class TestCrossRegionTiedDetection:
+    def test_cross_block_tied_raises(self) -> None:
+        # Two blocks share a frozen weight via tied storage. Slot-local
+        # streaming can't preserve this; must raise at prepare().
+        shared = torch.randn(8, 8)
+        block_0 = nn.Linear(8, 8, bias=False)
+        block_1 = nn.Linear(8, 8, bias=False)
+        # Tie block_0 and block_1 weights — distinct Parameter wrappers,
+        # same storage, exposed in named_parameters under different
+        # qualified names.
+        block_0.weight = nn.Parameter(shared, requires_grad=False)
+        block_1.weight = nn.Parameter(shared, requires_grad=False)
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList([block_0, block_1])
+
+        m = M()
+        for p in m.parameters():
+            p.requires_grad = False
+        off = BlockOffloader(
+            m, torch.device("cpu"), blocks_to_swap=1,
+            layers_attr="transformer_blocks", auto_setup=False,
+        )
+        with pytest.raises(ValueError, match="cross-region|tied frozen"):
+            off.prepare()
+        off.close()
+
+    def test_block_to_non_block_tied_raises(self) -> None:
+        shared = torch.randn(4, 4)
+        block_0 = nn.Linear(4, 4, bias=False)
+        block_0.weight = nn.Parameter(shared, requires_grad=False)
+        head = nn.Linear(4, 4, bias=False)
+        head.weight = nn.Parameter(shared, requires_grad=False)  # tied to block
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [block_0, nn.Linear(4, 4, bias=False)]
+                )
+                self.head = head
+
+        m = M()
+        for p in m.parameters():
+            p.requires_grad = False
+        off = BlockOffloader(
+            m, torch.device("cpu"), blocks_to_swap=1,
+            layers_attr="transformer_blocks", auto_setup=False,
+        )
+        with pytest.raises(ValueError, match="cross-region|tied frozen"):
+            off.prepare()
+        off.close()
+
+    def test_mixed_trainable_frozen_cross_region_tied_raises(self) -> None:
+        # A trainable block param tied to a frozen non-block param: if
+        # not detected, the frozen side gets pinned/swapped while the
+        # trainable side is moved separately on activate, silently
+        # breaking the tie. Detection now ignores requires_grad.
+        shared = torch.randn(4, 4)
+        block_0 = nn.Linear(4, 4, bias=False)
+        block_0.weight = nn.Parameter(shared, requires_grad=True)  # trainable
+        head = nn.Linear(4, 4, bias=False)
+        head.weight = nn.Parameter(shared, requires_grad=False)  # frozen, tied
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [block_0, nn.Linear(4, 4, bias=False)]
+                )
+                self.head = head
+
+        m = M()
+        # Make non-block-1 frozen so we don't trip blocks_to_swap validation
+        for p in m.transformer_blocks[1].parameters():
+            p.requires_grad = False
+        off = BlockOffloader(
+            m, torch.device("cpu"), blocks_to_swap=1,
+            layers_attr="transformer_blocks", auto_setup=False,
+        )
+        with pytest.raises(ValueError, match="cross-region|tied"):
+            off.prepare()
+        off.close()
+
+    def test_non_block_internal_tied_works(self) -> None:
+        # Tied embed↔head WITHIN non-block region: PinnedWeights
+        # composition handles this via its own dedup. Should not raise.
+        embed = nn.Embedding(16, 8)
+        head = nn.Linear(8, 16, bias=False)
+        head.weight = embed.weight  # standard tie_weights() pattern
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = embed
+                self.transformer_blocks = nn.ModuleList(
+                    [nn.Linear(8, 8, bias=False) for _ in range(4)]
+                )
+                self.head = head
+
+        m = M()
+        for p in m.parameters():
+            p.requires_grad = False
+        off = BlockOffloader(
+            m, torch.device("cpu"), blocks_to_swap=2,
+            layers_attr="transformer_blocks", auto_setup=False,
+        )
+        try:
+            off.prepare()
+            # Non-block PinnedWeights deduped the tie — single slot.
+            assert len(off._non_block_pinned._slots) == 1
+            # Both names still tied at the Parameter level.
+            assert m.embed.weight is m.head.weight
+        finally:
+            off.close()
+
+
+# ---------------------------------------------------------------------------
 # BlockPinnedStore.activate_pool idempotency
 # ---------------------------------------------------------------------------
 
