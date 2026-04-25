@@ -295,10 +295,15 @@ class PinnedSlab:
             self._specs[spec.name] = _ParamSpec(**kwargs)
 
         # Pre-build CPU views — avoids re-running as_strided + quanto wrapper
-        # on each get_view call.
+        # on each get_view call. Also wrap each view in a stable
+        # ``nn.Parameter`` so callers that assign to ``module._parameters``
+        # get a reference that doesn't churn across loads.
         self._cpu_views: dict[str, torch.Tensor] = {}
+        self._cpu_params: dict[str, nn.Parameter] = {}
         for name, spec in self._specs.items():
-            self._cpu_views[name] = self._build_cpu_view(spec)
+            view = self._build_cpu_view(spec)
+            self._cpu_views[name] = view
+            self._cpu_params[name] = nn.Parameter(view, requires_grad=False)
 
     def _build_cpu_view(self, spec: _ParamSpec) -> torch.Tensor:
         data_buf = self._buffers[spec.data_dtype]
@@ -332,6 +337,16 @@ class PinnedSlab:
         """Return the cached CPU view for a named param (or alias)."""
         canonical = self._lookup_canonical(name)
         return self._cpu_views[canonical]
+
+    def get_param(self, name: str) -> nn.Parameter:
+        """Return a stable ``nn.Parameter`` wrapping the cached CPU view.
+
+        The Parameter object is built once at slab construction; consumers
+        assigning to ``submod._parameters[local_name]`` get a reference
+        whose identity persists across loads (required for PEFT and to
+        avoid Python ref churn on the hot path)."""
+        canonical = self._lookup_canonical(name)
+        return self._cpu_params[canonical]
 
     def _lookup_canonical(self, name: str) -> str:
         if name in self._cpu_views:
@@ -385,8 +400,11 @@ class GpuSlab:
             self._buffers[dtype] = torch.empty(src.numel(), dtype=dtype, device=device)
         self._template_specs: dict[str, _ParamSpec] = template.specs
         self._gpu_views: dict[str, torch.Tensor] = {}
+        self._gpu_params: dict[str, nn.Parameter] = {}
         for name, spec in template.specs.items():
-            self._gpu_views[name] = self._build_gpu_view(spec)
+            view = self._build_gpu_view(spec)
+            self._gpu_views[name] = view
+            self._gpu_params[name] = nn.Parameter(view, requires_grad=False)
 
     def _build_gpu_view(self, spec: _ParamSpec) -> torch.Tensor:
         data_buf = self._buffers[spec.data_dtype]
@@ -403,6 +421,14 @@ class GpuSlab:
         The returned reference is reusable across many ``bulk_to_gpu``
         loads — only the underlying storage bytes change."""
         return self._gpu_views[name]
+
+    def get_param(self, name: str) -> nn.Parameter:
+        """Return a stable ``nn.Parameter`` wrapping the cached GPU view.
+
+        Used by :class:`BlockOffloader` to populate
+        ``submod._parameters[local_name]`` without churning Parameter
+        identity across block loads."""
+        return self._gpu_params[name]
 
     def is_compatible_with(self, pinned: PinnedSlab) -> bool:
         """Strict layout check: same dtype set, same per-param specs.
