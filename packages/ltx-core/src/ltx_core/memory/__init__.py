@@ -24,14 +24,12 @@ storage/placement strategies that :class:`ModelCache` consumes. New
 strategies (disk-mmap, NVMe-paged, multi-GPU shard, etc.) just satisfy
 the protocol.
 
-:class:`BlockOffloader`'s legacy ``setup()`` / ``teardown()`` API is
-preserved as deprecated aliases for the new ``prepare`` / ``activate``
-/ ``deactivate`` / ``close`` lifecycle. ``auto_setup=True`` (the
-default) makes existing long-lived callers work unchanged.
-
-For :class:`ModelCache` integration, BlockOffloader factories must call
-``prepare()`` before returning the handle so the cache can read the
-correct ``cache_bytes`` immediately::
+:class:`BlockOffloader` defaults to ``auto_setup=True`` which runs
+``prepare(); activate()`` immediately so long-lived training callers
+don't have to phase the lifecycle by hand. For
+:class:`ModelCache` integration, factories pass ``auto_setup=False``
+and call ``prepare()`` before returning the handle so the cache reads
+the correct ``cache_bytes`` immediately::
 
     def factory():
         off = BlockOffloader(..., auto_setup=False)
@@ -57,7 +55,7 @@ into its own library when a second consumer appears (no LTX imports
 here).
 """
 
-from ltx_core.memory.block_offloader import BlockOffloader, TrainingBlockOffloader  # noqa: F401
+from ltx_core.memory.block_offloader import BlockOffloader
 from ltx_core.memory.model_cache import (
     ActivationError,
     DuplicateModelKeyError,

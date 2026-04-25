@@ -138,7 +138,7 @@ def _prepare_models_for_training(self) -> None:
         # Apply offloading BEFORE accelerator.prepare() while weights are on CPU.
         # _setup_lora() has already run, so LoRA params have requires_grad=True
         # and will be skipped by the offloader.
-        self._block_offloader = TrainingBlockOffloader(
+        self._block_offloader = BlockOffloader(
             model=self._transformer,
             layers_attr="transformer_blocks",
             target_device=self._accelerator.device,

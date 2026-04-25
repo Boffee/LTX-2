@@ -309,65 +309,6 @@ class TestClose:
 
 
 # ---------------------------------------------------------------------------
-# Back-compat aliases
-# ---------------------------------------------------------------------------
-
-
-class TestBackCompat:
-    @CUDA
-    def test_setup_after_construct_prepares_and_activates(self) -> None:
-        m = _make_block_model()
-        off = BlockOffloader(
-            m, torch.device("cuda"), blocks_to_swap=2,
-            layers_attr="transformer_blocks", auto_setup=False,
-        )
-        try:
-            off.setup()
-            assert off._prepared
-            assert off._active
-        finally:
-            off.close()
-
-    @CUDA
-    def test_setup_when_active_is_noop(self) -> None:
-        m = _make_block_model()
-        off = BlockOffloader(
-            m, torch.device("cuda"), blocks_to_swap=2, layers_attr="transformer_blocks",
-        )
-        try:
-            assert off._active
-            off.setup()  # idempotent when already active
-            assert off._active
-        finally:
-            off.close()
-
-    @CUDA
-    def test_setup_after_close_raises(self) -> None:
-        m = _make_block_model()
-        off = BlockOffloader(
-            m, torch.device("cuda"), blocks_to_swap=2, layers_attr="transformer_blocks",
-        )
-        off.close()
-        with pytest.raises(RuntimeError, match="closed"):
-            off.setup()
-
-    @CUDA
-    def test_teardown_is_destructive(self) -> None:
-        # Critical for shard_orchestrator.py: teardown() between shards
-        # must break the forward-hook reference cycle by destroying
-        # everything, not just deactivating.
-        m = _make_block_model()
-        off = BlockOffloader(
-            m, torch.device("cuda"), blocks_to_swap=2, layers_attr="transformer_blocks",
-        )
-        off.teardown()
-        # Destructive: model on meta, offloader closed.
-        assert off.closed
-        for p in m.parameters():
-            assert p.device.type == "meta"
-
-
-# ---------------------------------------------------------------------------
 # Hook lifecycle
 # ---------------------------------------------------------------------------
 

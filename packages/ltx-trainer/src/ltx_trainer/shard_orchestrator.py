@@ -105,9 +105,9 @@ def _tear_down_trainer(trainer: "LtxvTrainer") -> None:
     The block offloader registers forward-pre hooks on transformer block
     modules. Each hook closure retains a reference to the offloader, which
     references the model, which references the block — a cycle that
-    refcount GC can't break on its own. Without explicit teardown, shard N+1
-    starts loading its model on top of shard N's still-resident GPU
-    parameters + optimizer state + pinned CPU buffers, and OOMs on the
+    refcount GC can't break on its own. Without an explicit ``close()``,
+    shard N+1 starts loading its model on top of shard N's still-resident
+    GPU parameters + optimizer state + pinned CPU buffers, and OOMs on the
     first tensor that doesn't fit in whatever sliver remains.
     """
     try:
@@ -115,7 +115,7 @@ def _tear_down_trainer(trainer: "LtxvTrainer") -> None:
 
         offloader = getattr(trainer, "_block_offloader", None)
         if offloader is not None:
-            offloader.teardown()
+            offloader.close()
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

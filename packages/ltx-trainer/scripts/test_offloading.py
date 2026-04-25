@@ -2,7 +2,7 @@
 
 Creates dummy preprocessed data and runs a short training loop to verify:
 1. Block offloading works (no device mismatch, loss decreases)
-2. Validation teardown/setup cycling works
+2. Validation deactivate/activate cycling works
 3. Audio LR creates separate param groups
 4. No regression when features are disabled
 

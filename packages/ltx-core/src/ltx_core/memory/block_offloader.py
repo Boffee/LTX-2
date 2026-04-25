@@ -20,11 +20,10 @@ into the base weights first.
 
 Implements :class:`~ltx_core.memory.strategy.ModelStrategy` via the
 ``prepare`` / ``activate`` / ``deactivate`` / ``close`` lifecycle so it
-plugs into :class:`~ltx_core.memory.model_cache.ModelCache`. The legacy
-``setup()`` / ``teardown()`` API is preserved as deprecated aliases —
-``setup()`` does ``prepare(); activate()`` and ``teardown()`` does
-``close()`` (destructive). Long-lived training keeps using the existing
-construct-then-train-then-teardown pattern unchanged via ``auto_setup=True``.
+plugs into :class:`~ltx_core.memory.model_cache.ModelCache`.
+``auto_setup=True`` (the default) runs ``prepare(); activate()``
+immediately in the constructor so long-lived training callers don't
+need to phase the lifecycle by hand.
 """
 
 from __future__ import annotations
@@ -456,13 +455,11 @@ class BlockOffloader:
     the offload.
 
     Implements :class:`~ltx_core.memory.strategy.ModelStrategy` via the
-    ``prepare`` / ``activate`` / ``deactivate`` / ``close`` lifecycle. The
-    legacy ``setup()`` / ``teardown()`` API is preserved as deprecated
-    aliases — ``setup()`` does ``prepare(); activate()`` and ``teardown()``
-    does ``close()`` (destructive — moves the model to ``meta`` and releases
-    pinned storage). ``shard_orchestrator.py`` and other consumers that
-    call ``teardown()`` between shards depend on this destructive
-    semantics for breaking forward-hook reference cycles.
+    ``prepare`` / ``activate`` / ``deactivate`` / ``close`` lifecycle.
+    ``close()`` is destructive — it moves the model to ``meta`` and
+    releases pinned storage, breaking the offloader → forward-hook →
+    block reference cycle. ``shard_orchestrator.py`` calls it between
+    shards for exactly that reason.
 
     Caveats
     -------
@@ -544,7 +541,8 @@ class BlockOffloader:
         self._last_idx: int = -1
 
         if auto_setup:
-            self.setup()
+            self.prepare()
+            self.activate()
 
     # ------------------------------------------------------------------
     # ModelStrategy lifecycle
@@ -857,10 +855,10 @@ class BlockOffloader:
 
         Idempotent. After ``close()``, the wrapped model is unusable —
         callers must rebuild a fresh BlockOffloader to use it again.
-        Also the path the legacy ``teardown()`` alias takes, which is
-        what ``shard_orchestrator.py`` relies on to break the
-        offloader → forward-hook → block → offloader reference cycle
-        between shards.
+        ``shard_orchestrator.py`` calls ``close()`` between shards to
+        break the offloader → forward-hook → block → offloader
+        reference cycle that holds the previous shard's GPU + pinned
+        memory across the rebind.
         """
         if self._closed:
             return
@@ -907,34 +905,6 @@ class BlockOffloader:
         tb: TracebackType | None,
     ) -> None:
         self.deactivate()
-
-    # ------------------------------------------------------------------
-    # Back-compat aliases (pre-lifecycle-split public API)
-    # ------------------------------------------------------------------
-
-    def setup(self) -> None:
-        """Back-compat: ``prepare(); activate()``. Behavior depends on
-        current state:
-
-        - constructed → prepare + activate
-        - prepared → activate
-        - active → no-op
-        - closed → raise ``RuntimeError``
-        """
-        if self._closed:
-            raise RuntimeError("BlockOffloader is closed; create a fresh instance.")
-        if self._active:
-            return
-        if not self._prepared:
-            self.prepare()
-        self.activate()
-
-    def teardown(self) -> None:
-        """Back-compat alias for :meth:`close`. Destructive — moves the
-        model to ``meta`` and releases all pinned storage. This is what
-        ``shard_orchestrator.py`` calls between shards to break the
-        forward-hook reference cycle."""
-        self.close()
 
     # ------------------------------------------------------------------
     # Internals
@@ -1111,7 +1081,3 @@ class BlockOffloader:
     def reset_peak(self) -> None:
         if self._tracker is not None:
             self._tracker.peak_gpu_blocks = len(self._tracker._on_gpu) + len(self._pending)
-
-
-# Back-compat alias — old name from when this lived in ltx-trainer.
-TrainingBlockOffloader = BlockOffloader
