@@ -375,7 +375,7 @@ class TestActiveSet:
                 assert isinstance(e, nn.Module)
                 assert isinstance(d, nn.Module)
                 snap = cache.snapshot()
-                assert snap.active_refcounts == {"enc": 1, "dec": 1}
+                assert dict(snap.active_refcounts) == {"enc": 1, "dec": 1}
 
     def test_deactivate_returns_to_lru_at_mru(self) -> None:
         cache = ModelCache(300)

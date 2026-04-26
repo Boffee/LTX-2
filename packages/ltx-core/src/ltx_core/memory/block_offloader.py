@@ -65,7 +65,7 @@ def _resolve_dotted(module: nn.Module, dotted_path: str) -> nn.Module:
 # ---------------------------------------------------------------------------
 
 
-class GpuSlot:
+class _GpuSlot:
     """Pre-allocated GPU storage for one block's frozen params.
 
     For each ``PinnedParamBuffer`` template, allocates matching GPU
@@ -101,8 +101,8 @@ class GpuSlot:
         return self._gpu_params[name]
 
 
-class GpuSlotPool:
-    """Pool of pre-allocated :class:`GpuSlot` instances.
+class _GpuSlotPool:
+    """Pool of pre-allocated :class:`_GpuSlot` instances.
 
     All blocks share the same parameter structure (in homogeneous
     mode), so one template list of ``PinnedParamBuffer`` is used to
@@ -121,7 +121,7 @@ class GpuSlotPool:
         num_slots: int,
         device: torch.device,
     ) -> None:
-        self._slots = [GpuSlot(template, device) for _ in range(num_slots)]
+        self._slots = [_GpuSlot(template, device) for _ in range(num_slots)]
         self._free: list[int] = list(range(num_slots))
         self._events: list[torch.cuda.Event | None] = [None] * num_slots
 
@@ -131,7 +131,7 @@ class GpuSlotPool:
     def release(self, slot_id: int) -> None:
         self._free.append(slot_id)
 
-    def slot(self, slot_id: int) -> GpuSlot:
+    def slot(self, slot_id: int) -> _GpuSlot:
         return self._slots[slot_id]
 
     def set_compute_event(self, slot_id: int, event: torch.cuda.Event) -> None:
@@ -150,7 +150,7 @@ class GpuSlotPool:
 # ---------------------------------------------------------------------------
 
 
-class BlockPinnedStore:
+class _BlockPinnedStore:
     """Per-block pinned CPU + (when activated) per-slot GPU storage.
 
     Lifecycle:
@@ -161,7 +161,7 @@ class BlockPinnedStore:
       offloaded. Buffers (registered via ``register_buffer``) get a
       pinned CPU clone in place. No GPU allocation occurs.
 
-    - :meth:`activate_pool` allocates a :class:`GpuSlotPool` for
+    - :meth:`activate_pool` allocates a :class:`_GpuSlotPool` for
       bounded GPU residency. Block layouts must be homogeneous for
       pool reuse; heterogeneous configurations fall back to per-load
       ``cudaMalloc`` (slower).
@@ -226,7 +226,7 @@ class BlockPinnedStore:
             self._buf_pairs.append(buf_pairs)
 
         self._device: torch.device | None = None
-        self._pool: GpuSlotPool | None = None
+        self._pool: _GpuSlotPool | None = None
         self._block_to_slot: dict[int, int] = {}
         # Captured on first activate_pool() so a mismatched re-activation
         # raises rather than silently reusing the wrong pool.
@@ -259,7 +259,7 @@ class BlockPinnedStore:
             existing = self._pool_config
             if existing != (num_gpu_slots, device):
                 raise ValueError(
-                    f"BlockPinnedStore pool already activated with "
+                    f"_BlockPinnedStore pool already activated with "
                     f"{existing}; cannot re-activate with ({num_gpu_slots}, "
                     f"{device}). Call deactivate_pool() first."
                 )
@@ -267,7 +267,7 @@ class BlockPinnedStore:
         self._device = device
         self._pool_config = (num_gpu_slots, device)
         if num_gpu_slots > 0 and self._param_bufs and self._blocks_are_homogeneous():
-            self._pool = GpuSlotPool(self._param_bufs[0], num_gpu_slots, device)
+            self._pool = _GpuSlotPool(self._param_bufs[0], num_gpu_slots, device)
         else:
             if num_gpu_slots > 0 and self._param_bufs:
                 logger.info("Blocks have heterogeneous structure; using per-load GPU allocation")
@@ -390,7 +390,7 @@ class BlockPinnedStore:
 # ---------------------------------------------------------------------------
 
 
-class BlockTracker:
+class _BlockTracker:
     def __init__(self, num_layers: int) -> None:
         self.num_layers = num_layers
         self._on_gpu: set[int] = set()
@@ -470,7 +470,7 @@ class BlockOffloader:
       :meth:`prepare`.** Frozen storage shared across blocks, or
       between a block and a non-block sibling, can't be preserved by
       slot-local streaming. Storage shared across two slots within the
-      same block can't be preserved by ``BlockPinnedStore``'s
+      same block can't be preserved by ``_BlockPinnedStore``'s
       duplicate-removed iteration either. Non-block-internal ties
       (the standard ``tie_weights()`` embed↔head pattern) are handled
       correctly via the composed :class:`PinnedWeights`'s storage-key
@@ -536,7 +536,7 @@ class BlockOffloader:
         # Resources owned at "prepared" lifetime
         self._layers: list[nn.Module] | None = None
         self._block_leaf_names: set[str] | None = None
-        self._store: BlockPinnedStore | None = None
+        self._store: _BlockPinnedStore | None = None
         # Non-block frozen params/buffers are managed via PinnedWeights
         # composition: a synthetic wrapper module references the non-block
         # children of each parent, then PinnedWeights pins them and
@@ -547,7 +547,7 @@ class BlockOffloader:
         self._non_block_pinned: PinnedWeights | None = None
 
         # Resources owned at "active" lifetime
-        self._tracker: BlockTracker | None = None
+        self._tracker: _BlockTracker | None = None
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._executor: ThreadPoolExecutor | None = None
         self._stream: torch.cuda.Stream | None = None
@@ -583,7 +583,7 @@ class BlockOffloader:
         """Resolve layers, pin frozen weights to CPU. Truly inactive:
         no GPU allocation, no hooks, no executor.
 
-        Frozen block weights go into a :class:`BlockPinnedStore` (per-block
+        Frozen block weights go into a :class:`_BlockPinnedStore` (per-block
         pinned CPU + on-demand slot pool when active). Frozen non-block
         siblings (patchifier, output projection, norms, etc.) are pinned
         via a composed :class:`PinnedWeights` so they leave GPU on
@@ -657,7 +657,7 @@ class BlockOffloader:
                 self._non_block_pinned = None
 
         # Pin block weights (CPU only — pool allocated in activate()).
-        self._store = BlockPinnedStore(self._layers)
+        self._store = _BlockPinnedStore(self._layers)
 
         self._prepared = True
 
@@ -707,7 +707,7 @@ class BlockOffloader:
         Three categories are unsupported:
 
         - **Cross-region ties** (block↔block, block↔non_block): the two
-          pinning regimes (per-block ``BlockPinnedStore`` and
+          pinning regimes (per-block ``_BlockPinnedStore`` and
           whole-non-block composed ``PinnedWeights``) can't coordinate
           to share storage.
         - **Mixed frozen/trainable ties** across any region boundary:
@@ -715,7 +715,7 @@ class BlockOffloader:
           trainable side is moved separately on activate, breaking the
           sharing invariant silently.
         - **Intra-block ties** (two slots in the same block sharing
-          storage): ``BlockPinnedStore`` uses ``named_parameters()``
+          storage): ``_BlockPinnedStore`` uses ``named_parameters()``
           with default duplicate removal and only swaps one alias slot,
           leaving the other pointing at non-pinned data. Reject rather
           than silently break.
@@ -807,7 +807,7 @@ class BlockOffloader:
             # Intra-block ties: a single block region with multiple
             # distinct (parent, leaf) slot locations means the same
             # storage is referenced at multiple places within the block
-            # and BlockPinnedStore would only swap one of them.
+            # and _BlockPinnedStore would only swap one of them.
             sole_region = next(iter(regions))
             if sole_region.startswith("block:"):
                 slot_locs = {(pid, leaf) for _, _, _, pid, leaf in members}
@@ -815,7 +815,7 @@ class BlockOffloader:
                     raise ValueError(
                         f"BlockOffloader does not support intra-block tied "
                         f"parameters: storage shared by {names} within "
-                        f"{sole_region}. BlockPinnedStore cannot preserve "
+                        f"{sole_region}. _BlockPinnedStore cannot preserve "
                         "the tying invariant — one alias would stay pointing "
                         "at non-pinned data. Untie the parameters or use "
                         "whole-model PinnedWeights instead."
@@ -907,7 +907,7 @@ class BlockOffloader:
             # params are covered.
             _move_trainable_to_device(self._model, self._target_device)
 
-            self._tracker = BlockTracker(num_layers)
+            self._tracker = _BlockTracker(num_layers)
             self._executor = ThreadPoolExecutor(max_workers=1)
             self._stream = torch.cuda.Stream(device=self._target_device, priority=-1)
             self._pending = {}

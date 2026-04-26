@@ -39,7 +39,7 @@ class TestPinnedParamBuffer:
 
     @CUDA
     def test_pool_pattern_allocate_and_copy(self) -> None:
-        # Mirrors how GpuSlot uses PinnedParamBuffer: allocate GPU
+        # Mirrors how _GpuSlot uses PinnedParamBuffer: allocate GPU
         # storage once, then copy_to_gpu in place on each load.
         p = nn.Parameter(torch.randn(16, dtype=torch.bfloat16), requires_grad=False)
         buf = PinnedParamBuffer("w", p)
@@ -59,7 +59,7 @@ class TestPinnedParamBuffer:
         torch.cuda.synchronize()
         assert torch.equal(gpu_data.cpu(), new_vals)
         # Stable storage — gpu_param wraps the same GPU bytes as gpu_data.
-        # GpuSlot relies on this: build the Parameter wrapper once at slot
+        # _GpuSlot relies on this: build the Parameter wrapper once at slot
         # construction, mutate underlying storage in place on each load.
         assert gpu_param.data_ptr() == gpu_data.data_ptr()
 
@@ -87,16 +87,16 @@ class TestPinnedParamBuffer:
 
     @CUDA
     def test_slot_param_identity_stable_across_loads(self) -> None:
-        # GpuSlot caches the Parameter wrapping its GPU storage; copy_from
+        # _GpuSlot caches the Parameter wrapping its GPU storage; copy_from
         # must not churn that wrapper. Hooks repointing submod._parameters
         # at slot.get_param() observe a stable object across reloads — the
         # whole point of the pool-slot pattern over per-load allocation.
-        from ltx_core.memory.block_offloader import GpuSlot
+        from ltx_core.memory.block_offloader import _GpuSlot
 
         p1 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
         p2 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
         block = [PinnedParamBuffer("a", p1), PinnedParamBuffer("b", p2)]
-        slot = GpuSlot(block, torch.device("cuda"))
+        slot = _GpuSlot(block, torch.device("cuda"))
 
         a_first = slot.get_param("a")
         b_first = slot.get_param("b")

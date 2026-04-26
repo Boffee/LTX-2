@@ -799,7 +799,7 @@ class TestCrossRegionTiedDetection:
         off.close()
 
     def test_intra_block_tied_raises(self) -> None:
-        # Two slots WITHIN one block share storage. BlockPinnedStore
+        # Two slots WITHIN one block share storage. _BlockPinnedStore
         # uses default named_parameters (remove_duplicate=True) and
         # would only swap one alias, leaving the other pointing at
         # non-pinned data. Detect+reject rather than silently break.
@@ -1011,17 +1011,17 @@ class TestBlockBuffersPinned:
 
 
 # ---------------------------------------------------------------------------
-# BlockPinnedStore.activate_pool idempotency
+# _BlockPinnedStore.activate_pool idempotency
 # ---------------------------------------------------------------------------
 
 
 class TestActivatePoolIdempotency:
     @CUDA
     def test_same_config_idempotent(self) -> None:
-        from ltx_core.memory.block_offloader import BlockPinnedStore
+        from ltx_core.memory.block_offloader import _BlockPinnedStore
 
         m = _make_block_model()
-        store = BlockPinnedStore(list(m.transformer_blocks))
+        store = _BlockPinnedStore(list(m.transformer_blocks))
         store.activate_pool(2, torch.device("cuda"))
         pool_first = store._pool
         store.activate_pool(2, torch.device("cuda"))  # same config — no-op
@@ -1029,10 +1029,10 @@ class TestActivatePoolIdempotency:
 
     @CUDA
     def test_mismatched_config_raises(self) -> None:
-        from ltx_core.memory.block_offloader import BlockPinnedStore
+        from ltx_core.memory.block_offloader import _BlockPinnedStore
 
         m = _make_block_model()
-        store = BlockPinnedStore(list(m.transformer_blocks))
+        store = _BlockPinnedStore(list(m.transformer_blocks))
         store.activate_pool(2, torch.device("cuda"))
         with pytest.raises(ValueError, match="already activated"):
             store.activate_pool(3, torch.device("cuda"))

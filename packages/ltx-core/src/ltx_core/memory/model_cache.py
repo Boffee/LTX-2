@@ -119,17 +119,19 @@ class ModelCacheStats:
 class ModelCacheSnapshot:
     """Detached point-in-time view of the cache.
 
-    The dataclass itself is frozen and ``stats`` is deep-copied at
-    capture time so subsequent cache activity does not mutate it. The
-    nested ``active_refcounts`` dict and ``stats`` instance are not
-    additionally frozen, so callers should not mutate them.
+    The dataclass itself is frozen, ``active_refcounts`` is a tuple of
+    ``(key, count)`` pairs, and ``stats`` is deep-copied at capture
+    time so subsequent cache activity does not mutate it. The nested
+    ``ModelCacheStats`` instance is not additionally frozen for
+    pragmatic reasons (the cache's working stats need to be mutable),
+    so callers should not mutate it.
     """
 
     max_cache_bytes: int
     used_cache_bytes: int
     registered_keys: tuple[str, ...]
     cached_keys_lru_to_mru: tuple[str, ...]
-    active_refcounts: dict[str, int]
+    active_refcounts: tuple[tuple[str, int], ...]
     stats: ModelCacheStats
 
 
@@ -189,10 +191,14 @@ class ModelEvictionError(ModelCacheError):
 
 
 class ActivationError(ModelCacheError):
-    """A strategy's ``activate()`` raised. For freshly-built handles,
-    the cache discards the poisoned entry. For previously-cached
-    entries, the entry remains cached but the active refcount is rolled
-    back."""
+    """A strategy's ``activate()`` raised. The cache discards the entry
+    (closes the handle, removes it from cache state) regardless of
+    whether the entry was freshly built or previously cached — strategies
+    with multi-step ``activate()`` (e.g. :class:`BlockOffloader`) can
+    fail mid-way after partially installing hooks/pool/composed
+    PinnedWeights, and caching such an entry as "ready to retry" lies
+    about its state. The next acquire rebuilds via the registered
+    factory."""
 
 
 # ---------------------------------------------------------------------------
@@ -374,14 +380,21 @@ class ModelCache:
         )
 
     def snapshot(self) -> ModelCacheSnapshot:
-        """Whole-cache point-in-time view. Stats are deep-copied so
-        the snapshot is genuinely immutable."""
+        """Whole-cache point-in-time view. ``stats`` is copied at
+        capture time so subsequent activity does not mutate the
+        snapshot; the dataclass itself is frozen and
+        ``active_refcounts`` is a tuple. See
+        :class:`ModelCacheSnapshot` for the immutability nuances."""
         return ModelCacheSnapshot(
             max_cache_bytes=self._max_cache_bytes,
             used_cache_bytes=self._used_bytes,
             registered_keys=tuple(self._entries.keys()),
             cached_keys_lru_to_mru=tuple(self._lru.keys()),
-            active_refcounts={k: e.active_count for k, e in self._entries.items() if e.active_count > 0},
+            active_refcounts=tuple(
+                (k, e.active_count)
+                for k, e in self._entries.items()
+                if e.active_count > 0
+            ),
             stats=dataclasses.replace(self._stats),
         )
 

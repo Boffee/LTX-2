@@ -50,11 +50,13 @@ Other skips
 
 Caveats
 -------
-- Cache key includes ``streaming_prefetch_count`` (selects PinnedWeights
-  vs the streaming fallback path) but **not** other per-call kwargs.
-  Calling the same block instance with kwargs that affect model
-  construction would silently reuse the first-built model. For LTX-2
-  ``Builder.build()`` ignores ``**kwargs`` so this is safe today.
+- Cache key is ``f"{cls.__name__}:{token}:{kind}:pinned"`` — keyed by
+  block-instance token only, **not** per-call kwargs. Calling the same
+  block instance with kwargs that affect model construction would
+  silently reuse the first-built model. For LTX-2 ``Builder.build()``
+  ignores ``**kwargs`` so this is safe today; if a future kwarg ever
+  affects construction it must be added to the variant in the key
+  so the cache rebuilds.
 - Default size estimates are 0 (no pre-eviction; rely on post-activate
   reconciliation). For tight-budget configurations where the total
   pinned working set may exceed ``max_cache_bytes``, pass non-zero
@@ -181,12 +183,20 @@ def install_model_cache(
     _TEXT_ENCODER_SIZE_ESTIMATE = text_encoder_size_estimate
 
 
-class UninstallBusyError(RuntimeError):
+class UninstallBusyError(ModelInUseError):
     """Raised when ``uninstall_model_cache`` cannot evict one or more
-    installer-owned entries because they are currently active. Caller
-    must finish their work (exit any open ``cache.use`` contexts) and
-    retry. Uninstall does NOT partially unwind on failure — the
-    patches stay installed and the surviving entries stay tracked."""
+    installer-owned entries because they are currently active.
+
+    Subclasses :class:`~ltx_core.memory.model_cache.ModelInUseError` so
+    callers can ``except ModelInUseError`` to catch any "entry is busy"
+    family of error.
+
+    On failure: patches stay installed; busy keys stay tracked; any
+    non-busy installer-owned keys evicted before the first failure stay
+    evicted (we don't roll back a partial eviction). The caller can
+    finish their work and retry — only the busy keys will need a
+    second eviction pass.
+    """
 
     def __init__(self, busy_keys: list[str]) -> None:
         super().__init__(

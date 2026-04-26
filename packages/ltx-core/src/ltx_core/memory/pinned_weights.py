@@ -15,8 +15,12 @@ slot back at a Parameter that wraps pinned CPU storage.
 Implements :class:`~ltx_core.memory.strategy.ModelStrategy` so it plugs
 into a model cache directly.
 
-Caveats
--------
+Cross-cutting compatibility caveats (``torch.compile`` incompatibility,
+DDP/FSDP wrap-before requirement, single-thread contract) live in the
+:mod:`~ltx_core.memory` package docstring.
+
+Class-specific caveats
+----------------------
 - The constructor *mutates* the wrapped ``model`` — each frozen
   parameter slot (``module._parameters[leaf]``) is replaced with a
   Parameter wrapping pinned CPU storage, and registered buffers are
@@ -31,13 +35,7 @@ Caveats
   training-mode BatchNorm running stats) are *discarded* on
   :meth:`deactivate`. Suitable for inference of stateless modules; not
   suitable for models that need persistent buffer state across calls.
-- Incompatible with ``torch.compile`` (compile traces capture tensor
-  identity; slot swaps invalidate the trace).
-- Wrap the model *before* DDP/FSDP — those wrappers manage parameter
-  storage themselves and conflict with this class.
 - :meth:`activate` is not re-entrant: nested calls raise ``RuntimeError``.
-- Not thread-safe: concurrent callers on the same instance race on slot
-  assignment.
 - :meth:`close` is destructive: it moves the wrapped model to the
   ``meta`` device to release storage references. The model object is
   unusable after ``close()``; callers must rebuild to use it again.
@@ -51,9 +49,7 @@ Caveats
 
 from __future__ import annotations
 
-import contextlib
 import logging
-from collections.abc import Iterator
 from types import TracebackType
 from typing import Any
 
@@ -253,7 +249,14 @@ class PinnedWeights:
     @property
     def cache_bytes(self) -> int:
         """Total pinned host bytes held. Tied weights counted once."""
-        return self.pinned_bytes
+        total = 0
+        for buf, _ in self._slots:
+            total += buf.pinned_data.numel() * buf.pinned_data.element_size()
+            if buf.pinned_scale is not None:
+                total += buf.pinned_scale.numel() * buf.pinned_scale.element_size()
+        for pinned, _ in self._buffer_slots:
+            total += pinned.numel() * pinned.element_size()
+        return total
 
     @property
     def closed(self) -> bool:
@@ -349,37 +352,6 @@ class PinnedWeights:
         tb: TracebackType | None,
     ) -> None:
         self.deactivate()
-
-    # ------------------------------------------------------------------
-    # Back-compat aliases (pre-ModelStrategy public API)
-    # ------------------------------------------------------------------
-
-    @property
-    def pinned_bytes(self) -> int:
-        """Total pinned CPU memory currently held. Tied weights counted once."""
-        total = 0
-        for buf, _ in self._slots:
-            total += buf.pinned_data.numel() * buf.pinned_data.element_size()
-            if buf.pinned_scale is not None:
-                total += buf.pinned_scale.numel() * buf.pinned_scale.element_size()
-        for pinned, _ in self._buffer_slots:
-            total += pinned.numel() * pinned.element_size()
-        return total
-
-    @contextlib.contextmanager
-    def on_gpu(self) -> Iterator[nn.Module]:
-        """Back-compat context manager around :meth:`activate` /
-        :meth:`deactivate`. Prefer ``with strategy as model:`` going
-        forward."""
-        model = self.activate()
-        try:
-            yield model
-        finally:
-            self.deactivate()
-
-    def teardown(self) -> None:
-        """Back-compat alias for :meth:`close`. Prefer ``close()``."""
-        self.close()
 
     # ------------------------------------------------------------------
     # Internals

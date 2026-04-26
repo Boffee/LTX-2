@@ -67,9 +67,12 @@ Compatibility
 - **Single-thread / sequential.** No internal locking; concurrent use
   on the same strategy or cache is undefined behavior.
 
-Designed to be a self-contained subpackage so it can be lifted out
-into its own library when a second consumer appears (no LTX imports
-here).
+Designed as a self-contained subpackage so it can be lifted out into
+its own library when a second consumer appears. The core strategy and
+cache modules avoid pipeline imports; the optional
+:mod:`~ltx_core.memory.pipeline_install` integration module imports
+``ltx_pipelines`` lazily at install time and is the only piece tied
+to the LTX repo layout.
 """
 
 from ltx_core.memory.block_offloader import BlockOffloader
@@ -78,10 +81,7 @@ from ltx_core.memory.model_cache import (
     DuplicateModelKeyError,
     ModelCache,
     ModelCacheError,
-    ModelCacheSnapshot,
-    ModelCacheStats,
     ModelEvictionError,
-    ModelInfo,
     ModelInUseError,
     ModelNotRegisteredError,
     ModelSpec,
@@ -90,17 +90,19 @@ from ltx_core.memory.model_cache import (
 from ltx_core.memory.pinned_weights import PinnedWeights
 from ltx_core.memory.strategy import ModelStrategy
 
+# `ModelCacheSnapshot`, `ModelCacheStats`, and `ModelInfo` are observability
+# types — used by callers who introspect cache state, not the typical
+# acquire/use path. Import them directly from
+# `ltx_core.memory.model_cache` when needed.
+
 __all__ = [
     "ActivationError",
     "BlockOffloader",
     "DuplicateModelKeyError",
     "ModelCache",
     "ModelCacheError",
-    "ModelCacheSnapshot",
-    "ModelCacheStats",
     "ModelEvictionError",
     "ModelInUseError",
-    "ModelInfo",
     "ModelNotRegisteredError",
     "ModelSpec",
     "ModelStrategy",

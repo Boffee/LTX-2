@@ -148,11 +148,6 @@ class TestClose:
         with pytest.raises(RuntimeError, match="closed"):
             pw.activate()
 
-    def test_teardown_alias(self) -> None:
-        pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
-        pw.teardown()
-        assert pw.closed
-
     def test_close_failure_does_not_strand_strategy(self, monkeypatch) -> None:
         # If model.to("meta") raises, we must NOT mark the strategy
         # closed and we must NOT drop the only handle to pinned storage —
@@ -217,31 +212,6 @@ class TestActivateRollback:
             monkeypatch.setattr(pw, "_move_to_gpu", original)
             with pw:
                 pass
-        finally:
-            pw.close()
-
-
-# ---------------------------------------------------------------------------
-# on_gpu() back-compat
-# ---------------------------------------------------------------------------
-
-
-class TestOnGpuBackCompat:
-    def test_on_gpu_yields_model(self) -> None:
-        m = _make_simple_model()
-        pw = PinnedWeights(m, torch.device("cpu"))
-        try:
-            with pw.on_gpu() as returned:
-                assert returned is m
-        finally:
-            pw.close()
-
-    def test_on_gpu_not_reentrant(self) -> None:
-        pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
-        try:
-            with pw.on_gpu():
-                with pytest.raises(RuntimeError, match="not re-entrant"):
-                    pw.on_gpu().__enter__()
         finally:
             pw.close()
 
@@ -345,7 +315,6 @@ class TestTiedWeightDedup:
             # 32 * 16 * 4 (float32 default) = 2048 bytes for one buffer.
             # If the dedup were broken this would double.
             assert pw.cache_bytes == 32 * 16 * 4
-            assert pw.cache_bytes == pw.pinned_bytes
         finally:
             pw.close()
 
@@ -526,15 +495,14 @@ class TestQuanto:
 
 
 # ---------------------------------------------------------------------------
-# cache_bytes / pinned_bytes accounting
+# cache_bytes accounting
 # ---------------------------------------------------------------------------
 
 
 class TestCacheBytes:
-    def test_cache_bytes_matches_pinned_bytes(self) -> None:
+    def test_cache_bytes_positive(self) -> None:
         pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
         try:
-            assert pw.cache_bytes == pw.pinned_bytes
             assert pw.cache_bytes > 0
         finally:
             pw.close()
