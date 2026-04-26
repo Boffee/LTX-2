@@ -306,10 +306,17 @@ a pipeline gets cache hits across calls; constructing a new pipeline
 gets a fresh entry. When a pipeline is garbage-collected, its cache
 entries are auto-evicted via `weakref.finalize`.
 
-Both non-streaming (PinnedWeights) and streaming
-(`streaming_prefetch_count=N`, BlockOffloader) modes are cached;
-`stream{N}` and `pinned` are separate variants in the cache key so
-toggling on the same instance produces distinct entries.
+Strategy choice per component:
+
+- **Transformer** follows the pipeline's `streaming_prefetch_count`
+  kwarg. `None` → PinnedWeights (whole-model bulk DMA); `int` →
+  BlockOffloader(prefetch=N). Cache key includes `stream{N}` vs
+  `pinned` so toggling produces distinct entries.
+- **Text encoder** always uses PinnedWeights. The pipeline's
+  `streaming_prefetch_count` kwarg is ignored for the text encoder
+  because text encoders fit on GPU and per-block streaming overhead
+  doesn't amortize over a single-shot encode call.
+
 `torch_compile=True` falls back to the original (non-cached) path
 because slot-swap is incompatible with compile's tensor-identity
 tracking.

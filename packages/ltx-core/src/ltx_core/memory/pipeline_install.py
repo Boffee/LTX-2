@@ -28,15 +28,25 @@ etc.) are out of scope — they're either too small to be worth
 caching, or their lazy-iterator return type makes lifetime
 correctness fragile.
 
-Streaming mode
---------------
-Both non-streaming (``PinnedWeights``) and streaming
-(``streaming_prefetch_count=N``, ``BlockOffloader``) modes are cached.
-The cache key includes a ``stream{N}`` vs ``pinned`` variant so
-toggling on the same block instance produces distinct entries. This
-relies on :class:`BlockOffloader` handling direct frozen parameters
-on parent modules (e.g. LTX's ``velocity_model.scale_shift_table``)
-via the composed-PinnedWeights skip filter.
+Strategy choice per component
+-----------------------------
+- **Transformer**: follows the pipeline's per-call
+  ``streaming_prefetch_count`` kwarg. ``None`` →
+  :class:`PinnedWeights` (whole-model bulk DMA); ``int`` →
+  :class:`BlockOffloader` (per-block streaming). Cache key includes
+  ``stream{N}`` vs ``pinned`` so toggling on the same block instance
+  produces distinct entries. Streaming-mode caching relies on
+  :class:`BlockOffloader` handling direct frozen parameters on parent
+  modules (e.g. LTX's ``velocity_model.scale_shift_table``) via the
+  composed-PinnedWeights skip filter.
+- **Text encoder**: always :class:`PinnedWeights`. The pipeline's
+  ``streaming_prefetch_count`` kwarg is ignored for the text encoder
+  because text encoders fit on GPU under any realistic config and
+  are used one-shot per prompt — per-block hook overhead doesn't
+  amortize over a single forward pass. Hardcoding this also avoids
+  the silent footgun where the pipeline's single-knob kwarg would
+  inadvertently stream the text encoder when the caller really only
+  wanted the diffusion transformer to stream.
 
 Fallback to original
 --------------------
@@ -141,6 +151,18 @@ def install_model_cache(
         ``old_pinned + new_pinned`` during construction.
     text_encoder_size_estimate:
         Same, for text encoder entries.
+
+    Strategy choice
+    ---------------
+    - **Transformer**: follows the pipeline's per-call
+      ``streaming_prefetch_count`` kwarg. ``None`` →
+      :class:`PinnedWeights` (whole-model bulk DMA); ``int`` →
+      :class:`BlockOffloader` (per-block streaming).
+    - **Text encoder**: always :class:`PinnedWeights`. Streaming a
+      text encoder doesn't make sense — they fit on GPU, are used
+      one-shot per prompt, and per-block hook overhead doesn't
+      amortize. The pipeline's ``streaming_prefetch_count`` kwarg is
+      ignored for the text encoder.
 
     Idempotent: calling with the same cache is a no-op (just updates
     estimates). Calling with a different cache uninstalls the previous
@@ -471,14 +493,18 @@ def _patched_text_encoder_ctx(
     if cache is None:
         return original(self, streaming_prefetch_count)
 
+    # Always use PinnedWeights for the text encoder, regardless of the
+    # pipeline's streaming_prefetch_count kwarg. Streaming a text
+    # encoder doesn't make sense — text encoders fit on GPU under any
+    # realistic config and are used one-shot per prompt; per-block
+    # hook overhead doesn't amortize over a single forward pass.
+    # Decoupling text-encoder strategy from the pipeline's
+    # one-knob-fits-all kwarg also avoids a silent footgun where
+    # passing streaming_prefetch_count for the diffusion transformer
+    # would inadvertently stream the text encoder too.
     cls = type(self)
     token = _get_or_create_token(cls, self)
-    variant = (
-        f"stream{streaming_prefetch_count}"
-        if streaming_prefetch_count is not None
-        else "pinned"
-    )
-    key = f"{cls.__name__}:{token}:text_encoder:{variant}"
+    key = f"{cls.__name__}:{token}:text_encoder:pinned"
     _associate_key(token, key)
 
     block_ref = weakref.ref(self)
@@ -495,21 +521,7 @@ def _patched_text_encoder_ctx(
         built = block._text_encoder_builder.build(device=torch.device("cpu"), dtype=dtype)
         # Match the upstream call which sets eval mode after build.
         built.train(False)
-        if streaming_prefetch_count is None:
-            return PinnedWeights(built, target_device)
-        layers_attr = "model.model.language_model.layers"
-        layer_list = _resolve_block_list(built, layers_attr, cls.__name__)
-        num_layers = len(layer_list)
-        off = BlockOffloader(
-            built,
-            target_device=target_device,
-            blocks_to_swap=num_layers - 1,
-            layers_attr=layers_attr,
-            prefetch_count=streaming_prefetch_count,
-            auto_setup=False,
-        )
-        off.prepare()
-        return off
+        return PinnedWeights(built, target_device)
 
     return cache.use(
         ModelSpec(

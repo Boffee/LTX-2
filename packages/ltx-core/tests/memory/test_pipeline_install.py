@@ -100,6 +100,52 @@ def _wire_stub_to_cache(cache: ModelCache, *, transformer_size: int = 0) -> None
     )
 
 
+class _StubBuilder:
+    def __init__(self):
+        self.build_count = 0
+
+    def build(self, *, device, dtype):
+        self.build_count += 1
+        m = nn.Linear(4, 4, bias=False)
+        for p in m.parameters():
+            p.requires_grad = False
+        return m
+
+
+class StubPromptEncoder:
+    """Stand-in for ltx_pipelines.utils.blocks.PromptEncoder with the
+    fields the patcher reads."""
+
+    def __init__(self):
+        self._device = torch.device("cpu")
+        self._dtype = torch.float32
+        self._text_encoder_builder = _StubBuilder()
+
+    def _text_encoder_ctx(self, streaming_prefetch_count):
+        # Original: build per call.
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _cm():
+            model = self._text_encoder_builder.build(
+                device=torch.device("cpu"), dtype=self._dtype
+            )
+            try:
+                yield model
+            finally:
+                pass
+
+        return _cm()
+
+
+def _wire_text_encoder_stub(cache: ModelCache, *, size: int = 0) -> None:
+    pi._INSTALLED_CACHE = cache
+    pi._TEXT_ENCODER_SIZE_ESTIMATE = size
+    pi._install_method_patch(
+        StubPromptEncoder, "_text_encoder_ctx", pi._patched_text_encoder_ctx,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Cache hit / miss
 # ---------------------------------------------------------------------------
@@ -365,6 +411,58 @@ class TestSubclassSafety:
         with sub._transformer_ctx(streaming_prefetch_count=None):
             pass
         assert sub._build_count == 2  # built again via fallback
+
+
+# ---------------------------------------------------------------------------
+# Text encoder always uses PinnedWeights (ignores streaming kwarg)
+# ---------------------------------------------------------------------------
+
+
+class TestTextEncoderAlwaysPinned:
+    def test_text_encoder_ignores_streaming_kwarg(self, cache: ModelCache) -> None:
+        # The pipeline's single streaming_prefetch_count kwarg gets
+        # forwarded to both the diffusion stage and the text encoder.
+        # The diffusion stage should stream (model too big for GPU),
+        # but the text encoder should always bulk-pin (fits, faster).
+        # The patcher hardcodes text encoder = PinnedWeights, ignoring
+        # the kwarg.
+        encoder = StubPromptEncoder()
+        _wire_text_encoder_stub(cache)
+
+        # Call with streaming kwarg set — would historically force
+        # BlockOffloader on the text encoder.
+        with encoder._text_encoder_ctx(streaming_prefetch_count=2):
+            pass
+        with encoder._text_encoder_ctx(streaming_prefetch_count=2):
+            pass
+
+        # First call built; second hit the cache. Same `pinned` cache key
+        # for both — streaming kwarg ignored.
+        assert encoder._text_encoder_builder.build_count == 1
+        snap = cache.snapshot()
+        assert snap.stats.builds == 1
+        assert snap.stats.hits == 1
+        # Single key used regardless of streaming kwarg.
+        assert len(snap.cached_keys_lru_to_mru) == 1
+        assert snap.cached_keys_lru_to_mru[0].endswith(":pinned")
+
+    def test_text_encoder_streaming_and_pinned_kwarg_share_entry(
+        self, cache: ModelCache
+    ) -> None:
+        # Same as above but oscillating None / int. Both reuse the same
+        # cached pinned strategy.
+        encoder = StubPromptEncoder()
+        _wire_text_encoder_stub(cache)
+
+        with encoder._text_encoder_ctx(streaming_prefetch_count=None):
+            pass
+        with encoder._text_encoder_ctx(streaming_prefetch_count=4):
+            pass
+
+        assert encoder._text_encoder_builder.build_count == 1
+        snap = cache.snapshot()
+        assert snap.stats.builds == 1
+        assert snap.stats.hits == 1
 
 
 # ---------------------------------------------------------------------------
