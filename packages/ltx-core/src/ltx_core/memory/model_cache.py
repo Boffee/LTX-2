@@ -11,32 +11,29 @@ Design highlights
 - **Strategy-agnostic.** The cache only talks to the
   :class:`ModelStrategy` protocol — three lifecycle methods plus
   ``cache_bytes`` accounting. Pluggable: today :class:`PinnedWeights`
-  and :class:`BlockOffloader`; future strategies (disk-mmap, NVMe-paged,
+  and :func:`make_block_offloader`; future strategies (disk-mmap, NVMe-paged,
   multi-GPU shard) just satisfy the protocol.
 - **Active-set with refcount.** Multiple keys can be active
   simultaneously (e.g. text encoder and embedding processor in the
   same call), and the same key can be acquired re-entrantly (refcount
   bump, the underlying strategy is not re-activated).
 - **Transactional admission, with one caveat.** Activation failures
-  drop the poisoned entry, run ``close()``, and propagate
-  :class:`ActivationError`. Close failure during eviction propagates
-  :class:`ModelEvictionError` rather than silently corrupting state.
-  **Factory failure** preserves the registration but leaves any
-  pre-eviction *committed* — the cache evicts inactive LRU entries to
-  give the factory a predictable host-memory budget for pinning, and
-  those evictions are not rolled back if the factory raises (rolling
-  back would mean re-pinning the just-released weights, which can OOM
-  the host allocator). The cache stays
-  internally consistent; the cost is some warm cached entries
-  disappearing.
+  drop the poisoned entry and propagate :class:`ActivationError`.
+  Eviction is just a reference drop (no failure path) — pinned memory
+  is freed when GC runs on the dropped strategy. **Factory failure**
+  preserves the registration but leaves any pre-eviction *committed*
+  — the cache evicts inactive LRU entries to give the factory a
+  predictable host-memory budget for pinning, and those evictions
+  are not rolled back if the factory raises (rolling back would
+  mean re-pinning the just-released weights, which can OOM the host
+  allocator). The cache stays internally consistent; the cost is
+  some warm cached entries disappearing.
 - **No GPU budget.** The cache only enforces ``max_cache_bytes``
   (typically pinned host memory). Concurrent active models share the
   GPU at the caller's risk.
 - **Single-thread.** No locking. Sequential callers only.
 
-Inspired by ComfyUI's ``model_management.LoadedModel`` /
-``current_loaded_models`` and accelerate's hook lifecycle, but
-instance-owned (not global) so it's library-friendly and embeddable.
+Instance-owned (not global) so it's library-friendly and embeddable.
 """
 
 from __future__ import annotations
@@ -80,6 +77,18 @@ class ModelSpec:
     ``label`` is an optional human-readable name surfaced in logs and
     snapshots; defaults to ``None`` if omitted (in which case displays
     fall back to ``key``).
+
+    .. note::
+       The ``factory`` should build a *fresh* model that the cache
+       solely owns. Eviction releases pinned host memory only when
+       the strategy (and the model it wraps) becomes unreachable —
+       Python's refcount-based GC handles this when the cache is the
+       sole owner. If the factory captures an externally-held model
+       in its closure (e.g., ``factory=lambda: PinnedWeights(my_model,
+       device)`` where ``my_model`` is alive elsewhere), eviction
+       drops the strategy but the model — with its pinned slots —
+       stays alive. ``used_cache_bytes`` will drop to reflect the
+       eviction, but the actual host memory won't be freed.
     """
 
     key: str
@@ -111,7 +120,6 @@ class ModelCacheStats:
     bytes_evicted: int = 0
     factory_errors: int = 0
     activation_errors: int = 0
-    close_errors: int = 0
     peak_cache_bytes: int = 0
 
 
@@ -184,21 +192,15 @@ class ModelInUseError(ModelCacheError):
     are active."""
 
 
-class ModelEvictionError(ModelCacheError):
-    """An entry's ``close()`` raised during eviction. Cache state is
-    consistent (the entry is removed) but the underlying strategy may
-    have leaked resources."""
-
-
 class ActivationError(ModelCacheError):
     """A strategy's ``activate()`` raised. The cache discards the entry
-    (closes the handle, removes it from cache state) regardless of
-    whether the entry was freshly built or previously cached — strategies
-    with multi-step ``activate()`` (e.g. :class:`BlockOffloader`) can
-    fail mid-way after partially installing hooks/pool/composed
-    PinnedWeights, and caching such an entry as "ready to retry" lies
-    about its state. The next acquire rebuilds via the registered
-    factory."""
+    (drops the handle reference, removes it from cache state) regardless
+    of whether the entry was freshly built or previously cached —
+    strategies with multi-step ``activate()`` (e.g.
+    :func:`make_block_offloader`) can fail mid-way after partially
+    installing hooks/pool/composed PinnedWeights, and caching such an
+    entry as "ready to retry" lies about its state. The next acquire
+    rebuilds via the registered factory."""
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +232,7 @@ class ModelCache:
         pinned host memory). Must be ≥ 0.
     empty_host_cache:
         Optional callback invoked after every successful eviction (and
-        after closing a rejected newly-built handle) to flush PyTorch's
+        after dropping a rejected newly-built handle) to flush PyTorch's
         ``CachingHostAllocator`` so freed pinned pages return to the OS.
         If ``None`` and CUDA is available, defaults to
         ``torch._C._host_emptyCache`` when present. Pass a no-op
@@ -299,7 +301,7 @@ class ModelCache:
 
     def unregister(self, key: str, *, evict: bool = True) -> None:
         """Drop a registration. If a built handle exists and
-        ``evict=True`` (default), close it; otherwise raise
+        ``evict=True`` (default), evict it; otherwise raise
         :class:`ModelInUseError` if it's cached or active."""
         entry = self._entries.get(key)
         if entry is None:
@@ -311,7 +313,7 @@ class ModelCache:
         if entry.handle is not None:
             if not evict:
                 raise ModelInUseError(
-                    f"{key!r} has a built handle; pass evict=True to close it"
+                    f"{key!r} has a built handle; pass evict=True to release it"
                 )
             self._evict_inactive(key)
         del self._entries[key]
@@ -429,24 +431,23 @@ class ModelCache:
             self._stats.activation_errors += 1
             # Treat all activation failures as poisoned regardless of
             # whether the entry was freshly built or previously cached.
-            # Strategies like BlockOffloader can fail mid-way through
-            # activate after partially registering hooks / allocating GPU
-            # pool / activating composed PinnedWeights, and their own
-            # rollback can fail (BlockOffloader.activate() preserves
-            # _active=True in that case so close() retries). Caching such
-            # an entry as "ready to retry" lies about its state and the
-            # next acquire would crash on the strategy's not-re-entrant
-            # guard or operate on partially-installed resources.
-            self._discard_entry(entry, cause=exc)
+            # Block-streaming strategies can fail mid-way through
+            # activate after partially registering hooks / allocating
+            # GPU pool / activating composed PinnedWeights. Caching
+            # such an entry as "ready to retry" lies about its state
+            # and the next acquire would operate on partially-installed
+            # resources.
+            self._discard_entry(entry)
             raise ActivationError(f"activate() failed for {key!r}") from exc
 
-        # Reconcile cache_bytes after a successful activate. Strategies
-        # like BlockOffloader with auto_setup=False that the factory
-        # forgot to prepare() report cache_bytes=0 at admission, then
-        # activate() auto-prepares and pins memory. Without this update
-        # _used_bytes would lag reality and future admissions would
-        # over-commit. If the actual now exceeds max_cache_bytes we
-        # can't unwind mid-context (the strategy is active and being
+        # Reconcile cache_bytes after a successful activate. Most
+        # strategies pin in __init__ so cache_bytes is final at
+        # admission, but a strategy that defers pinning (e.g., a custom
+        # one) might report 0 at admission and pin during activate.
+        # Without this update _used_bytes would lag reality and future
+        # admissions would over-commit. If the actual now exceeds
+        # max_cache_bytes we can't unwind mid-context (the strategy is
+        # active and being
         # yielded), so we log and continue — the user is over budget
         # but at least the accounting reflects it.
         post_activate_bytes = entry.handle.cache_bytes
@@ -455,18 +456,10 @@ class ModelCache:
             # strategy returning negative cache_bytes after activate
             # would corrupt _used_bytes accounting just as it would
             # at admission. Treat the activation as failed and discard.
-            try:
+            with contextlib.suppress(BaseException):
                 entry.handle.deactivate()
-            except BaseException:
-                pass
             self._stats.activation_errors += 1
-            self._discard_entry(
-                entry,
-                cause=ValueError(
-                    f"strategy.cache_bytes for {key!r} returned "
-                    f"{post_activate_bytes} (must be >= 0) after activate"
-                ),
-            )
+            self._discard_entry(entry)
             raise ModelCacheError(
                 f"strategy.cache_bytes for {key!r} returned "
                 f"{post_activate_bytes} (must be >= 0) after activate"
@@ -481,9 +474,11 @@ class ModelCache:
             if self._used_bytes > self._max_cache_bytes:
                 logger.warning(
                     "ModelCache over budget after activate(): %r grew from "
-                    "%d to %d bytes; total %d/%d. Factory likely returned "
-                    "an unprepared strategy — call prepare() in the factory "
-                    "so the cache reads correct cache_bytes at admission.",
+                    "%d to %d bytes; total %d/%d. The strategy reported a "
+                    "smaller cache_bytes at construction than after "
+                    "activate() — usually means a custom strategy that "
+                    "defers pinning. Pin in __init__ so cache_bytes is "
+                    "final at admission.",
                     key, entry.cache_bytes - delta, post_activate_bytes,
                     self._used_bytes, self._max_cache_bytes,
                 )
@@ -499,11 +494,11 @@ class ModelCache:
                 # the handle in a clean inactive state and not raise
                 # under normal use. If it does raise, the strategy's
                 # internal state is unknown — don't risk reusing it.
-                # Close and discard so a subsequent acquire rebuilds.
+                # Discard so a subsequent acquire rebuilds.
                 try:
                     entry.handle.deactivate()
                 except BaseException:
-                    self._discard_poisoned(entry)
+                    self._discard_entry(entry, was_active=True)
                     raise
                 entry.active_module = None
                 # Active → inactive: re-enter LRU at MRU position.
@@ -524,8 +519,12 @@ class ModelCache:
         actual = handle.cache_bytes
         if actual < 0:
             # Misbehaving strategy. Don't admit it (would corrupt
-            # _used_bytes accounting) — close and raise.
-            self._close_uncached(handle)
+            # _used_bytes accounting). Drop the local ref BEFORE the
+            # host-cache flush so refcount-GC frees the strategy's
+            # pinned tensors in time for empty_host_cache to actually
+            # reclaim them.
+            del handle
+            self._after_release()
             raise ModelCacheError(
                 f"strategy.cache_bytes for {key!r} returned {actual} (must be >= 0)"
             )
@@ -534,9 +533,12 @@ class ModelCache:
             try:
                 self._evict_until_room(key, actual)
             except BaseException:
-                # Can't fit the actual size — close the new handle and
-                # re-raise. Don't mark as built.
-                self._close_uncached(handle)
+                # Can't fit the actual size — drop the new handle and
+                # re-raise. Don't mark as built. del-before-flush so
+                # refcount-GC frees the strategy before the host-cache
+                # flush runs.
+                del handle
+                self._after_release()
                 raise
         entry.handle = handle
         entry.cache_bytes = actual
@@ -579,25 +581,19 @@ class ModelCache:
         entry = self._entries[key]
         assert entry.handle is not None
         assert entry.active_count == 0
-        handle = entry.handle
         bytes_freed = entry.cache_bytes
-        # Detach from cache state first so a close() failure doesn't
-        # leave us in an inconsistent state.
+        # Detach from cache state — dropping `entry.handle` releases
+        # the cache's only reference to the strategy. If the entry's
+        # factory built a fresh model (the typical pattern), the
+        # strategy was the sole owner of the model and Python's
+        # refcount-based GC frees the pinned tensors immediately.
         entry.handle = None
         entry.cache_bytes = 0
         self._lru.pop(key, None)
         self._used_bytes -= bytes_freed
-        try:
-            handle.close()
-        except BaseException as exc:
-            self._stats.close_errors += 1
-            raise ModelEvictionError(
-                f"close() raised while evicting {key!r}"
-            ) from exc
-        finally:
-            self._stats.evictions += 1
-            self._stats.bytes_evicted += bytes_freed
-            self._after_close()
+        self._stats.evictions += 1
+        self._stats.bytes_evicted += bytes_freed
+        self._after_release()
 
     def _evict_for_replace(self, key: str) -> None:
         """``register(replace=True)`` path. Refuses to clobber an active
@@ -610,78 +606,26 @@ class ModelCache:
         if entry.handle is not None:
             self._evict_inactive(key)
 
-    def _discard_poisoned(self, entry: _Entry) -> None:
-        """Strategy raised in deactivate() — its internal state is now
-        unknown. Drop the entry and best-effort close. Active state is
-        cleared so the entry doesn't appear active in snapshots."""
+    def _discard_entry(self, entry: _Entry, *, was_active: bool = False) -> None:
+        """Detach an entry from cache state — for activation failures,
+        deactivate poisoning, and unregistration. Dropping the
+        ``entry.handle`` reference triggers GC; if the cache was the
+        sole owner of the model, pinned tensors are freed immediately.
+        ``was_active=True`` also clears the active-module bookkeeping
+        (only relevant on the deactivate-poisoned path; active state
+        is otherwise managed by the use() context)."""
         key = entry.spec.key
-        handle = entry.handle
         bytes_to_free = entry.cache_bytes
         entry.handle = None
         entry.cache_bytes = 0
-        entry.active_module = None
-        entry.active_count = 0
+        if was_active:
+            entry.active_module = None
+            entry.active_count = 0
         self._lru.pop(key, None)
         self._used_bytes -= bytes_to_free
-        if handle is not None:
-            try:
-                handle.close()
-            except BaseException as close_exc:
-                self._stats.close_errors += 1
-                logger.error(
-                    "close() raised while discarding poisoned %r whose deactivate() "
-                    "had already failed; original deactivate error will still propagate. "
-                    "close error=%r",
-                    key,
-                    close_exc,
-                    exc_info=True,
-                )
-        self._after_close()
+        self._after_release()
 
-    def _close_uncached(self, handle: ModelStrategy) -> None:
-        """Close a handle that never made it into the cache (oversized
-        actual, factory return value rejected, etc.). Best-effort: log
-        close failures rather than raising over the original cause."""
-        try:
-            handle.close()
-        except BaseException as exc:
-            self._stats.close_errors += 1
-            logger.warning(
-                "close() raised on a never-cached handle; ignoring", exc_info=exc
-            )
-        finally:
-            self._after_close()
-
-    def _discard_entry(self, entry: _Entry, *, cause: BaseException) -> None:
-        """Activation failed (freshly-built or previously-cached). Roll
-        back the cache state, drop the LRU entry, and best-effort close
-        the handle. Any close failure is logged (don't mask the original
-        activation cause)."""
-        key = entry.spec.key
-        handle = entry.handle
-        bytes_to_free = entry.cache_bytes
-        entry.handle = None
-        entry.cache_bytes = 0
-        self._lru.pop(key, None)
-        self._used_bytes -= bytes_to_free
-        if handle is not None:
-            try:
-                handle.close()
-            except BaseException as close_exc:
-                self._stats.close_errors += 1
-                logger.error(
-                    "close() raised while discarding %r whose activate() "
-                    "had already failed; original activation error will still propagate. "
-                    "close error=%r",
-                    key,
-                    close_exc,
-                    exc_info=True,
-                )
-        self._after_close()
-        # Use cause to silence ruff's unused-arg lint if any analyzer cares.
-        _ = cause
-
-    def _after_close(self) -> None:
+    def _after_release(self) -> None:
         if self._empty_host_cache is None:
             return
         try:

@@ -16,7 +16,6 @@ from ltx_core.memory import (
     ActivationError,
     DuplicateModelKeyError,
     ModelCache,
-    ModelEvictionError,
     ModelInUseError,
     ModelNotRegisteredError,
     ModelSpec,
@@ -33,8 +32,8 @@ from ltx_core.memory.strategy import ModelStrategy
 class FakeStrategy:
     """In-memory fake satisfying the :class:`ModelStrategy` protocol.
 
-    Records every lifecycle call. Optionally raises on activate / close
-    via injected callables for failure-mode tests.
+    Records every lifecycle call. Optionally raises on activate via
+    an injected exception for failure-mode tests.
     """
 
     instances: list["FakeStrategy"] = []  # populated by FakeStrategy() constructor
@@ -44,12 +43,9 @@ class FakeStrategy:
         cache_bytes: int,
         *,
         activate_raises: BaseException | None = None,
-        close_raises: BaseException | None = None,
     ) -> None:
         self._cache_bytes = cache_bytes
         self._activate_raises = activate_raises
-        self._close_raises = close_raises
-        self._closed = False
         self._active = False
         self.events: list[str] = []
         self.module = nn.Identity()
@@ -58,10 +54,6 @@ class FakeStrategy:
     @property
     def cache_bytes(self) -> int:
         return self._cache_bytes
-
-    @property
-    def closed(self) -> bool:
-        return self._closed
 
     def activate(self) -> nn.Module:
         self.events.append("activate")
@@ -76,12 +68,6 @@ class FakeStrategy:
         self.events.append("deactivate")
         self._active = False
 
-    def close(self) -> None:
-        self.events.append("close")
-        if self._close_raises is not None:
-            raise self._close_raises
-        self._closed = True
-
     def __enter__(self) -> nn.Module:
         return self.activate()
 
@@ -93,15 +79,12 @@ def _make_factory(
     bytes_: int,
     *,
     activate_raises: BaseException | None = None,
-    close_raises: BaseException | None = None,
     factory_raises: BaseException | None = None,
 ) -> Callable[[], FakeStrategy]:
     def factory() -> FakeStrategy:
         if factory_raises is not None:
             raise factory_raises
-        return FakeStrategy(
-            bytes_, activate_raises=activate_raises, close_raises=close_raises
-        )
+        return FakeStrategy(bytes_, activate_raises=activate_raises)
 
     return factory
 
@@ -198,8 +181,7 @@ class TestRegistration:
         cache.register(_spec("a", 200), replace=True)
         # The freshly-replaced entry has not been built yet.
         assert cache.snapshot().used_cache_bytes == 0
-        # The previous handle was closed during replace.
-        assert "close" in first.events
+        # The previous handle was released during replace.
 
     def test_replace_active_raises(self) -> None:
         cache = ModelCache(1000)
@@ -215,7 +197,6 @@ class TestRegistration:
             pass
         cache.unregister("a")
         assert "a" not in cache.snapshot().registered_keys
-        assert FakeStrategy.instances[0].events[-1] == "close"
 
     def test_unregister_active_raises(self) -> None:
         cache = ModelCache(1000)
@@ -429,13 +410,12 @@ class TestFailureModes:
         snap = cache.snapshot()
         assert snap.used_cache_bytes == 0
         assert snap.stats.activation_errors == 1
-        # Strategy was constructed and then closed.
-        assert FakeStrategy.instances[0].events == ["activate", "close"]
+        # Strategy was constructed and then released.
 
     def test_activation_failure_on_cached_entry_discards_it(self) -> None:
         # Activation failure on a previously-cached entry is treated
         # as poisoned (same as freshly-built). Strategies like
-        # BlockOffloader can fail mid-way through activate after
+        # block-streaming can fail mid-way through activate after
         # partially installing hooks/pool; caching them as
         # "ready to retry" lies about their state.
         cache = ModelCache(200)
@@ -447,32 +427,13 @@ class TestFailureModes:
         with pytest.raises(ActivationError):
             with cache.use("a"):
                 pass
-        # Entry was discarded — closed and removed from cache state.
+        # Entry was discarded — released and removed from cache state.
         snap = cache.snapshot()
         assert "a" not in snap.cached_keys_lru_to_mru
         assert snap.used_cache_bytes == 0
-        # The poisoned strategy was closed.
-        assert "close" in s.events
+        # The poisoned strategy reference was dropped.
         # Registration persisted for retry — but next acquire rebuilds.
         assert "a" in snap.registered_keys
-
-    def test_close_failure_during_eviction_propagates(self) -> None:
-        cache = ModelCache(200)
-        spec = ModelSpec(
-            key="a",
-            estimated_cache_bytes=100,
-            factory=_make_factory(100, close_raises=RuntimeError("close boom")),
-        )
-        cache.register(spec)
-        with cache.use("a"):
-            pass
-        with pytest.raises(ModelEvictionError):
-            cache.evict("a")
-        # Cache state is consistent: entry removed, bytes recovered.
-        snap = cache.snapshot()
-        assert snap.used_cache_bytes == 0
-        assert snap.stats.close_errors == 1
-
 
     def test_factory_failure_after_pre_eviction_keeps_evictions(self) -> None:
         # Documented behavior: the cache pre-evicts to make room for
@@ -505,25 +466,6 @@ class TestFailureModes:
         assert "bad" in snap.registered_keys
         assert snap.stats.factory_errors == 1
 
-    def test_close_failure_in_close_uncached_increments_counter(self) -> None:
-        # Activation never reached — actual cache_bytes overflows the
-        # budget AND the resulting close() during _close_uncached also
-        # raises. Should swallow the close error (logged) but increment
-        # the counter and surface the original ModelTooLargeError.
-        cache = ModelCache(50)
-
-        def factory():
-            return FakeStrategy(100, close_raises=RuntimeError("close boom"))
-
-        spec = ModelSpec(key="bad", estimated_cache_bytes=50, factory=factory)
-        with pytest.raises(ModelTooLargeError):
-            with cache.use(spec):
-                pass
-        snap = cache.snapshot()
-        assert snap.stats.close_errors == 1
-        assert snap.used_cache_bytes == 0
-
-
 # ---------------------------------------------------------------------------
 # Deactivate failure
 # ---------------------------------------------------------------------------
@@ -532,7 +474,7 @@ class TestFailureModes:
 class TestDeactivateFailure:
     def test_deactivate_failure_discards_entry(self) -> None:
         # A strategy whose deactivate() raises is treated as poisoned:
-        # the entry is removed from the cache (close() is called) and
+        # the entry is removed from the cache and
         # the original deactivate exception propagates.
         class PoisonStrategy(FakeStrategy):
             def deactivate(self) -> None:
@@ -555,8 +497,7 @@ class TestDeactivateFailure:
         assert "a" not in snap.cached_keys_lru_to_mru
         assert snap.used_cache_bytes == 0
         assert "a" in snap.registered_keys
-        # The poisoned strategy was closed in best-effort cleanup.
-        assert "close" in FakeStrategy.instances[-1].events
+        # The poisoned strategy reference was dropped.
 
 
 # ---------------------------------------------------------------------------
@@ -576,8 +517,7 @@ class TestCacheBytesValidation:
                 pass
         snap = cache.snapshot()
         assert snap.used_cache_bytes == 0
-        # Strategy was constructed and then closed.
-        assert FakeStrategy.instances[0].events[-1] == "close"
+        # Strategy was constructed and then released.
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +587,7 @@ class TestActualVsEstimate:
 
     def test_cache_bytes_reconciled_after_activate(self) -> None:
         # A strategy that reports 0 bytes pre-activate but pins memory
-        # during activate (simulating BlockOffloader with auto_setup=False
+        # during activate (simulating block-streaming with auto_setup=False
         # whose factory forgot to call prepare()) must have its
         # cache_bytes reconciled by the cache after activate so
         # _used_bytes reflects reality.
@@ -674,7 +614,7 @@ class TestActualVsEstimate:
             assert info.cache_bytes == 100
             assert cache.used_cache_bytes == 100
 
-    def test_actual_overflow_rejects_and_closes(self) -> None:
+    def test_actual_overflow_rejects_and_releases(self) -> None:
         cache = ModelCache(100)
 
         def oversized():
@@ -684,8 +624,7 @@ class TestActualVsEstimate:
         with pytest.raises(ModelTooLargeError):
             with cache.use(spec):
                 pass
-        # The constructed handle was closed.
-        assert FakeStrategy.instances[0].events[-1] == "close"
+        # The constructed handle reference was dropped.
         assert cache.snapshot().used_cache_bytes == 0
 
 

@@ -30,24 +30,21 @@ class TestModelStrategyConformance:
         try:
             assert isinstance(pw, ModelStrategy)
         finally:
-            pw.close()
+            pw.deactivate()
 
     def test_has_lifecycle_methods(self) -> None:
         pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
         try:
             assert callable(pw.activate)
             assert callable(pw.deactivate)
-            assert callable(pw.close)
             assert isinstance(pw.cache_bytes, int)
-            assert isinstance(pw.closed, bool)
             assert pw.cache_bytes > 0
-            assert pw.closed is False
         finally:
-            pw.close()
+            pw.deactivate()
 
 
 # ---------------------------------------------------------------------------
-# Lifecycle: activate / deactivate / close
+# Lifecycle: activate / deactivate
 # ---------------------------------------------------------------------------
 
 
@@ -66,7 +63,7 @@ class TestLifecycle:
                 assert not p.is_cuda
                 assert p.is_pinned()
         finally:
-            pw.close()
+            pw.deactivate()
 
     def test_context_manager_protocol(self) -> None:
         m = _make_simple_model()
@@ -77,17 +74,7 @@ class TestLifecycle:
             for p in m.parameters():
                 assert p.is_pinned()
         finally:
-            pw.close()
-
-    def test_activate_not_reentrant(self) -> None:
-        pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
-        try:
-            pw.activate()
-            with pytest.raises(RuntimeError, match="not re-entrant"):
-                pw.activate()
             pw.deactivate()
-        finally:
-            pw.close()
 
     def test_deactivate_when_not_active_is_noop(self) -> None:
         pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
@@ -95,7 +82,7 @@ class TestLifecycle:
             pw.deactivate()
             pw.deactivate()
         finally:
-            pw.close()
+            pw.deactivate()
 
     def test_repeated_activate_deactivate_cycle(self) -> None:
         pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
@@ -104,121 +91,32 @@ class TestLifecycle:
                 with pw:
                     pass
         finally:
-            pw.close()
-
-
-# ---------------------------------------------------------------------------
-# close() destructiveness — the bug fix
-# ---------------------------------------------------------------------------
-
-
-class TestClose:
-    def test_close_moves_model_to_meta(self) -> None:
-        m = _make_simple_model()
-        pw = PinnedWeights(m, torch.device("cpu"))
-        for p in m.parameters():
-            assert p.is_pinned()
-        pw.close()
-        # After close: model parameters are on meta — proves the
-        # destructive teardown actually broke the model→pinned-storage
-        # references that were the original bug.
-        for p in m.parameters():
-            assert p.device.type == "meta"
-
-    def test_close_is_idempotent(self) -> None:
-        pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
-        pw.close()
-        assert pw.closed
-        pw.close()
-        assert pw.closed
-
-    def test_close_rejects_when_active(self) -> None:
-        pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
-        try:
-            pw.activate()
-            with pytest.raises(RuntimeError, match="while activate"):
-                pw.close()
             pw.deactivate()
-        finally:
-            pw.close()
-
-    def test_activate_after_close_raises(self) -> None:
-        pw = PinnedWeights(_make_simple_model(), torch.device("cpu"))
-        pw.close()
-        with pytest.raises(RuntimeError, match="closed"):
-            pw.activate()
-
-    def test_close_failure_does_not_strand_strategy(self, monkeypatch) -> None:
-        # If a per-slot meta replacement raises, we must NOT mark the
-        # strategy closed and we must NOT drop the only handle to
-        # pinned storage — the caller should be able to retry.
-        from ltx_core.memory.pinned_buffer import PinnedParamBuffer
-
-        m = _make_simple_model()
-        pw = PinnedWeights(m, torch.device("cpu"))
-
-        # Patch make_meta_param at the class level (PinnedParamBuffer
-        # uses __slots__, so per-instance setattr is blocked). First
-        # call raises; subsequent calls succeed.
-        original_make = PinnedParamBuffer.make_meta_param
-        call_count = {"n": 0}
-
-        def flaky_make_meta_param(self_):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                raise RuntimeError("simulated meta replacement failure")
-            return original_make(self_)
-
-        monkeypatch.setattr(PinnedParamBuffer, "make_meta_param", flaky_make_meta_param)
-
-        with pytest.raises(RuntimeError, match="simulated"):
-            pw.close()
-        # Strategy must still be usable — not marked closed, slots intact.
-        assert pw.closed is False
-        assert len(pw._slots) > 0
-        # Retry succeeds and properly closes.
-        pw.close()
-        assert pw.closed is True
 
 
 # ---------------------------------------------------------------------------
-# activate() rollback
+# Cleanup: drop the strategy + model refs to free pinned
 # ---------------------------------------------------------------------------
 
 
-class TestActivateRollback:
-    def test_rollback_restores_pinned_state(self, monkeypatch) -> None:
-        # Simulate _move_to_gpu failing partway. The rollback should
-        # restore slots to pinned-CPU references and clear _active so
-        # the strategy can be retried or closed cleanly.
+class TestCleanup:
+    def test_drop_strategy_and_model_frees_pinned(self) -> None:
+        # The "drop refs to free pinned" contract. Strategies don't have
+        # a destructive close(); pinned tensors live in module slots
+        # and are freed when the caller drops the model reference (and
+        # the strategy reference, which is the only other holder).
+        import gc
+        import weakref
+
         m = _make_simple_model()
         pw = PinnedWeights(m, torch.device("cpu"))
-        try:
-            original = pw._move_to_gpu
-
-            def failing_move():
-                # Simulate partial progress: do half the work, then fail.
-                if pw._slots:
-                    buf, locs = pw._slots[0]
-                    for parent, leaf in locs:
-                        parent._parameters[leaf] = buf.cpu_param  # placeholder swap
-                raise RuntimeError("simulated GPU OOM")
-
-            monkeypatch.setattr(pw, "_move_to_gpu", failing_move)
-
-            with pytest.raises(RuntimeError, match="simulated GPU OOM"):
-                pw.activate()
-            assert pw._active is False
-            # Slots are restored to pinned-CPU references.
-            for buf, locs in pw._slots:
-                for parent, leaf in locs:
-                    assert parent._parameters[leaf] is buf.cpu_param
-            # Strategy is reusable.
-            monkeypatch.setattr(pw, "_move_to_gpu", original)
-            with pw:
-                pass
-        finally:
-            pw.close()
+        first_parent, first_leaf = pw._slots[0][1][0]
+        slot_param_ref = weakref.ref(first_parent._parameters[first_leaf])
+        pw.deactivate()
+        assert slot_param_ref() is not None  # still alive via model slot
+        del m, pw, first_parent
+        gc.collect()
+        assert slot_param_ref() is None  # GC freed it
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +146,7 @@ class TestConstruction:
             assert pw.cache_bytes == 8 * 4 * 4  # float32
             assert m.table.is_pinned()
         finally:
-            pw.close()
+            pw.deactivate()
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +197,7 @@ class TestTiedWeightDedup:
             assert m.embed._parameters["weight"] is m.head._parameters["weight"]
             assert m.embed.weight is buf.cpu_param
         finally:
-            pw.close()
+            pw.deactivate()
 
     def test_distinct_params_sharing_storage_dedupe(self) -> None:
         m, _, _ = self._make_distinct_param_tied_model()
@@ -311,7 +209,7 @@ class TestTiedWeightDedup:
             # Both module slots now reference the same Parameter object.
             assert m._parameters["a"] is m._parameters["b"]
         finally:
-            pw.close()
+            pw.deactivate()
 
     def test_cache_bytes_counts_tied_once(self) -> None:
         m, _, _ = self._make_tied_model()
@@ -321,7 +219,7 @@ class TestTiedWeightDedup:
             # If the dedup were broken this would double.
             assert pw.cache_bytes == 32 * 16 * 4
         finally:
-            pw.close()
+            pw.deactivate()
 
     @CUDA
     def test_tied_params_share_gpu_storage_on_activate(self) -> None:
@@ -335,7 +233,7 @@ class TestTiedWeightDedup:
                 # Stronger: same Parameter object.
                 assert m.embed._parameters["weight"] is m.head._parameters["weight"]
         finally:
-            pw.close()
+            pw.deactivate()
 
     @CUDA
     def test_distinct_tied_params_share_gpu_storage_on_activate(self) -> None:
@@ -350,7 +248,7 @@ class TestTiedWeightDedup:
                 assert m._parameters["a"].data.data_ptr() == m._parameters["b"].data.data_ptr()
                 assert m._parameters["a"] is m._parameters["b"]
         finally:
-            pw.close()
+            pw.deactivate()
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +277,7 @@ class TestSharedSubmoduleAlias:
             # location even though there are two attribute paths.
             assert len(locs) == 1
         finally:
-            pw.close()
+            pw.deactivate()
 
     def test_aliased_buffer(self) -> None:
         # Two distinct submodules sharing the same buffer tensor. The
@@ -408,7 +306,7 @@ class TestSharedSubmoduleAlias:
             assert m.a.buf is pinned
             assert m.b.buf is pinned
         finally:
-            pw.close()
+            pw.deactivate()
 
 
 class TestMixedTrainableFrozenTied:
@@ -441,7 +339,7 @@ class TestZeroSizedParams:
             # 3 slots: a, b, c — empties did not collapse.
             assert len(pw._slots) == 3
         finally:
-            pw.close()
+            pw.deactivate()
 
 
 # ---------------------------------------------------------------------------
@@ -482,7 +380,7 @@ class TestQuanto:
             assert m.weight._data.is_pinned()
             assert m.weight._scale.is_pinned()
         finally:
-            pw.close()
+            pw.deactivate()
 
     @CUDA
     def test_quanto_activate_moves_inner_to_cuda(self) -> None:
@@ -496,22 +394,18 @@ class TestQuanto:
             assert m.weight._data.is_pinned()
             assert m.weight._scale.is_pinned()
         finally:
-            pw.close()
+            pw.deactivate()
 
-    def test_quanto_close_meta_replaces_quanto_param(self) -> None:
-        # Surgical close uses make_meta_param, which builds a meta
-        # WeightQBytesTensor via WeightQBytesTensor.create with empty
-        # meta inputs. Verify quanto accepts this and the resulting
-        # parameter has the right wrapper + meta-device storage.
-        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
-
+    def test_quanto_close_releases_internal_state(self) -> None:
+        # deactivate is idempotent; the model.s quanto
+        # parameter still references its pinned-CPU storage. Pinned
+        # memory is freed when the caller drops the model reference.
         m = self._make_quanto_model()
         pw = PinnedWeights(m, torch.device("cpu"))
-        pw.close()
-        # The slot now holds a meta-device quanto Parameter.
-        assert isinstance(m.weight.data, WeightQBytesTensor)
-        assert m.weight._data.device.type == "meta"
-        assert m.weight._scale.device.type == "meta"
+        pw.deactivate()
+        # Quanto wrapper still on CPU after deactivate.
+        assert m.weight._data.is_pinned()
+        assert m.weight._scale.is_pinned()
 
 
 # ---------------------------------------------------------------------------
@@ -525,7 +419,7 @@ class TestCacheBytes:
         try:
             assert pw.cache_bytes > 0
         finally:
-            pw.close()
+            pw.deactivate()
 
     def test_cache_bytes_includes_buffers_when_requested(self) -> None:
         m = nn.Sequential(nn.Linear(4, 4, bias=False), nn.LayerNorm(4))
@@ -533,13 +427,9 @@ class TestCacheBytes:
             p.requires_grad = False
         pw_with = PinnedWeights(m, torch.device("cpu"), include_buffers=True)
         with_bytes = pw_with.cache_bytes
-        pw_with.close()
 
         m2 = nn.Sequential(nn.Linear(4, 4, bias=False), nn.LayerNorm(4))
         for p in m2.parameters():
             p.requires_grad = False
         pw_without = PinnedWeights(m2, torch.device("cpu"), include_buffers=False)
-        try:
-            assert pw_without.cache_bytes <= with_bytes
-        finally:
-            pw_without.close()
+        assert pw_without.cache_bytes <= with_bytes

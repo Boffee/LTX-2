@@ -2,8 +2,7 @@
 
 A model-agnostic GPU/CPU memory manager for PyTorch. Two pluggable
 strategies for moving model weights between host and GPU, plus an LRU
-cache that swaps multiple independent models in and out of GPU memory
-the way ComfyUI does.
+cache that swaps multiple independent models in and out of GPU memory.
 
 Self-contained, library-friendly: no dependencies beyond `torch` (plus
 optional `optimum.quanto` for quantized models). Designed to be lifted
@@ -13,9 +12,10 @@ into its own package when a second consumer appears.
 
 | Module | Role |
 |---|---|
-| `strategy.py` | `ModelStrategy` — the plug-in contract every strategy implements |
+| `strategy.py` | `ModelStrategy` — the plug-in contract every strategy implements; `SlotOwnership` skip-filter type |
 | `pinned_weights.py` | `PinnedWeights` — whole-model bulk pinned-CPU↔GPU strategy |
-| `block_offloader.py` | `BlockOffloader` — block-level streaming for models bigger than GPU |
+| `block_streamer.py` | `BlockStreamer` — sharp per-block-list streaming primitive (component) |
+| `block_compose.py` | `BlockStreamingStrategy` (composite), `TrainableMover` (component), `make_block_offloader` (factory) |
 | `pinned_buffer.py` | `PinnedParamBuffer` — per-tensor pinning primitive (handles quanto) |
 | `model_cache.py` | `ModelCache` — LRU pool over strategies with active-set leases |
 | `pipeline_install.py` | Optional one-line monkey-patch installer (see [Integrations](#integrations)) |
@@ -29,8 +29,8 @@ across many calls. Re-loading from disk every call is too slow
 expensive. `torch.cuda.empty_cache()` plus `.to("meta")` gets you the
 basics but leaves significant performance on the table — pinned host
 memory does CPU↔GPU DMA at full PCIe bandwidth (~30 GB/s vs.
-~3 GB/s from disk), and a single LRU cache across multiple models
-matches ComfyUI's swap behavior.
+~3 GB/s from disk), and a single LRU cache lets multiple models
+share the same host-memory budget.
 
 This library gives you:
 
@@ -47,7 +47,7 @@ This library gives you:
 | Situation | Use |
 |---|---|
 | Model fits on GPU when active; want fast eviction between calls | **`PinnedWeights`** — bulk DMA, ~200 ms for 12 GB at PCIe Gen5 x16 |
-| Model too big for GPU even when active | **`BlockOffloader`** — streams transformer blocks via forward hooks |
+| Model too big for GPU even when active | **`make_block_offloader`** — streams transformer blocks via forward hooks |
 | Multiple models swap in/out across a script | Wrap each in a strategy, hand to **`ModelCache`** |
 
 ## Quick start: PinnedWeights
@@ -67,15 +67,18 @@ with strategy as gpu_model:
 with strategy as gpu_model:
     output = gpu_model(input_tensor_2)
 
-strategy.close()  # destructive — moves model to "meta", releases pinned
+del strategy, model  # drop refs to free pinned host memory
 ```
 
 `PinnedWeights` mutates the model in place: every frozen
 `nn.Parameter` slot gets repointed at a Parameter wrapping pinned CPU
 storage. After construction, only access the model through the
 strategy's context manager (or `activate()` / `deactivate()`).
+**Drop the strategy and model references to release pinned host
+memory** — there's no `close()`; resource cleanup is reference-drop
++ GC.
 
-## Quick start: BlockOffloader
+## Quick start: block streaming
 
 For models too big to fit on GPU even when active. Streams transformer
 blocks through a small GPU-resident window using forward-pre hooks
@@ -83,27 +86,48 @@ and a CUDA-stream-based async prefetcher.
 
 ```python
 import torch
-from ltx_core.memory import BlockOffloader
+from ltx_core.memory import make_block_offloader
 
-# auto_setup=True (default) runs prepare() + activate() in __init__.
-offloader = BlockOffloader(
+# Constructor pins everything; cache_bytes is final immediately.
+strategy = make_block_offloader(
     model,
     target_device=torch.device("cuda"),
-    blocks_to_swap=24,   # offload N blocks; rest stay GPU-resident
-    layers_attr="transformer_blocks",  # path to the nn.ModuleList of blocks
+    layers_attr="transformer_blocks",  # path to the nn.ModuleList
+    blocks_to_swap=24,                  # offload N blocks; rest GPU-resident
     prefetch_count=2,
 )
 
-# Forward through `model` normally; hooks stream blocks on demand.
-output = model(input_tensor)
+with strategy as gpu_model:
+    output = gpu_model(input_tensor)
 
-# Destructive close (also breaks the hook reference cycle):
-offloader.close()
+del strategy, model  # drop refs to free pinned host memory
 ```
 
-Trainable parameters (e.g. LoRA adapters) stay on GPU permanently
-while the offloader is active — backward through them is unaffected
-by the offload.
+Trainable parameters (e.g. LoRA adapters) move to GPU on activate
+and back to CPU on deactivate via the bundled `TrainableMover`
+component — backward through them is unaffected by the offload.
+
+### Heterogeneous block lists
+
+`layers_attr` accepts a list of dotted paths for models with
+multiple kinds of blocks (e.g. Flux's `transformer_blocks` +
+`single_transformer_blocks`). Each path becomes its own homogeneous
+streaming group with its own slot pool — no per-load `cudaMalloc`
+fallback:
+
+```python
+strategy = make_block_offloader(
+    model,
+    target_device=torch.device("cuda"),
+    layers_attr=["transformer_blocks", "single_transformer_blocks"],
+    blocks_to_swap=[8, 24],   # per-group; or pass a single int for both
+    prefetch_count=[2, 4],
+)
+```
+
+For bespoke compositions (custom components, mixed strategies),
+construct the `BlockStreamer`s, `PinnedWeights`, and `TrainableMover`
+yourself and hand them to `BlockStreamingStrategy` directly.
 
 ## Quick start: ModelCache
 
@@ -146,6 +170,14 @@ with cache.use(spec) as vae:  # registers if missing, then uses
     decoded = vae.decode(latent)
 ```
 
+> **Anti-pattern:** the factory should build a fresh model each call,
+> not capture an externally-held one. With `factory=lambda:
+> PinnedWeights(my_kept_model, device)` the cache is no longer the
+> sole owner of the model — eviction drops the strategy, but
+> `my_kept_model` keeps the pinned slots alive. `used_cache_bytes`
+> will lie about freed memory. Always have the factory build the
+> model itself.
+
 ## Architecture
 
 ```
@@ -155,64 +187,75 @@ with cache.use(spec) as vae:  # registers if missing, then uses
                        └────────┬─────────┘
                                 │ uses (via ModelStrategy protocol)
                                 ▼
-            ┌───────────────────┴───────────────────┐
-            │                                       │
-   ┌────────▼─────────┐                  ┌──────────▼─────────┐
-   │  PinnedWeights   │                  │   BlockOffloader   │
-   │  whole-model DMA │                  │  per-block stream  │
-   └────────┬─────────┘                  └──────────┬─────────┘
-            │                                       │
-            └─────────────┬─────────────────────────┘
-                          ▼
-                ┌──────────────────┐
-                │ PinnedParamBuffer│  per-tensor pinned-CPU storage
-                │  (quanto-aware)  │  shared primitive
-                └──────────────────┘
+            ┌───────────────────┴────────────────────┐
+            │                                        │
+   ┌────────▼─────────┐                ┌─────────────▼──────────────┐
+   │  PinnedWeights   │                │   BlockStreamingStrategy   │
+   │  whole-model DMA │                │   (composes components)    │
+   └────────┬─────────┘                └─────────────┬──────────────┘
+            │                                        │
+            │             ┌──────────────────────────┴──────────┐
+            │             │  components (ordered):              │
+            │             │  • PinnedWeights (non-block,        │
+            │             │    skip_slots = streamers' slots)   │
+            │             │  • TrainableMover                   │
+            │             │  • N × BlockStreamer                │
+            │             │   built by make_block_offloader()   │
+            │             └──────────────────────────┬──────────┘
+            │                                        │
+            └────────────────────┬───────────────────┘
+                                 ▼
+                       ┌──────────────────┐
+                       │ PinnedParamBuffer│  per-tensor pinned-CPU storage
+                       │  (quanto-aware)  │  shared primitive
+                       └──────────────────┘
 ```
 
 `ModelStrategy` is the protocol every strategy implements —
-`cache_bytes`, `activate()`, `deactivate()`, `close()`, plus the
+`cache_bytes`, `activate()`, `deactivate()`, plus the
 context-manager dunders. `ModelCache` only talks to this protocol;
 write a new strategy and it slots in:
 
 ```python
-from contextlib import AbstractContextManager
 from torch import nn
 
 class MyStrategy:
     @property
     def cache_bytes(self) -> int: ...
-    @property
-    def closed(self) -> bool: ...
     def activate(self) -> nn.Module: ...
     def deactivate(self) -> None: ...
-    def close(self) -> None: ...
     def __enter__(self) -> nn.Module: return self.activate()
     def __exit__(self, *exc) -> None: self.deactivate()
 ```
 
 ## Strategy lifecycle
 
-Both built-in strategies follow the same conceptual lifecycle, with
-`BlockOffloader` adding an explicit `prepare()` step because pinning
-and GPU pool allocation are distinct phases:
+Uniform across all strategies — pinning happens in `__init__` so
+`cache_bytes` is final at admission time:
 
 ```
-PinnedWeights:    constructed → activate ↔ deactivate → close
-BlockOffloader:   constructed → prepare → activate ↔ deactivate → close
+constructed → activate ↔ deactivate → drop refs
 ```
 
 `activate()` makes the model usable for compute. `deactivate()`
 releases transient GPU resources (the `cache_bytes` worth of pinned
-storage stays held). `close()` is the destructive endpoint — it moves
-the model to the `meta` device and releases pinned storage; the
-wrapped model is unusable afterward.
+storage stays held in module slots, ready for fast re-activation).
+**There is no `close()`.** To release pinned host memory, drop the
+strategy reference (and the model reference if you don't need it
+anymore). Python's refcount-based GC frees pinned tensors
+immediately. Strategies release what they own; ownership of the
+user's model is the user's concern.
+
+**Failure semantics.** If `activate()` raises midway, the strategy
+is poisoned — drop the strategy reference and rebuild. Don't retry
+`activate()` on a failed strategy. This is a low-level library; we
+don't guard against caller misuse.
 
 ## Compatibility
 
 - **`torch.compile` is not supported** for managed modules. Both
   strategies swap parameter slots (`module._parameters[leaf] = new_param`)
-  on every activate/deactivate, and `BlockOffloader` registers
+  on every activate/deactivate, and `BlockStreamer` registers
   forward-pre hooks that mutate slots on every block call. Both
   invalidate the tensor-identity assumptions `torch.compile` makes
   about its trace.
@@ -231,11 +274,11 @@ Both strategies handle the standard `tie_weights()` pattern (one
 `Parameter` referenced under multiple names) plus the rarer case of
 distinct quanto wrappers around shared inner `_data` storage.
 
-`BlockOffloader` rejects (at `prepare()`) tied weights that span
-streamed regions — block↔block, block↔non-block, or mixed
+`make_block_offloader` rejects (at construction) tied weights that
+span streamed regions — block↔block, block↔non-block, or mixed
 trainable/frozen across regions. Slot-local block streaming can't
-preserve cross-region tying. Use whole-model `PinnedWeights` for those
-models instead.
+preserve cross-region tying. Use whole-model `PinnedWeights` for
+those models instead.
 
 ## Quanto support
 
@@ -259,7 +302,6 @@ than silent corruption.
 | `ModelTooLargeError` | Cache miss can't fit even after evicting all inactive entries (active entries blocking) |
 | `ActivationError` | Strategy's `activate()` raised — the cache discards the entry; next acquire rebuilds |
 | `ModelInUseError` | `evict()` / `clear()` / `unregister()` called while entry is active |
-| `ModelEvictionError` | Strategy's `close()` raised during eviction — cache state is consistent (entry removed) but underlying resources may have leaked |
 | `DuplicateModelKeyError` | `register()` called for an existing key without `replace=True` |
 | `ModelNotRegisteredError` | `use(str)` called for an unknown key |
 
@@ -310,7 +352,7 @@ Strategy choice per component:
 
 - **Transformer** follows the pipeline's `streaming_prefetch_count`
   kwarg. `None` → PinnedWeights (whole-model bulk DMA); `int` →
-  BlockOffloader(prefetch=N). Cache key includes `stream{N}` vs
+  make_block_offloader(prefetch_count=N). Cache key includes `stream{N}` vs
   `pinned` so toggling produces distinct entries.
 - **Text encoder** always uses PinnedWeights. The pipeline's
   `streaming_prefetch_count` kwarg is ignored for the text encoder
@@ -332,9 +374,3 @@ uninstall_model_cache()
 `ModelInUseError`) if any installer-owned entry is currently active —
 exit your `cache.use(...)` contexts and retry.
 
-## Inspiration
-
-Shaped by ComfyUI's `model_management.py` (object-identity caching,
-weakref finalizers, multi-model swapping) and HuggingFace accelerate's
-hook lifecycle patterns, but instance-owned (not global) so it's
-library-friendly and embeddable.

@@ -47,7 +47,7 @@ def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
 
     Used by both :class:`~ltx_core.memory.PinnedWeights` (for handle-
     level dedup of tied frozen params) and
-    :class:`~ltx_core.memory.BlockOffloader` (for cross-region tied-
+    :func:`~ltx_core.memory.make_block_offloader` (for cross-region tied-
     weight detection across blocks and non-block modules).
 
     Note: pure storage identity is not sufficient — two views into the
@@ -179,20 +179,6 @@ class PinnedParamBuffer:
         if self.is_quanto:
             assert gpu_scale is not None
             gpu_scale.copy_(self.pinned_scale, non_blocking=non_blocking)
-
-    def make_meta_param(self) -> nn.Parameter:
-        """Build a ``nn.Parameter`` on the ``meta`` device with this
-        buffer's shape/dtype/quanto layout. Used by
-        ``PinnedWeights.close()`` to surgically replace managed slots
-        (matching ``model.to("meta")`` semantics) without touching
-        slots owned by other strategies in composed setups."""
-        meta_data = torch.empty_like(self.pinned_data, device="meta")
-        meta_scale = (
-            torch.empty_like(self.pinned_scale, device="meta")
-            if self.is_quanto
-            else None
-        )
-        return self.make_gpu_param(meta_data, meta_scale)
 
     def load_to_gpu(self, device: torch.device, non_blocking: bool = False) -> nn.Parameter:
         """Convenience: allocate GPU storage and copy in one shot.

@@ -44,7 +44,7 @@ class StubDiffusionStage:
         self._build_count += 1
         # Mimic the LTX shape: outer X0Model wrapping a velocity_model
         # that holds transformer_blocks. Lets streaming-mode tests
-        # exercise BlockOffloader's introspection.
+        # exercise make_block_offloader introspection.
         velocity = nn.Module()
         velocity.transformer_blocks = nn.ModuleList(
             [nn.Linear(4, 4, bias=False) for _ in range(2)]
@@ -176,7 +176,7 @@ class TestCacheHits:
             pass
 
         # PinnedWeights variant alone — verify the basic path works
-        # without trying to construct BlockOffloader (stub model has no
+        # without trying to construct block-streaming (stub model has no
         # transformer_blocks). Just confirm one entry was added.
         snap = cache.snapshot()
         assert snap.stats.builds == 1
@@ -206,11 +206,11 @@ class TestFallthrough:
 
     @CUDA
     def test_streaming_mode_uses_cache(self, cache: ModelCache) -> None:
-        # Streaming-mode caching: BlockOffloader now handles direct
+        # Streaming-mode caching: block-streaming now handles direct
         # parent params via the skip-filter PinnedWeights composition,
         # so streaming-mode models go through the cache too.
         stage = StubDiffusionStage()
-        stage._device = torch.device("cuda")  # BlockOffloader needs CUDA
+        stage._device = torch.device("cuda")  # block-streaming needs CUDA
         _wire_stub_to_cache(cache)
 
         with stage._transformer_ctx(streaming_prefetch_count=1):
@@ -430,7 +430,7 @@ class TestTextEncoderAlwaysPinned:
         _wire_text_encoder_stub(cache)
 
         # Call with streaming kwarg set — would historically force
-        # BlockOffloader on the text encoder.
+        # block-streaming on the text encoder.
         with encoder._text_encoder_ctx(streaming_prefetch_count=2):
             pass
         with encoder._text_encoder_ctx(streaming_prefetch_count=2):
@@ -491,16 +491,12 @@ class TestUninstallBusy:
 class _UserStrategy:
     """Trivial user-owned strategy for testing uninstall isolation."""
     cache_bytes = 10
-    closed = False
 
     def activate(self):
         return nn.Identity()
 
     def deactivate(self):
         pass
-
-    def close(self):
-        self.closed = True
 
     def __enter__(self):
         return self.activate()

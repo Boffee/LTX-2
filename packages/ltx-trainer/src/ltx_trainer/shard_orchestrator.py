@@ -99,23 +99,30 @@ def _parse_resolution_buckets(s: str) -> list[tuple[int, int, int]]:
 
 
 def _tear_down_trainer(trainer: "LtxvTrainer") -> None:
-    """Break the shard-trainer reference cycle so its GPU/pinned memory is
-    released before the next shard's trainer is constructed.
+    """Release shard-trainer GPU/pinned memory so the next shard can
+    construct cleanly.
 
-    The block offloader registers forward-pre hooks on transformer block
-    modules. Each hook closure retains a reference to the offloader, which
-    references the model, which references the block — a cycle that
-    refcount GC can't break on its own. Without an explicit ``close()``,
-    shard N+1 starts loading its model on top of shard N's still-resident
-    GPU parameters + optimizer state + pinned CPU buffers, and OOMs on the
-    first tensor that doesn't fit in whatever sliver remains.
+    The block offloader registers forward-pre hooks on transformer
+    block modules. The hook closures use ``weakref.ref(streamer)`` so
+    the strategy itself can be refcount-freed, but the model still
+    holds the hooks and pinned slot mutations until both the model
+    and strategy references are dropped. We do that here, then
+    explicitly run ``gc.collect()`` + ``torch.cuda.empty_cache()`` to
+    return CUDA cache memory to the allocator before shard N+1 starts
+    loading.
     """
     try:
         import torch
 
         offloader = getattr(trainer, "_block_offloader", None)
         if offloader is not None:
-            offloader.close()
+            offloader.deactivate()  # remove hooks, return slots to pinned-CPU
+            trainer._block_offloader = None  # drop strategy ref
+        # Drop the model + optimizer refs too — they hold the pinned slots.
+        for attr in ("_transformer", "_optimizer", "_text_encoder",
+                     "_embeddings_processor", "_vae_decoder", "_vae_encoder"):
+            if hasattr(trainer, attr):
+                setattr(trainer, attr, None)
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

@@ -14,7 +14,7 @@ files don't need to change. One call at script startup::
 After install, every :class:`~ltx_pipelines.utils.blocks.DiffusionStage`
 and :class:`~ltx_pipelines.utils.blocks.PromptEncoder` invocation
 routes its model construction through ``cache``. Cache entries are
-keyed by block-instance object identity (ComfyUI-style) so:
+keyed by block-instance object identity so:
 
 - One pipeline instance reused across many calls hits the cache
 - Different pipeline instances each get their own entries
@@ -33,10 +33,10 @@ Strategy choice per component
 - **Transformer**: follows the pipeline's per-call
   ``streaming_prefetch_count`` kwarg. ``None`` →
   :class:`PinnedWeights` (whole-model bulk DMA); ``int`` →
-  :class:`BlockOffloader` (per-block streaming). Cache key includes
+  :func:`make_block_offloader` (per-block streaming). Cache key includes
   ``stream{N}`` vs ``pinned`` so toggling on the same block instance
   produces distinct entries. Streaming-mode caching relies on
-  :class:`BlockOffloader` handling direct frozen parameters on parent
+  :func:`make_block_offloader` handling direct frozen parameters on parent
   modules (e.g. LTX's ``velocity_model.scale_shift_table``) via the
   composed-PinnedWeights skip filter.
 - **Text encoder**: always :class:`PinnedWeights`. The pipeline's
@@ -89,7 +89,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from ltx_core.memory.block_offloader import BlockOffloader
+from ltx_core.memory.block_compose import make_block_offloader
 from ltx_core.memory.model_cache import ModelCache, ModelInUseError, ModelSpec
 from ltx_core.memory.pinned_weights import PinnedWeights
 from ltx_core.memory.strategy import ModelStrategy
@@ -157,7 +157,7 @@ def install_model_cache(
     - **Transformer**: follows the pipeline's per-call
       ``streaming_prefetch_count`` kwarg. ``None`` →
       :class:`PinnedWeights` (whole-model bulk DMA); ``int`` →
-      :class:`BlockOffloader` (per-block streaming).
+      :func:`make_block_offloader` (per-block streaming).
     - **Text encoder**: always :class:`PinnedWeights`. Streaming a
       text encoder doesn't make sense — they fit on GPU, are used
       one-shot per prompt, and per-block hook overhead doesn't
@@ -420,7 +420,7 @@ def _patched_transformer_ctx(
     # Fall back to original when caching is impossible:
     #   - cache uninstalled
     #   - torch.compile (slot swaps invalidate compile's tensor-identity
-    #     tracking; both PinnedWeights and BlockOffloader hit this)
+    #     tracking; both PinnedWeights and block-streaming hit this)
     if cache is None or getattr(self, "_torch_compile", False):
         return original(self, streaming_prefetch_count, **kwargs)
 
@@ -455,23 +455,21 @@ def _patched_transformer_ctx(
         model = block._build_transformer(device=torch.device("cpu"))
         if streaming_prefetch_count is None:
             return PinnedWeights(model, target_device)
-        # Streaming: BlockOffloader handles direct parent params (e.g.
-        # LTX's velocity_model.scale_shift_table) via the composed
-        # PinnedWeights with a skip filter, so streaming-mode models
-        # are now cacheable.
+        # Streaming: make_block_offloader handles direct parent params
+        # (e.g. LTX's velocity_model.scale_shift_table) via the
+        # composed PinnedWeights with a skip filter, so streaming-mode
+        # models are cacheable. Pinning happens inside the factory
+        # so cache_bytes is final when ModelCache admits the entry.
         layers_attr = "velocity_model.transformer_blocks"
         layer_list = _resolve_block_list(model, layers_attr, cls.__name__)
         num_layers = len(layer_list)
-        off = BlockOffloader(
+        return make_block_offloader(
             model,
             target_device=target_device,
-            blocks_to_swap=num_layers - 1,
             layers_attr=layers_attr,
+            blocks_to_swap=num_layers - 1,
             prefetch_count=streaming_prefetch_count,
-            auto_setup=False,
         )
-        off.prepare()
-        return off
 
     return cache.use(
         ModelSpec(

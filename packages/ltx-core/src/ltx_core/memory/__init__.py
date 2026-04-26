@@ -2,10 +2,15 @@
 
 Two complementary offload strategies:
 
-- :class:`BlockOffloader` — per-block streaming. Use for models whose
-  individual blocks fit on GPU but the whole model does not. Hooks-based,
-  prefetches upcoming blocks on a secondary CUDA stream, supports
-  gradient checkpointing through autograd backward.
+- :func:`make_block_offloader` — per-block streaming. Use for models
+  whose individual blocks fit on GPU but the whole model does not.
+  Hooks-based, prefetches upcoming blocks on a secondary CUDA stream,
+  supports gradient checkpointing through autograd backward. Returns
+  a :class:`BlockStreamingStrategy` composing one
+  :class:`BlockStreamer` per ``layers_attr`` path plus a non-block
+  :class:`PinnedWeights` plus a :class:`TrainableMover`. For bespoke
+  configurations (per-group ``blocks_to_swap``), construct the
+  components directly and pass them to :class:`BlockStreamingStrategy`.
 
 - :class:`PinnedWeights` — whole-model pinned-CPU bulk cache. Use for
   models that fit on GPU when active but should be evicted between
@@ -18,35 +23,30 @@ Both classes share the underlying per-parameter pinned storage from
 + optional quanto ``WeightQBytesTensor`` decomposition), so quantized
 models work with either.
 
-Both :class:`PinnedWeights` and :class:`BlockOffloader` implement the
-:class:`ModelStrategy` Protocol — the plug-in contract for
-storage/placement strategies that :class:`ModelCache` consumes. New
-strategies (disk-mmap, NVMe-paged, multi-GPU shard, etc.) just satisfy
-the protocol.
+Both :class:`PinnedWeights` and :class:`BlockStreamingStrategy`
+implement the :class:`ModelStrategy` Protocol — the plug-in contract
+for storage/placement strategies that :class:`ModelCache` consumes.
+New strategies (disk-mmap, NVMe-paged, multi-GPU shard, etc.) just
+satisfy the protocol.
 
-:class:`BlockOffloader` defaults to ``auto_setup=True`` which runs
-``prepare(); activate()`` immediately so long-lived training callers
-don't have to phase the lifecycle by hand. For
-:class:`ModelCache` integration, factories pass ``auto_setup=False``
-and call ``prepare()`` before returning the handle so the cache reads
-the correct ``cache_bytes`` immediately::
+All strategies pin in their constructor, so ``cache_bytes`` is final
+immediately and :class:`ModelCache` can admit them without a
+factory-side ``prepare()`` dance. ``activate()`` then brings
+everything to GPU; ``deactivate()`` returns to pinned CPU.
 
-    def factory():
-        off = BlockOffloader(..., auto_setup=False)
-        off.prepare()
-        return off
+:func:`make_block_offloader` produces a :class:`BlockStreamingStrategy`
+that composes (in order):
+  1. A non-block :class:`PinnedWeights` with a :class:`SlotOwnership`
+     skip filter for everything outside the block list (sibling
+     modules + direct parent-module state like LTX's
+     ``velocity_model.scale_shift_table``).
+  2. A :class:`TrainableMover` for LoRA / adapter weights.
+  3. One :class:`BlockStreamer` per ``layers_attr`` path.
 
-The prepared state is fully GPU-inactive: block frozen weights live
-in the per-block pinned store, everything else (non-block sibling
-modules and any direct frozen state on parent modules — e.g. LTX's
-``velocity_model.scale_shift_table``) is pinned via a composed
-``PinnedWeights`` with a skip filter for the block-list params, and
-trainable params sit on CPU. ``activate()`` brings everything to
-GPU; ``deactivate()`` returns it to pinned CPU. Cross-region tied
-parameters (block ↔ non-block, cross-block, or mixed
-trainable/frozen across regions) are detected at ``prepare()`` and
-raise — slot-local block streaming cannot preserve such ties; use
-whole-model ``PinnedWeights`` instead.
+Cross-region tied parameters (block ↔ non-block, cross-block, or
+mixed trainable/frozen across regions) are detected at construction
+and raise — slot-local block streaming cannot preserve such ties; use
+whole-model :class:`PinnedWeights` instead.
 
 :class:`ModelCache` manages the cached backing storage of multiple
 strategies with LRU eviction, an active-set with refcounted leases, and
@@ -55,9 +55,9 @@ transactional admission. See its docstring for design notes.
 Compatibility
 -------------
 - **``torch.compile`` is not supported** for managed modules.
-  :class:`PinnedWeights` and :class:`BlockOffloader` swap parameter
+  :class:`PinnedWeights` and :class:`BlockStreamer` swap parameter
   slots (``module._parameters[leaf] = new_param``) on every
-  activate/deactivate, and :class:`BlockOffloader` registers
+  activate/deactivate, and :class:`BlockStreamer` registers
   forward-pre hooks that mutate slots on every block call. Both
   invalidate the tensor-identity assumptions ``torch.compile`` makes
   about its trace, producing recompiles or graph breaks at best,
@@ -77,20 +77,24 @@ cache modules avoid pipeline imports; the optional
 to the LTX repo layout.
 """
 
-from ltx_core.memory.block_offloader import BlockOffloader
+from ltx_core.memory.block_compose import (
+    BlockStreamingStrategy,
+    TrainableMover,
+    make_block_offloader,
+)
+from ltx_core.memory.block_streamer import BlockStreamer
 from ltx_core.memory.model_cache import (
     ActivationError,
     DuplicateModelKeyError,
     ModelCache,
     ModelCacheError,
-    ModelEvictionError,
     ModelInUseError,
     ModelNotRegisteredError,
     ModelSpec,
     ModelTooLargeError,
 )
 from ltx_core.memory.pinned_weights import PinnedWeights
-from ltx_core.memory.strategy import ModelStrategy
+from ltx_core.memory.strategy import ModelStrategy, SlotOwnership
 
 # `ModelCacheSnapshot`, `ModelCacheStats`, and `ModelInfo` are observability
 # types — used by callers who introspect cache state, not the typical
@@ -99,15 +103,18 @@ from ltx_core.memory.strategy import ModelStrategy
 
 __all__ = [
     "ActivationError",
-    "BlockOffloader",
+    "BlockStreamer",
+    "BlockStreamingStrategy",
     "DuplicateModelKeyError",
     "ModelCache",
     "ModelCacheError",
-    "ModelEvictionError",
     "ModelInUseError",
     "ModelNotRegisteredError",
     "ModelSpec",
     "ModelStrategy",
     "ModelTooLargeError",
     "PinnedWeights",
+    "SlotOwnership",
+    "TrainableMover",
+    "make_block_offloader",
 ]

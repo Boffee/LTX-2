@@ -127,26 +127,33 @@ def make_config(
 
 def _verify_offloader(trainer, blocks_to_swap: int) -> None:
     """Check offloader invariants after a training step."""
-    offloader = trainer._block_offloader
-    assert offloader is not None, "Offloader should be active"
+    strategy = trainer._block_offloader
+    assert strategy is not None, "Offloader should be active"
 
-    num_layers = len(offloader._layers)
+    # The new API: strategy has _components; the last component is the
+    # BlockStreamer (PinnedWeights and TrainableMover come first).
+    from ltx_core.memory import BlockStreamer
+    streamers = [c for c in strategy._components if isinstance(c, BlockStreamer)]
+    assert len(streamers) == 1, f"Expected 1 streamer, got {len(streamers)}"
+    streamer = streamers[0]
+
+    num_layers = len(streamer._blocks)
     num_resident = num_layers - blocks_to_swap
-    expected_max = num_resident + offloader._prefetch_count
+    expected_max = num_resident + streamer._prefetch_count
 
-    peak = offloader.peak_gpu_blocks
+    peak = streamer.peak_gpu_blocks
     assert peak <= expected_max, (
         f"Peak GPU blocks ({peak}) exceeds expected max ({expected_max})"
     )
     assert peak > 0, "No blocks were ever on GPU — offloader may not be active"
 
     # Verify LoRA params stayed on GPU
-    for layer in offloader._layers:
+    for layer in streamer._blocks:
         for name, p in layer.named_parameters():
             if p.requires_grad:
                 assert p.data.is_cuda, f"LoRA param {name} should be on GPU"
 
-    offloader.reset_peak()
+    streamer.reset_peak()
     print(f"    offloader OK: peak {peak} blocks on GPU (max allowed: {expected_max})")
 
 
@@ -226,6 +233,25 @@ def run_test(name: str, config: dict, tmp_dir: Path) -> bool:
 
         traceback.print_exc()
         return False
+    finally:
+        # Explicit teardown: drop the trainer's strategy + heavy model
+        # refs so refcount-GC frees them before the next test starts.
+        # Without this, PyTorch's CUDA cache holds onto the previous
+        # trainer's allocations and the next test OOMs on small GPUs.
+        import gc
+        if "trainer" in locals():
+            offloader = getattr(trainer, "_block_offloader", None)
+            if offloader is not None:
+                offloader.deactivate()
+                trainer._block_offloader = None
+            for attr in ("_transformer", "_optimizer", "_text_encoder",
+                         "_embeddings_processor", "_vae_decoder", "_vae_encoder"):
+                if hasattr(trainer, attr):
+                    setattr(trainer, attr, None)
+            del trainer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def main() -> None:

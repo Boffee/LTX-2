@@ -8,37 +8,62 @@ need to know how any particular strategy works.
 
 Implementations in this package: :class:`~ltx_core.memory.PinnedWeights`
 (whole-model bulk DMA between pinned CPU and GPU) and
-:class:`~ltx_core.memory.BlockOffloader` (block-level streaming for
+:func:`~ltx_core.memory.make_block_offloader` (block-level streaming for
 models too big for GPU). Future strategies (disk-mmap, NVMe-paged,
 multi-GPU shard) just have to satisfy this protocol.
 
 Lifecycle
 ---------
-``__init__`` (and possibly an explicit ``prepare()`` step, depending
-on the strategy) sets up backing storage →
+``__init__`` sets up backing storage (pinning, etc.) so
+``cache_bytes`` is final immediately and the strategy is ready for
+:class:`~ltx_core.memory.model_cache.ModelCache` admission →
 ``activate()`` (make model usable, returns the ``nn.Module``) →
 ``deactivate()`` (release transient compute resources, keep
-``cache_bytes`` resident) → ``close()`` (release ``cache_bytes``;
-the wrapped model is unusable afterward).
+``cache_bytes`` resident).
 
-Strategies that defer pinning until an explicit ``prepare()`` (e.g.
-:class:`~ltx_core.memory.BlockOffloader` with ``auto_setup=False``)
-must have ``prepare()`` called before being handed to
-:class:`~ltx_core.memory.model_cache.ModelCache` so the cache reads a
-correct ``cache_bytes`` immediately.
+``activate()/deactivate()`` may be repeated as many times as you
+want. The strategy is also a context manager:
+``with strategy as model: ...`` is equivalent to ``activate()`` /
+``deactivate()``.
 
-``close()`` is idempotent. ``activate()/deactivate()`` may be repeated
-between construction and ``close()``. The strategy is also a context
-manager: ``with strategy as model: ...`` is equivalent to
-``activate()`` / ``deactivate()``.
+There is no ``close()``. To release ``cache_bytes`` (typically
+pinned host memory), drop the strategy reference (and the model
+reference if you don't need it anymore). Python's refcount-based
+GC frees pinned tensors immediately. Strategies release what they
+own; ownership of the user's model is the user's concern.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import TracebackType
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from torch import nn
+
+
+@dataclass(frozen=True, slots=True)
+class SlotOwnership:
+    """Identifies a parameter or buffer slot in the model tree by
+    ``(parent_module, leaf_name, kind)``.
+
+    Used as a slot-skip filter when one strategy manages a subset of
+    a model's slots and a second strategy needs to ignore them. Unlike
+    ``id(param)`` / ``id(buffer)``, this identity survives
+    ``module._parameters[leaf] = new_param`` swaps — the parent module
+    and leaf name are stable even when the Parameter/buffer object at
+    that slot changes. That decouples filter consumers from
+    construction order: a strategy can be built with the filter at any
+    time, before or after the producing strategy has mutated slots.
+
+    ``parent_id`` is ``id()`` of the parent module, which is stable for
+    the module's lifetime and unique per submodule (Python guarantee
+    while a reference is held).
+    """
+
+    parent_id: int
+    leaf: str
+    kind: Literal["param", "buffer"]
 
 
 @runtime_checkable
@@ -68,11 +93,6 @@ class ModelStrategy(Protocol):
         """
         ...
 
-    @property
-    def closed(self) -> bool:
-        """``True`` after :meth:`close`. A closed strategy is unusable."""
-        ...
-
     def activate(self) -> nn.Module:
         """Make the model usable for compute and return the module to call.
 
@@ -87,19 +107,11 @@ class ModelStrategy(Protocol):
         """Undo :meth:`activate`. ``cache_bytes`` remains held.
 
         Should be infallible under normal use: the cache treats a
-        raising ``deactivate()`` as a poisoned strategy and discards
-        the entry (calls :meth:`close` on it) since the strategy's
-        internal state is unknown after the failure.
-        """
-        ...
-
-    def close(self) -> None:
-        """Release ``cache_bytes``. Idempotent.
-
-        After ``close()`` returns, the wrapped model may no longer be
-        usable (typically its parameters have been moved to the ``meta``
-        device to break storage references). Callers must request a
-        fresh strategy to use the model again.
+        raising ``deactivate()`` as a poisoned strategy and drops it
+        (without further cleanup attempts) since the strategy's
+        internal state is unknown after the failure. After deactivate,
+        the caller drops the strategy reference to release pinned
+        memory — there is no separate ``close()`` step.
         """
         ...
 
