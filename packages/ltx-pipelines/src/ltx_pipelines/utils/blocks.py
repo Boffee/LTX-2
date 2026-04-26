@@ -163,22 +163,11 @@ class DiffusionStage:
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
         torch_compile: bool = False,
-        transformer_wrapper: Callable[[torch.nn.Module], AbstractContextManager[torch.nn.Module]] | None = None,
     ) -> None:
         self._dtype = dtype
         self._device = device
         self._quantization = quantization
         self._torch_compile = torch_compile
-        # Optional user-provided wrapper around the freshly-built transformer.
-        # Receives the CPU-resident transformer and returns a context manager
-        # that yields the wrapped (or same) module to use for inference. Lets
-        # callers swap in heavier offloaders (e.g. ltx_core.memory.
-        # BlockOffloader / PinnedWeights) without modifying ltx-pipelines
-        # source.
-        # When set, takes precedence over the built-in streaming_prefetch_count
-        # path. When None, the existing LayerStreamingWrapper / gpu_model
-        # behavior is preserved.
-        self._transformer_wrapper = transformer_wrapper
         self._transformer_builder = Builder(
             model_path=checkpoint_path,
             model_class_configurator=LTXModelConfigurator,
@@ -221,10 +210,6 @@ class DiffusionStage:
         streaming_prefetch_count: int | None,
         **kwargs: object,
     ) -> AbstractContextManager:
-        if self._transformer_wrapper is not None:
-            # User-supplied wrapper: build on CPU, hand off; the wrapper owns
-            # placement and any prefetch/teardown semantics.
-            return self._transformer_wrapper(self._build_transformer(device=torch.device("cpu"), **kwargs))
         if streaming_prefetch_count is not None:
             return _streaming_model(
                 self._build_transformer(device=torch.device("cpu"), **kwargs),
