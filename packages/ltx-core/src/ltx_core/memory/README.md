@@ -306,9 +306,13 @@ a pipeline gets cache hits across calls; constructing a new pipeline
 gets a fresh entry. When a pipeline is garbage-collected, its cache
 entries are auto-evicted via `weakref.finalize`.
 
-Streaming mode (`streaming_prefetch_count=N`) and
-`torch_compile=True` fall back to the original (non-cached) path
-because both are incompatible with the slot-swap pattern.
+Both non-streaming (PinnedWeights) and streaming
+(`streaming_prefetch_count=N`, BlockOffloader) modes are cached;
+`stream{N}` and `pinned` are separate variants in the cache key so
+toggling on the same instance produces distinct entries.
+`torch_compile=True` falls back to the original (non-cached) path
+because slot-swap is incompatible with compile's tensor-identity
+tracking.
 
 To uninstall:
 

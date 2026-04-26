@@ -537,13 +537,12 @@ class BlockOffloader:
         self._layers: list[nn.Module] | None = None
         self._block_leaf_names: set[str] | None = None
         self._store: _BlockPinnedStore | None = None
-        # Non-block frozen params/buffers are managed via PinnedWeights
-        # composition: a synthetic wrapper module references the non-block
-        # children of each parent, then PinnedWeights pins them and
-        # handles the GPU round-trip on activate/deactivate. None when the
-        # model has no non-block siblings or all non-block params are
-        # trainable.
-        self._non_block_wrapper: nn.Module | None = None
+        # Non-block frozen params/buffers (everything outside the block
+        # list — sibling modules AND direct frozen state on parent
+        # modules like LTX's velocity_model.scale_shift_table) are
+        # managed via composed PinnedWeights with a skip filter for the
+        # block params. None when there's nothing non-block to pin
+        # (pure block-only model).
         self._non_block_pinned: PinnedWeights | None = None
 
         # Resources owned at "active" lifetime
@@ -621,84 +620,61 @@ class BlockOffloader:
         # the two pinning regimes either.
         self._detect_cross_region_tied_weights()
 
-        # Direct frozen state on parent modules (params/buffers attached
-        # to the parent itself rather than via a child module) isn't
-        # reachable through the named_children() walk in
-        # _build_non_block_wrapper. Detect and reject so the user can
-        # refactor (wrap the param in a sub-module).
-        self._detect_direct_parent_state()
+        # Move the entire model to CPU. Block params come along (will be
+        # pinned by _BlockPinnedStore below); non-block frozen state is
+        # also there for PinnedWeights to pin; trainable params come too
+        # (PinnedWeights skips them; activate moves them to GPU).
+        self._model.to("cpu")
 
-        # Move all blocks AND non-block siblings to CPU. Trainable params
-        # come along for the ride (PinnedWeights skips them; block-side
-        # trainable will be re-moved to GPU on activate). After prepare()
-        # the entire model is GPU-inactive — pinned CPU + trainable CPU.
-        for layer in self._layers:
-            layer.to("cpu")
+        # Compute the skip-id sets so the composed PinnedWeights walks
+        # the OUTER model but ignores parameters/buffers that
+        # _BlockPinnedStore will own. Capture ids BEFORE
+        # _BlockPinnedStore mutates the slots.
+        block_param_ids = {
+            id(p) for layer in self._layers for p in layer.parameters()
+        }
+        block_buffer_ids = {
+            id(b) for layer in self._layers for b in layer.buffers()
+        }
 
-        self._non_block_wrapper = self._build_non_block_wrapper()
-        if self._non_block_wrapper is not None:
-            self._non_block_wrapper.to("cpu")
-            # Only construct PinnedWeights if there's something to pin
-            # (frozen params or registered buffers). A pure-trainable
-            # wrapper has nothing for PinnedWeights to manage; trainable
-            # params still move to GPU on activate via the whole-model
-            # _move_trainable_to_device walk. Pre-check rather than
-            # catching the constructor's ValueError so genuine errors
-            # (mixed trainable/frozen tied storage, etc.) propagate.
-            has_frozen = any(
-                not p.requires_grad for p in self._non_block_wrapper.parameters()
+        # Compose PinnedWeights for everything outside the block list:
+        # non-block sibling modules AND direct frozen params/buffers on
+        # parent modules (e.g., LTX's velocity_model.scale_shift_table).
+        # Construct only if there's actually non-block content to manage —
+        # PinnedWeights raises on empty input.
+        if self._has_non_block_pinnable_content(block_param_ids, block_buffer_ids):
+            self._non_block_pinned = PinnedWeights(
+                self._model,
+                self._target_device,
+                skip_param_ids=block_param_ids,
+                skip_buffer_ids=block_buffer_ids,
             )
-            has_buffer = any(True for _ in self._non_block_wrapper.buffers())
-            if has_frozen or has_buffer:
-                self._non_block_pinned = PinnedWeights(
-                    self._non_block_wrapper, self._target_device,
-                )
-            else:
-                self._non_block_pinned = None
+        else:
+            self._non_block_pinned = None
 
         # Pin block weights (CPU only — pool allocated in activate()).
         self._store = _BlockPinnedStore(self._layers)
 
         self._prepared = True
 
-    # ------------------------------------------------------------------
-    # Non-block wrapper + cross-region tied detection
-    # ------------------------------------------------------------------
-
-    def _compute_parent_paths(self) -> set[str]:
-        paths: set[str] = set()
-        for attr_path in self._layers_attrs:
-            parts = attr_path.split(".")
-            paths.add(".".join(parts[:-1]) if len(parts) > 1 else "")
-        return paths
-
-    def _build_non_block_wrapper(self) -> nn.Module | None:
-        """Build a synthetic ``nn.Module`` that references all non-block
-        sibling submodules (preserving object identity, so mutations on
-        the wrapper propagate to the outer model). Returns ``None`` if
-        there are no non-block siblings.
-        """
+    def _has_non_block_pinnable_content(
+        self, skip_param_ids: set[int], skip_buffer_ids: set[int]
+    ) -> bool:
+        """True if the outer model has any frozen param or buffer that
+        isn't in the block-list skip set. Used to decide whether to
+        construct the composed PinnedWeights."""
         assert self._model is not None
-        assert self._block_leaf_names is not None
-        wrapper = nn.Module()
-        attached = False
-        seen_module_ids: set[int] = set()
-        for parent_path in self._compute_parent_paths():
-            parent = _resolve_dotted(self._model, parent_path) if parent_path else self._model
-            for name, child in parent.named_children():
-                if name in self._block_leaf_names:
-                    continue
-                if id(child) in seen_module_ids:
-                    # Same submodule reachable from multiple parent paths;
-                    # attach once.
-                    continue
-                seen_module_ids.add(id(child))
-                # Unique attribute name to avoid collisions when multiple
-                # parent paths have same-named non-block siblings.
-                unique = f"{parent_path.replace('.', '_')}__{name}" if parent_path else name
-                setattr(wrapper, unique, child)
-                attached = True
-        return wrapper if attached else None
+        for p in self._model.parameters():
+            if not p.requires_grad and id(p) not in skip_param_ids:
+                return True
+        for b in self._model.buffers():
+            if id(b) not in skip_buffer_ids:
+                return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Cross-region tied-weight detection
+    # ------------------------------------------------------------------
 
     def _detect_cross_region_tied_weights(self) -> None:
         """Group all params across regions (each block + non_block) by
@@ -724,73 +700,32 @@ class BlockOffloader:
         handles them via storage-key dedup.
         """
         assert self._layers is not None
-        assert self._block_leaf_names is not None
+        assert self._model is not None
+
+        # Map each block param's id to its block index, so we can
+        # classify any param in the model into its region in O(1).
+        param_id_to_region: dict[int, str] = {}
+        for block_idx, layer in enumerate(self._layers):
+            for p in layer.parameters():
+                param_id_to_region.setdefault(id(p), f"block:{block_idx}")
+
         # storage_key -> list of (region_label, qualified_name, requires_grad,
         #                         id(parent), leaf)
         groups: dict[tuple, list[tuple[str, str, bool, int, str]]] = {}
-
-        for block_idx, layer in enumerate(self._layers):
-            region = f"block:{block_idx}"
-            modules_map = dict(layer.named_modules(remove_duplicate=False))
-            for qual_name, p in layer.named_parameters(remove_duplicate=False):
-                if p.numel() == 0:
-                    continue
-                parts = qual_name.rsplit(".", 1)
-                if len(parts) == 2:
-                    parent_obj, leaf = modules_map[parts[0]], parts[1]
-                else:
-                    parent_obj, leaf = layer, qual_name
-                skey = storage_key(p.data)
-                groups.setdefault(skey, []).append(
-                    (region, f"{region}.{qual_name}", p.requires_grad,
-                     id(parent_obj), leaf)
-                )
-
-        for parent_path in self._compute_parent_paths():
-            parent = _resolve_dotted(self._model, parent_path) if parent_path else self._model
-            for name, child in parent.named_children():
-                if name in self._block_leaf_names:
-                    continue
-                prefix = f"{parent_path}.{name}" if parent_path else name
-                child_modules = dict(child.named_modules(remove_duplicate=False))
-                for qual_name, p in child.named_parameters(prefix=prefix, remove_duplicate=False):
-                    if p.numel() == 0:
-                        continue
-                    # Strip the prefix to get the path within `child`.
-                    rel_name = qual_name[len(prefix):].lstrip(".")
-                    parts = rel_name.rsplit(".", 1)
-                    if len(parts) == 2:
-                        parent_obj, leaf = child_modules[parts[0]], parts[1]
-                    else:
-                        parent_obj, leaf = child, rel_name
-                    skey = storage_key(p.data)
-                    groups.setdefault(skey, []).append(
-                        ("non_block", qual_name, p.requires_grad,
-                         id(parent_obj), leaf)
-                    )
-
-        # Direct params attached to parent / ancestor modules themselves
-        # (rather than via a child). Frozen ones are rejected later by
-        # `_detect_direct_parent_state` since they're unmanageable, but
-        # we still scan them here so a direct *trainable* param tied to
-        # a managed frozen param surfaces as a cross-region mixed tie
-        # rather than silently breaking on activate.
-        ancestor_paths: set[str] = set()
-        for parent_path in self._compute_parent_paths():
-            parts = parent_path.split(".") if parent_path else []
-            for i in range(len(parts) + 1):
-                ancestor_paths.add(".".join(parts[:i]))
-        for path in ancestor_paths:
-            module = _resolve_dotted(self._model, path) if path else self._model
-            for name, p in module._parameters.items():
-                if p is None or p.numel() == 0:
-                    continue
-                qual_name = f"{path}.{name}" if path else name
-                skey = storage_key(p.data)
-                groups.setdefault(skey, []).append(
-                    (f"direct_parent:{path or '<root>'}", qual_name,
-                     p.requires_grad, id(module), name)
-                )
+        modules_map = dict(self._model.named_modules(remove_duplicate=False))
+        for qual_name, p in self._model.named_parameters(remove_duplicate=False):
+            if p.numel() == 0:
+                continue
+            parts = qual_name.rsplit(".", 1)
+            if len(parts) == 2:
+                parent_obj, leaf = modules_map[parts[0]], parts[1]
+            else:
+                parent_obj, leaf = self._model, qual_name
+            region = param_id_to_region.get(id(p), "non_block")
+            skey = storage_key(p.data)
+            groups.setdefault(skey, []).append(
+                (region, qual_name, p.requires_grad, id(parent_obj), leaf)
+            )
 
         for members in groups.values():
             regions = {region for region, _, _, _, _ in members}
@@ -821,51 +756,69 @@ class BlockOffloader:
                         "whole-model PinnedWeights instead."
                     )
 
-    def _detect_direct_parent_state(self) -> None:
-        """Reject direct frozen params/buffers attached to a parent or
-        ancestor module itself (not via a child).
+        # Same scan for buffers. Block buffers are managed by
+        # _BlockPinnedStore (clones + pin per layer); non-block buffers
+        # by composed PinnedWeights. Two failure modes:
+        #   - Cross-region: block buffer and non-block buffer share
+        #     storage → two pinning regimes can't coordinate, alias
+        #     breaks silently.
+        #   - Intra-block: two distinct buffers within the same block
+        #     (or across blocks) share storage → _BlockPinnedStore
+        #     clones each independently, alias breaks silently.
+        # Walk per block to map each buffer instance to ALL its block
+        # regions (not just the first), so a buffer object shared
+        # across blocks classifies as multi-region and gets rejected.
+        buffer_id_to_regions: dict[int, set[str]] = {}
+        for block_idx, layer in enumerate(self._layers):
+            for b in layer.buffers():
+                buffer_id_to_regions.setdefault(id(b), set()).add(f"block:{block_idx}")
 
-        ``_build_non_block_wrapper`` only walks ``parent.named_children()``
-        for each module in ``_compute_parent_paths()``. Any param or
-        buffer registered directly on one of those parent modules — or
-        on any ancestor up to the root — would be unreachable. Activate
-        would leave it on whatever device it was constructed on,
-        silently breaking the "deactivate releases all GPU footprint"
-        contract. Easier to reject and ask the caller to wrap it in a
-        sub-module.
-        """
-        assert self._model is not None
-        assert self._block_leaf_names is not None
-        # Build the union of parent_paths and all ancestor paths up to
-        # the root, so direct state on the root is checked even when
-        # layers_attr is nested (e.g. "encoder.blocks" → check both
-        # "encoder" and the root "").
-        paths_to_check: set[str] = set()
-        for parent_path in self._compute_parent_paths():
-            parts = parent_path.split(".") if parent_path else []
-            for i in range(len(parts) + 1):
-                paths_to_check.add(".".join(parts[:i]))
-        for path in paths_to_check:
-            parent = _resolve_dotted(self._model, path) if path else self._model
-            for name, p in parent._parameters.items():
-                if p is None or p.requires_grad:
-                    continue
-                raise ValueError(
-                    f"BlockOffloader does not support frozen parameters "
-                    f"attached directly to a parent module. Found "
-                    f"{name!r} on {path or '<model root>'}. Wrap it "
-                    "in a sub-module (e.g. `nn.ParameterDict({'w': p})`) so "
-                    "it's reachable via named_children()."
+        # storage_key -> list of (region, qualified_name, id(buffer))
+        buf_groups: dict[tuple, list[tuple[str, str, int]]] = {}
+        for qual_name, b in self._model.named_buffers(remove_duplicate=False):
+            if b.numel() == 0:
+                continue
+            block_regions = buffer_id_to_regions.get(id(b))
+            if block_regions:
+                # Buffer object reachable inside the block list. If it
+                # shows up in multiple blocks (same instance reused),
+                # record once per region — the multi-region check below
+                # will catch it.
+                for region in block_regions:
+                    buf_groups.setdefault(storage_key(b), []).append(
+                        (region, qual_name, id(b))
+                    )
+            else:
+                buf_groups.setdefault(storage_key(b), []).append(
+                    ("non_block", qual_name, id(b))
                 )
-            for name, b in parent._buffers.items():
-                if b is None:
-                    continue
+
+        for members in buf_groups.values():
+            regions = {region for region, _, _ in members}
+            names = sorted({name for _, name, _ in members})
+            if len(regions) > 1:
                 raise ValueError(
-                    f"BlockOffloader does not support buffers attached "
-                    f"directly to a parent module. Found {name!r} on "
-                    f"{path or '<model root>'}. Wrap it in a "
-                    "sub-module so it's reachable via named_children()."
+                    f"BlockOffloader does not support tied buffers across "
+                    f"streamed regions: storage shared by {names}. The two "
+                    "pinning regimes (per-block clone vs composed "
+                    "PinnedWeights) can't coordinate to preserve the "
+                    "alias. Untie the buffers or use whole-model "
+                    "PinnedWeights instead."
                 )
+            sole_region = next(iter(regions))
+            if sole_region.startswith("block:"):
+                # Intra-block: distinct buffer objects sharing storage
+                # within the same block region. _BlockPinnedStore would
+                # clone each independently and break the alias.
+                distinct_ids = {bid for _, _, bid in members}
+                if len(distinct_ids) > 1:
+                    raise ValueError(
+                        f"BlockOffloader does not support intra-block tied "
+                        f"buffers: storage shared by {names} within "
+                        f"{sole_region}. _BlockPinnedStore clones each "
+                        "buffer independently — the alias would break. "
+                        "Untie the buffers or use whole-model PinnedWeights."
+                    )
 
     def activate(self) -> nn.Module:
         """Allocate per-activation resources and return the model.
@@ -1017,7 +970,6 @@ class BlockOffloader:
         self._layers = None
         self._block_leaf_names = None
         self._store = None
-        self._non_block_wrapper = None
         self._prepared = False
         self._closed = True
 

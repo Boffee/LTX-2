@@ -102,6 +102,15 @@ class PinnedWeights:
         embeddings stored as buffers, etc.). Default True. Set False
         for models with very large mutable buffers you'd rather rebuild
         on each call.
+    skip_param_ids:
+        Optional set of ``id(param)`` values to skip during the
+        parameter walk. Used by composers like :class:`BlockOffloader`
+        that want to hand the *outer* model to PinnedWeights but
+        manage some subset of params themselves (e.g., the streamed
+        block list). Skipped slots are not pinned and are not touched
+        by :meth:`close`.
+    skip_buffer_ids:
+        Same idea, for registered buffers.
     """
 
     def __init__(
@@ -109,12 +118,17 @@ class PinnedWeights:
         model: nn.Module,
         target_device: torch.device,
         include_buffers: bool = True,
+        *,
+        skip_param_ids: set[int] | None = None,
+        skip_buffer_ids: set[int] | None = None,
     ) -> None:
         self._model: nn.Module | None = model
         self._device = target_device
         self._include_buffers = include_buffers
         self._active = False  # guards re-entry of activate() and close-while-active
         self._closed = False
+        self._skip_param_ids: set[int] = skip_param_ids or set()
+        self._skip_buffer_ids: set[int] = skip_buffer_ids or set()
 
         # Tied-weight aware pinning. We walk both named_modules and
         # named_parameters with remove_duplicate=False so:
@@ -134,6 +148,8 @@ class PinnedWeights:
         # storage_key -> list of (name, param, parent_module, leaf)
         groups: dict[tuple[Any, ...], list[tuple[str, nn.Parameter, nn.Module, str]]] = {}
         for name, p in model.named_parameters(remove_duplicate=False):
+            if id(p) in self._skip_param_ids:
+                continue  # composer (e.g. BlockOffloader) owns this slot
             parts = name.rsplit(".", 1)
             if len(parts) == 2:
                 parent_path, leaf = parts
@@ -199,6 +215,8 @@ class PinnedWeights:
                 tuple[torch.Tensor, list[tuple[nn.Module, str, bool]]],
             ] = {}
             for full_name, b in list(model.named_buffers(remove_duplicate=False)):
+                if id(b) in self._skip_buffer_ids:
+                    continue  # composer owns this buffer
                 parent = self._resolve_parent(model, full_name)
                 leaf = full_name.rsplit(".", 1)[-1]
                 persistent = leaf not in parent._non_persistent_buffers_set
@@ -311,19 +329,31 @@ class PinnedWeights:
             self._active = False
 
     def close(self) -> None:
-        """Release pinned CPU storage and invalidate the wrapped model.
+        """Release pinned CPU storage and invalidate managed slots.
 
-        Moves the model to the ``meta`` device so its parameters and
-        buffers no longer reference the pinned tensors, then drops the
-        pinned buffers so their pages can be returned to the host
-        allocator. Idempotent. The wrapped model object is unusable
-        after this call — request a fresh strategy to use it again.
+        Walks the slots/buffer-slots this strategy manages and replaces
+        each with a meta-device Parameter/buffer of matching shape and
+        dtype. This breaks the model→pinned-tensor reference chain so
+        the pinned pages can return to the host allocator, and matches
+        the semantics of ``model.to("meta")`` for the slots we own.
 
-        If ``model.to("meta")`` raises (a custom subclass with a
-        broken ``_apply``, etc.), the strategy is *not* marked closed
-        and pinned references are *not* dropped, so the caller can
-        retry or perform manual cleanup. Raises ``RuntimeError`` if
-        called while active; deactivate first.
+        Surgical (per-slot) rather than wholesale ``model.to("meta")``
+        because :class:`PinnedWeights` may be used in composed setups
+        (e.g., :class:`BlockOffloader` hands the outer model with a
+        skip filter — block params are owned by ``_BlockPinnedStore``
+        and would be trampled if we touched the whole model).
+
+        Trainable parameters and any slots passed via ``skip_param_ids``
+        / ``skip_buffer_ids`` are NOT touched — they're not ours to
+        meta-ify. For standalone use (no skip filter), trainable params
+        survive close on whatever device they were on; callers who
+        want full meta-ification should drop their model reference too
+        and let GC finish the job.
+
+        Idempotent. Raises ``RuntimeError`` if called while active;
+        deactivate first. If a per-slot replacement raises (rare —
+        usually a quanto subclass quirk), state is *not* cleared and
+        the strategy is *not* marked closed so the caller can retry.
         """
         if self._closed:
             return
@@ -334,9 +364,26 @@ class PinnedWeights:
                 "GPU tensors that cannot be restored."
             )
         if self._model is not None:
-            # Let this raise without clearing state — preserves the
-            # ability to retry close() or hand-clean.
-            self._model.to("meta")
+            # Surgical meta-ification: walk only the slots we manage.
+            # Let exceptions propagate without clearing state — preserves
+            # retry / hand-clean possibility.
+            for buf, locs in self._slots:
+                meta_param = buf.make_meta_param()
+                for parent, leaf in locs:
+                    parent._parameters[leaf] = meta_param
+            for _pinned, locs in self._buffer_slots:
+                # We don't have a "pinned buffer's meta equivalent" helper —
+                # build one inline. Buffers are plain tensors (no quanto
+                # wrapper), so torch.empty_like + register_buffer suffices.
+                if not locs:
+                    continue
+                # Use the first location's pinned tensor as the shape/dtype
+                # template — all locations share the same pinned tensor by
+                # construction.
+                template = _pinned
+                meta_buf = torch.empty_like(template, device="meta")
+                for parent, leaf, persistent in locs:
+                    _set_buffer(parent, leaf, meta_buf, persistent)
         self._model = None
         self._slots.clear()
         self._buffer_slots.clear()

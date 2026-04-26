@@ -36,15 +36,17 @@ the correct ``cache_bytes`` immediately::
         off.prepare()
         return off
 
-The prepared state is fully GPU-inactive: block frozen weights live in
-the per-block pinned store, non-block frozen siblings (patchifier,
-output projection, norms, etc.) are pinned via composed
-``PinnedWeights``, and trainable params sit on CPU. ``activate()``
-brings everything to GPU; ``deactivate()`` returns it to pinned CPU.
-Cross-region tied parameters (block ↔ non-block, cross-block, or
-mixed trainable/frozen across regions) are detected at ``prepare()``
-and raise — slot-local block streaming cannot preserve such ties;
-use whole-model ``PinnedWeights`` instead.
+The prepared state is fully GPU-inactive: block frozen weights live
+in the per-block pinned store, everything else (non-block sibling
+modules and any direct frozen state on parent modules — e.g. LTX's
+``velocity_model.scale_shift_table``) is pinned via a composed
+``PinnedWeights`` with a skip filter for the block-list params, and
+trainable params sit on CPU. ``activate()`` brings everything to
+GPU; ``deactivate()`` returns it to pinned CPU. Cross-region tied
+parameters (block ↔ non-block, cross-block, or mixed
+trainable/frozen across regions) are detected at ``prepare()`` and
+raise — slot-local block streaming cannot preserve such ties; use
+whole-model ``PinnedWeights`` instead.
 
 :class:`ModelCache` manages the cached backing storage of multiple
 strategies with LRU eviction, an active-set with refcounted leases, and

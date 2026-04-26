@@ -701,7 +701,6 @@ class TestPreparedStateInactive:
         try:
             off.prepare()
             assert off._non_block_pinned is None
-            assert off._non_block_wrapper is None
             assert off.cache_bytes > 0  # block bytes only
         finally:
             off.close()
@@ -832,6 +831,79 @@ class TestCrossRegionTiedDetection:
             off.prepare()
         off.close()
 
+    def test_cross_region_tied_buffers_raises(self) -> None:
+        # Block buffer and non-block buffer are distinct tensor objects
+        # sharing underlying storage (e.g. two views of the same base).
+        # Block side gets cloned by _BlockPinnedStore, non-block side
+        # cloned by composed PinnedWeights — alias broken silently.
+        # Detection must catch this.
+        shared = torch.randn(8)
+        view_block = shared.view(8)  # distinct tensor object, same storage
+        view_aux = shared.view(8)
+        assert id(view_block) != id(view_aux)
+        assert view_block.data_ptr() == view_aux.data_ptr()
+
+        class BlockWithTiedBuf(nn.Module):
+            def __init__(self, buf):
+                super().__init__()
+                self.register_buffer("table", buf)
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [BlockWithTiedBuf(view_block), nn.Linear(4, 4, bias=False)]
+                )
+                self.aux = nn.Module()
+                self.aux.register_buffer("alias", view_aux)
+
+        m = M()
+        for p in m.parameters():
+            p.requires_grad = False
+        off = BlockOffloader(
+            m, torch.device("cpu"), blocks_to_swap=1,
+            layers_attr="transformer_blocks", auto_setup=False,
+        )
+        with pytest.raises(ValueError, match="tied buffers across"):
+            off.prepare()
+        off.close()
+
+    def test_intra_block_tied_buffers_raises(self) -> None:
+        # Two distinct buffer objects within the same block sharing
+        # underlying storage. _BlockPinnedStore clones each
+        # independently; alias would break silently. Detection must
+        # mirror the intra-block param check.
+        shared = torch.randn(8)
+        view_a = shared.view(8)
+        view_b = shared.view(8)
+        assert id(view_a) != id(view_b)
+        assert view_a.data_ptr() == view_b.data_ptr()
+
+        class TiedBufBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("buf_a", view_a)
+                self.register_buffer("buf_b", view_b)
+                self.weight = nn.Parameter(torch.randn(2), requires_grad=False)
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [TiedBufBlock(), nn.Linear(4, 4, bias=False)]
+                )
+
+        m = M()
+        for p in m.parameters():
+            p.requires_grad = False
+        off = BlockOffloader(
+            m, torch.device("cpu"), blocks_to_swap=1,
+            layers_attr="transformer_blocks", auto_setup=False,
+        )
+        with pytest.raises(ValueError, match="intra-block tied buffers"):
+            off.prepare()
+        off.close()
+
     def test_non_block_internal_tied_works(self) -> None:
         # Tied embed↔head WITHIN non-block region: PinnedWeights
         # composition handles this via its own dedup. Should not raise.
@@ -866,17 +938,21 @@ class TestCrossRegionTiedDetection:
 
 
 # ---------------------------------------------------------------------------
-# Direct-parent state rejection
+# Direct-parent state — handled by the composed PinnedWeights skip filter
+# (used to be rejected; now pinned alongside non-block siblings).
 # ---------------------------------------------------------------------------
 
 
-class TestDirectParentStateRejection:
-    def test_direct_frozen_param_on_root_raises(self) -> None:
+class TestDirectParentStateHandled:
+    def test_direct_frozen_param_on_root_is_pinned(self) -> None:
+        # Direct frozen param on the root (the LTX
+        # velocity_model.scale_shift_table case) used to crash. With
+        # the skip-filter PinnedWeights composition it gets pinned
+        # alongside non-block siblings.
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                # Direct frozen param on root (not via a child module).
-                self.weight = nn.Parameter(torch.randn(4), requires_grad=False)
+                self.scale_shift = nn.Parameter(torch.randn(4), requires_grad=False)
                 self.transformer_blocks = nn.ModuleList(
                     [nn.Linear(4, 4, bias=False) for _ in range(4)]
                 )
@@ -888,20 +964,23 @@ class TestDirectParentStateRejection:
             m, torch.device("cpu"), blocks_to_swap=2,
             layers_attr="transformer_blocks", auto_setup=False,
         )
-        with pytest.raises(ValueError, match="directly to a parent module"):
+        try:
             off.prepare()
-        off.close()
+            # Non-block PinnedWeights was constructed (handles the direct param).
+            assert off._non_block_pinned is not None
+            # The direct param is now pointing at pinned CPU storage.
+            assert m.scale_shift.is_pinned()
+        finally:
+            off.close()
 
     def test_direct_param_on_ancestor_when_layers_attr_nested(self) -> None:
-        # Nested layers_attr like "encoder.blocks": parent_paths is
-        # {"encoder"}. Direct frozen state on the ROOT (an ancestor of
-        # the parent) must still be detected — the wrapper only walks
-        # encoder's children and would miss it.
+        # Nested layers_attr like "encoder.blocks". A direct frozen
+        # param on the ROOT (an ancestor of the parent) must be
+        # pinned, not rejected.
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                # Direct frozen param on root, ABOVE the parent path.
-                self.weight = nn.Parameter(torch.randn(4), requires_grad=False)
+                self.root_param = nn.Parameter(torch.randn(4), requires_grad=False)
                 self.encoder = nn.Module()
                 self.encoder.blocks = nn.ModuleList(
                     [nn.Linear(4, 4, bias=False) for _ in range(4)]
@@ -914,16 +993,19 @@ class TestDirectParentStateRejection:
             m, torch.device("cpu"), blocks_to_swap=2,
             layers_attr="encoder.blocks", auto_setup=False,
         )
-        with pytest.raises(ValueError, match="directly to a parent module"):
+        try:
             off.prepare()
-        off.close()
+            assert off._non_block_pinned is not None
+            assert m.root_param.is_pinned()
+        finally:
+            off.close()
 
     def test_direct_trainable_tied_to_frozen_block_raises(self) -> None:
         # Mixed-tie edge case: direct trainable param on root sharing
         # storage with a frozen block param. The frozen side gets
         # pinned and slot-swapped; the trainable side is moved
         # separately on activate, breaking the tie. Cross-region
-        # detection must catch this.
+        # detection still catches this.
         shared = torch.randn(4, 4)
         block_0 = nn.Linear(4, 4, bias=False)
         block_0.weight = nn.Parameter(shared, requires_grad=False)
@@ -931,7 +1013,6 @@ class TestDirectParentStateRejection:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
-                # Direct TRAINABLE param tied to block_0.weight.
                 self.tied_w = nn.Parameter(shared, requires_grad=True)
                 self.transformer_blocks = nn.ModuleList(
                     [block_0, nn.Linear(4, 4, bias=False)]
@@ -948,7 +1029,7 @@ class TestDirectParentStateRejection:
             off.prepare()
         off.close()
 
-    def test_direct_buffer_on_root_raises(self) -> None:
+    def test_direct_buffer_on_root_is_pinned(self) -> None:
         class M(nn.Module):
             def __init__(self):
                 super().__init__()
@@ -964,9 +1045,12 @@ class TestDirectParentStateRejection:
             m, torch.device("cpu"), blocks_to_swap=2,
             layers_attr="transformer_blocks", auto_setup=False,
         )
-        with pytest.raises(ValueError, match="directly to a parent module"):
+        try:
             off.prepare()
-        off.close()
+            assert off._non_block_pinned is not None
+            assert m.table.is_pinned()
+        finally:
+            off.close()
 
 
 # ---------------------------------------------------------------------------

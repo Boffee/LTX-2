@@ -149,22 +149,27 @@ class TestClose:
             pw.activate()
 
     def test_close_failure_does_not_strand_strategy(self, monkeypatch) -> None:
-        # If model.to("meta") raises, we must NOT mark the strategy
-        # closed and we must NOT drop the only handle to pinned storage —
-        # the caller should be able to retry.
+        # If a per-slot meta replacement raises, we must NOT mark the
+        # strategy closed and we must NOT drop the only handle to
+        # pinned storage — the caller should be able to retry.
+        from ltx_core.memory.pinned_buffer import PinnedParamBuffer
+
         m = _make_simple_model()
         pw = PinnedWeights(m, torch.device("cpu"))
 
-        original_to = m.to
+        # Patch make_meta_param at the class level (PinnedParamBuffer
+        # uses __slots__, so per-instance setattr is blocked). First
+        # call raises; subsequent calls succeed.
+        original_make = PinnedParamBuffer.make_meta_param
         call_count = {"n": 0}
 
-        def flaky_to(*args, **kwargs):
+        def flaky_make_meta_param(self_):
             call_count["n"] += 1
             if call_count["n"] == 1:
-                raise RuntimeError("simulated to() failure")
-            return original_to(*args, **kwargs)
+                raise RuntimeError("simulated meta replacement failure")
+            return original_make(self_)
 
-        monkeypatch.setattr(m, "to", flaky_to)
+        monkeypatch.setattr(PinnedParamBuffer, "make_meta_param", flaky_make_meta_param)
 
         with pytest.raises(RuntimeError, match="simulated"):
             pw.close()
@@ -492,6 +497,21 @@ class TestQuanto:
             assert m.weight._scale.is_pinned()
         finally:
             pw.close()
+
+    def test_quanto_close_meta_replaces_quanto_param(self) -> None:
+        # Surgical close uses make_meta_param, which builds a meta
+        # WeightQBytesTensor via WeightQBytesTensor.create with empty
+        # meta inputs. Verify quanto accepts this and the resulting
+        # parameter has the right wrapper + meta-device storage.
+        from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
+
+        m = self._make_quanto_model()
+        pw = PinnedWeights(m, torch.device("cpu"))
+        pw.close()
+        # The slot now holds a meta-device quanto Parameter.
+        assert isinstance(m.weight.data, WeightQBytesTensor)
+        assert m.weight._data.device.type == "meta"
+        assert m.weight._scale.device.type == "meta"
 
 
 # ---------------------------------------------------------------------------

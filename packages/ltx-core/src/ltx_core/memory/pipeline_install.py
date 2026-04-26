@@ -28,33 +28,30 @@ etc.) are out of scope — they're either too small to be worth
 caching, or their lazy-iterator return type makes lifetime
 correctness fragile.
 
-Streaming bypass
-----------------
-Calls with ``streaming_prefetch_count is not None`` fall through to
-the original method (which uses :class:`LayerStreamingWrapper`).
-Reason: the LTX transformer (``X0Model.velocity_model``) has direct
-frozen parameters on the ``velocity_model`` module itself
-(``scale_shift_table``), and :class:`BlockOffloader` rejects that
-pattern at :meth:`prepare`. Caching streaming-mode models would
-require either teaching :class:`BlockOffloader` to manage
-direct-parent state, or composing a third strategy.
-:class:`LayerStreamingWrapper`'s pinned-CPU pages are NOT counted
-against the cache budget — keep that in mind for tight-budget
-configurations that mix streaming and cached models.
+Streaming mode
+--------------
+Both non-streaming (``PinnedWeights``) and streaming
+(``streaming_prefetch_count=N``, ``BlockOffloader``) modes are cached.
+The cache key includes a ``stream{N}`` vs ``pinned`` variant so
+toggling on the same block instance produces distinct entries. This
+relies on :class:`BlockOffloader` handling direct frozen parameters
+on parent modules (e.g. LTX's ``velocity_model.scale_shift_table``)
+via the composed-PinnedWeights skip filter.
 
-Other skips
------------
+Fallback to original
+--------------------
 - ``DiffusionStage._torch_compile=True``: compile and slot-swap are
   fundamentally incompatible. Falls back to original.
 - ``cache=None``: uninstalled.
 
 Caveats
 -------
-- Cache key is ``f"{cls.__name__}:{token}:{kind}:pinned"`` — keyed by
-  block-instance token only, **not** per-call kwargs. Calling the same
-  block instance with kwargs that affect model construction would
-  silently reuse the first-built model. For LTX-2 ``Builder.build()``
-  ignores ``**kwargs`` so this is safe today; if a future kwarg ever
+- Cache key is ``f"{cls.__name__}:{token}:{kind}:{variant}"`` — keyed
+  by block-instance token + streaming variant only, **not** per-call
+  kwargs. Calling the same block instance with kwargs that affect
+  model construction would silently reuse the first-built model. For
+  LTX-2 ``Builder.build()`` ignores ``**kwargs`` so this is safe
+  today; if a future kwarg ever
   affects construction it must be added to the variant in the key
   so the cache rebuilds.
 - Default size estimates are 0 (no pre-eviction; rely on post-activate
@@ -82,6 +79,7 @@ from typing import Any
 import torch
 from torch import nn
 
+from ltx_core.memory.block_offloader import BlockOffloader
 from ltx_core.memory.model_cache import ModelCache, ModelInUseError, ModelSpec
 from ltx_core.memory.pinned_weights import PinnedWeights
 from ltx_core.memory.strategy import ModelStrategy
@@ -356,6 +354,26 @@ def _get_or_create_token(cls: type, block: Any) -> int:
     return token
 
 
+def _resolve_block_list(model: nn.Module, layers_attr: str, owner_label: str) -> Any:
+    """Walk the dotted ``layers_attr`` path on ``model``; raise a clear
+    error if the path doesn't resolve. Same paths the upstream
+    ``_streaming_model`` callsite uses, so failures here mean upstream
+    reshaped the model and the patcher needs an update."""
+    obj: Any = model
+    for part in layers_attr.split("."):
+        try:
+            obj = getattr(obj, part)
+        except AttributeError as exc:
+            raise RuntimeError(
+                f"pipeline_install: could not resolve streaming layers at "
+                f"'{layers_attr}' for cached {owner_label} streaming mode "
+                f"(failed at {part!r} on {type(obj).__name__}). The upstream "
+                "model layout may have changed; the patcher's hard-coded "
+                "layers_attr needs updating."
+            ) from exc
+    return obj
+
+
 def _associate_key(token: int, key: str) -> None:
     """Track ``key`` against ``token`` so the block's GC finalizer can
     evict it later. Also adds to the global installer-owned set for
@@ -377,17 +395,21 @@ def _patched_transformer_ctx(
     cache = _INSTALLED_CACHE
     _, original = _find_patched_ancestor(self, "_transformer_ctx")
 
-    # Fall back to original when caching is impossible or incompatible:
+    # Fall back to original when caching is impossible:
     #   - cache uninstalled
-    #   - torch.compile (slot swaps invalidate compile's tensor-identity tracking)
-    #   - streaming mode (BlockOffloader rejects LTXModel's direct
-    #     velocity_model.scale_shift_table; LayerStreamingWrapper handles it)
-    if cache is None or getattr(self, "_torch_compile", False) or streaming_prefetch_count is not None:
+    #   - torch.compile (slot swaps invalidate compile's tensor-identity
+    #     tracking; both PinnedWeights and BlockOffloader hit this)
+    if cache is None or getattr(self, "_torch_compile", False):
         return original(self, streaming_prefetch_count, **kwargs)
 
     cls = type(self)
     token = _get_or_create_token(cls, self)
-    key = f"{cls.__name__}:{token}:transformer:pinned"
+    variant = (
+        f"stream{streaming_prefetch_count}"
+        if streaming_prefetch_count is not None
+        else "pinned"
+    )
+    key = f"{cls.__name__}:{token}:transformer:{variant}"
     _associate_key(token, key)
 
     block_ref = weakref.ref(self)
@@ -409,7 +431,25 @@ def _patched_transformer_ctx(
         # future kwarg ever affects model construction it must be added
         # to the cache key (variant) so the cache rebuilds.
         model = block._build_transformer(device=torch.device("cpu"))
-        return PinnedWeights(model, target_device)
+        if streaming_prefetch_count is None:
+            return PinnedWeights(model, target_device)
+        # Streaming: BlockOffloader handles direct parent params (e.g.
+        # LTX's velocity_model.scale_shift_table) via the composed
+        # PinnedWeights with a skip filter, so streaming-mode models
+        # are now cacheable.
+        layers_attr = "velocity_model.transformer_blocks"
+        layer_list = _resolve_block_list(model, layers_attr, cls.__name__)
+        num_layers = len(layer_list)
+        off = BlockOffloader(
+            model,
+            target_device=target_device,
+            blocks_to_swap=num_layers - 1,
+            layers_attr=layers_attr,
+            prefetch_count=streaming_prefetch_count,
+            auto_setup=False,
+        )
+        off.prepare()
+        return off
 
     return cache.use(
         ModelSpec(
@@ -428,17 +468,17 @@ def _patched_text_encoder_ctx(
     cache = _INSTALLED_CACHE
     _, original = _find_patched_ancestor(self, "_text_encoder_ctx")
 
-    # Streaming mode: same fallback as transformer. The Gemma text
-    # encoder may not have direct parent params today, but staying
-    # consistent (cache only the whole-model PinnedWeights path)
-    # avoids the need to teach BlockOffloader about each backbone's
-    # quirks.
-    if cache is None or streaming_prefetch_count is not None:
+    if cache is None:
         return original(self, streaming_prefetch_count)
 
     cls = type(self)
     token = _get_or_create_token(cls, self)
-    key = f"{cls.__name__}:{token}:text_encoder:pinned"
+    variant = (
+        f"stream{streaming_prefetch_count}"
+        if streaming_prefetch_count is not None
+        else "pinned"
+    )
+    key = f"{cls.__name__}:{token}:text_encoder:{variant}"
     _associate_key(token, key)
 
     block_ref = weakref.ref(self)
@@ -455,7 +495,21 @@ def _patched_text_encoder_ctx(
         built = block._text_encoder_builder.build(device=torch.device("cpu"), dtype=dtype)
         # Match the upstream call which sets eval mode after build.
         built.train(False)
-        return PinnedWeights(built, target_device)
+        if streaming_prefetch_count is None:
+            return PinnedWeights(built, target_device)
+        layers_attr = "model.model.language_model.layers"
+        layer_list = _resolve_block_list(built, layers_attr, cls.__name__)
+        num_layers = len(layer_list)
+        off = BlockOffloader(
+            built,
+            target_device=target_device,
+            blocks_to_swap=num_layers - 1,
+            layers_attr=layers_attr,
+            prefetch_count=streaming_prefetch_count,
+            auto_setup=False,
+        )
+        off.prepare()
+        return off
 
     return cache.use(
         ModelSpec(

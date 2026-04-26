@@ -21,6 +21,8 @@ from torch import nn
 from ltx_core.memory import ModelCache, ModelSpec
 from ltx_core.memory import pipeline_install as pi
 
+CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
 
 # ---------------------------------------------------------------------------
 # Stub blocks that mirror DiffusionStage / PromptEncoder shape
@@ -40,7 +42,15 @@ class StubDiffusionStage:
 
     def _build_transformer(self, *, device=None, **kwargs):  # noqa: ANN001
         self._build_count += 1
-        m = nn.Linear(4, 4, bias=False)
+        # Mimic the LTX shape: outer X0Model wrapping a velocity_model
+        # that holds transformer_blocks. Lets streaming-mode tests
+        # exercise BlockOffloader's introspection.
+        velocity = nn.Module()
+        velocity.transformer_blocks = nn.ModuleList(
+            [nn.Linear(4, 4, bias=False) for _ in range(2)]
+        )
+        m = nn.Module()
+        m.velocity_model = velocity
         for p in m.parameters():
             p.requires_grad = False
         return m
@@ -148,25 +158,46 @@ class TestFallthrough:
         assert snap.stats.builds == 0
         assert snap.stats.hits == 0
 
-    def test_streaming_mode_falls_back(self, cache: ModelCache) -> None:
-        # Streaming bypass: BlockOffloader rejects the real LTXModel
-        # shape (direct frozen params on velocity_model), so the patch
-        # routes streaming mode to the original method (which uses
-        # LayerStreamingWrapper). Cache stays untouched.
+    @CUDA
+    def test_streaming_mode_uses_cache(self, cache: ModelCache) -> None:
+        # Streaming-mode caching: BlockOffloader now handles direct
+        # parent params via the skip-filter PinnedWeights composition,
+        # so streaming-mode models go through the cache too.
         stage = StubDiffusionStage()
+        stage._device = torch.device("cuda")  # BlockOffloader needs CUDA
         _wire_stub_to_cache(cache)
 
-        with stage._transformer_ctx(streaming_prefetch_count=2):
+        with stage._transformer_ctx(streaming_prefetch_count=1):
             pass
-        with stage._transformer_ctx(streaming_prefetch_count=2):
+        with stage._transformer_ctx(streaming_prefetch_count=1):
             pass
 
-        # Both calls bypassed the cache — built fresh each time.
+        # First call built; second call hit the cache.
+        assert stage._build_count == 1
+        snap = cache.snapshot()
+        assert snap.stats.builds == 1
+        assert snap.stats.hits == 1
+
+    @CUDA
+    def test_streaming_and_pinned_get_separate_entries(
+        self, cache: ModelCache
+    ) -> None:
+        # Variant in cache key: stream{N} vs pinned. Toggling on the
+        # same instance creates two cache entries.
+        stage = StubDiffusionStage()
+        stage._device = torch.device("cuda")
+        _wire_stub_to_cache(cache)
+
+        with stage._transformer_ctx(streaming_prefetch_count=None):
+            pass
+        with stage._transformer_ctx(streaming_prefetch_count=1):
+            pass
+
+        # Both calls built fresh — different variants.
         assert stage._build_count == 2
         snap = cache.snapshot()
-        assert snap.stats.builds == 0
+        assert snap.stats.builds == 2
         assert snap.stats.hits == 0
-        assert snap.stats.misses == 0
 
     def test_no_cache_installed_runs_original(self) -> None:
         # When the cache is None (uninstalled), patched method should
@@ -315,6 +346,8 @@ class TestSubclassSafety:
         # A SUBCLASS instance whose MRO includes DiffusionStage should
         # find the original via _find_patched_ancestor's MRO walk.
         # Without that walk, type(self)=Subclass → _ORIGINALS KeyError.
+        # Trigger the fallback path via _torch_compile=True (the only
+        # remaining condition that takes the original-method branch).
         class StubSubclass(StubDiffusionStage):
             pass
 
@@ -326,9 +359,10 @@ class TestSubclassSafety:
             pass
         assert sub._build_count == 1
 
-        # Streaming path falls back — needs the MRO walk to find the
-        # original (which is on StubDiffusionStage, not StubSubclass).
-        with sub._transformer_ctx(streaming_prefetch_count=2):
+        # torch.compile path falls back — needs the MRO walk to find
+        # the original (which is on StubDiffusionStage, not StubSubclass).
+        sub._torch_compile = True
+        with sub._transformer_ctx(streaming_prefetch_count=None):
             pass
         assert sub._build_count == 2  # built again via fallback
 
