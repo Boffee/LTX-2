@@ -148,18 +148,25 @@ class TestFallthrough:
         assert snap.stats.builds == 0
         assert snap.stats.hits == 0
 
-    def test_explicit_transformer_wrapper_falls_back(self, cache: ModelCache) -> None:
+    def test_streaming_mode_falls_back(self, cache: ModelCache) -> None:
+        # Streaming bypass: BlockOffloader rejects the real LTXModel
+        # shape (direct frozen params on velocity_model), so the patch
+        # routes streaming mode to the original method (which uses
+        # LayerStreamingWrapper). Cache stays untouched.
         stage = StubDiffusionStage()
-        # Simulate an explicit user-set wrapper — patch defers to original.
-        stage._transformer_wrapper = lambda m: None  # truthy
         _wire_stub_to_cache(cache)
 
-        with stage._transformer_ctx(streaming_prefetch_count=None):
+        with stage._transformer_ctx(streaming_prefetch_count=2):
+            pass
+        with stage._transformer_ctx(streaming_prefetch_count=2):
             pass
 
-        assert stage._build_count == 1
+        # Both calls bypassed the cache — built fresh each time.
+        assert stage._build_count == 2
         snap = cache.snapshot()
-        assert snap.stats.builds == 0  # cache untouched
+        assert snap.stats.builds == 0
+        assert snap.stats.hits == 0
+        assert snap.stats.misses == 0
 
     def test_no_cache_installed_runs_original(self) -> None:
         # When the cache is None (uninstalled), patched method should
@@ -295,6 +302,58 @@ class TestInstallLifecycle:
             StubDiffusionStage, "_transformer_ctx", pi._patched_transformer_ctx,
         )
         assert StubDiffusionStage._transformer_ctx is original_method
+
+
+# ---------------------------------------------------------------------------
+# Subclass safety
+# ---------------------------------------------------------------------------
+
+
+class TestSubclassSafety:
+    def test_subclass_falls_back_via_mro(self, cache: ModelCache) -> None:
+        # Patching DiffusionStage installs originals under that class.
+        # A SUBCLASS instance whose MRO includes DiffusionStage should
+        # find the original via _find_patched_ancestor's MRO walk.
+        # Without that walk, type(self)=Subclass → _ORIGINALS KeyError.
+        class StubSubclass(StubDiffusionStage):
+            pass
+
+        _wire_stub_to_cache(cache)
+        sub = StubSubclass()
+
+        # Cached path works (no fallback needed).
+        with sub._transformer_ctx(streaming_prefetch_count=None):
+            pass
+        assert sub._build_count == 1
+
+        # Streaming path falls back — needs the MRO walk to find the
+        # original (which is on StubDiffusionStage, not StubSubclass).
+        with sub._transformer_ctx(streaming_prefetch_count=2):
+            pass
+        assert sub._build_count == 2  # built again via fallback
+
+
+# ---------------------------------------------------------------------------
+# Uninstall while active
+# ---------------------------------------------------------------------------
+
+
+class TestUninstallBusy:
+    def test_uninstall_raises_when_entry_active(self, cache: ModelCache) -> None:
+        from ltx_core.memory.pipeline_install import UninstallBusyError
+
+        _wire_stub_to_cache(cache)
+        stage = StubDiffusionStage()
+
+        with stage._transformer_ctx(streaming_prefetch_count=None):
+            # Active inside this with-block. Uninstall must fail loudly.
+            with pytest.raises(UninstallBusyError) as excinfo:
+                pi.uninstall_model_cache()
+            assert len(excinfo.value.busy_keys) == 1
+
+        # After the with-block exits, retry succeeds.
+        pi.uninstall_model_cache()
+        assert pi._INSTALLED_CACHE is None
 
 
 class _UserStrategy:
