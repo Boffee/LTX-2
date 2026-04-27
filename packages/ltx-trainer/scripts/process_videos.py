@@ -488,6 +488,27 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         audio_output_path = Path(audio_output_dir)
         audio_output_path.mkdir(parents=True, exist_ok=True)
 
+    # Skip rows whose latent files are already on disk. Latents are expensive
+    # to compute (VAE encode) but cheap to store, so caching is default-on; the
+    # paired caption embeddings are recomputed every run because they have the
+    # opposite cost profile.
+    data_root = Path(dataset_file).parent
+    keep_indices: list[int] = []
+    for idx, main_media_path in enumerate(dataset.main_media_paths):
+        rel_path = Path(main_media_path).relative_to(data_root).with_suffix(".pt")
+        video_latent_exists = (output_path / rel_path).is_file()
+        audio_latent_exists = (audio_output_path / rel_path).is_file() if with_audio else True
+        if not (video_latent_exists and audio_latent_exists):
+            keep_indices.append(idx)
+    skipped_count = len(dataset.main_media_paths) - len(keep_indices)
+    if skipped_count:
+        dataset.video_paths = [dataset.video_paths[i] for i in keep_indices]
+        dataset.main_media_paths = [dataset.main_media_paths[i] for i in keep_indices]
+        logger.info(f"Skipping {skipped_count} videos with cached latents; encoding {len(dataset)}")
+    if len(dataset) == 0:
+        logger.info(f"All videos have cached latents in {output_path} — nothing to encode")
+        return
+
     # Load video VAE encoder
     with console.status(f"[bold]Loading video VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
         vae = load_video_vae_encoder(model_path, device=torch_device, dtype=torch.bfloat16)
