@@ -367,7 +367,7 @@ def make_block_offloader(
     *,
     layers_attr: str | Sequence[str],
     blocks_to_swap: int | Sequence[int],
-    prefetch_count: int | Sequence[int] = 1,
+    prefetch_count: int | Sequence[int] = 2,
     strict_homogeneous: bool = True,
 ) -> BlockStreamingStrategy:
     """Build a :class:`BlockStreamingStrategy` for a model whose

@@ -483,7 +483,7 @@ class BlockStreamer:
         target_device: torch.device,
         *,
         blocks_to_swap: int,
-        prefetch_count: int = 1,
+        prefetch_count: int = 2,
         name: str | None = None,
         strict_homogeneous: bool = True,
     ) -> None:
