@@ -24,13 +24,18 @@ import yaml
 
 def create_dummy_data(
     data_dir: Path,
-    num_samples: int = 8,
+    num_samples: int = 2,
     video_dims: tuple[int, int, int] = (640, 352, 25),
+    with_audio: bool = False,
+    fps: int = 24,
 ) -> None:
     latents_dir = data_dir / "latents"
     conditions_dir = data_dir / "conditions"
     latents_dir.mkdir(parents=True)
     conditions_dir.mkdir(parents=True)
+    audio_latents_dir = data_dir / "audio_latents" if with_audio else None
+    if audio_latents_dir is not None:
+        audio_latents_dir.mkdir(parents=True)
 
     width, height, num_frames = video_dims
     assert num_frames % 8 == 1, f"num_frames must satisfy frames % 8 == 1, got {num_frames}"
@@ -39,13 +44,18 @@ def create_dummy_data(
     latent_h = height // 32
     latent_w = width // 32
 
+    # AudioLatentShape.from_duration with LTX-2.3 defaults (sr=16k, hop=160,
+    # latent_downsample=4) → 25 latent frames per second of waveform.
+    duration_sec = num_frames / fps
+    audio_frames = max(1, round(duration_sec * 25))
+
     for i in range(num_samples):
         latent_data = {
             "latents": torch.randn(128, latent_frames, latent_h, latent_w),
             "num_frames": latent_frames,
             "height": latent_h,
             "width": latent_w,
-            "fps": 24,
+            "fps": fps,
         }
         torch.save(latent_data, latents_dir / f"sample_{i:04d}.pt")
 
@@ -55,6 +65,15 @@ def create_dummy_data(
             "prompt_attention_mask": torch.ones(256, dtype=torch.bool),
         }
         torch.save(condition_data, conditions_dir / f"sample_{i:04d}.pt")
+
+        if audio_latents_dir is not None:
+            audio_data = {
+                "latents": torch.randn(8, audio_frames, 16),
+                "num_time_steps": audio_frames,
+                "frequency_bins": 16,
+                "duration": duration_sec,
+            }
+            torch.save(audio_data, audio_latents_dir / f"sample_{i:04d}.pt")
 
 
 def make_config(
@@ -66,6 +85,11 @@ def make_config(
     audio_learning_rate: float | None = None,
     quantization: str | None = "int8-quanto",
     video_dims: tuple[int, int, int] = (640, 352, 25),
+    lora_rank: int = 16,
+    lora_alpha: int | None = None,
+    steps: int = 3,
+    with_audio: bool = False,
+    optimizer_type: str = "adamw",
 ) -> dict:
     cfg = {
         "model": {
@@ -74,20 +98,29 @@ def make_config(
             "training_mode": "lora",
         },
         "lora": {
-            "rank": 16,
-            "alpha": 16,
-            "target_modules": ["to_k", "to_q", "to_v", "to_out.0"],
+            "rank": lora_rank,
+            "alpha": lora_alpha if lora_alpha is not None else lora_rank,
+            "target_modules": [
+                "to_k",
+                "to_q",
+                "to_v",
+                "to_out.0",
+                "ff.net.0.proj",
+                "ff.net.2",
+                "audio_ff.net.0.proj",
+                "audio_ff.net.2",
+            ],
         },
         "training_strategy": {
             "name": "text_to_video",
-            "with_audio": False,
+            "with_audio": with_audio,
         },
         "optimization": {
             "learning_rate": 1e-4,
-            "steps": 3,
+            "steps": steps,
             "batch_size": 1,
             "gradient_accumulation_steps": 1,
-            "optimizer_type": "adamw",
+            "optimizer_type": optimizer_type,
             "scheduler_type": "constant",
             "enable_gradient_checkpointing": True,
         },
@@ -268,6 +301,36 @@ def main() -> None:
         default="640x352x25",
         help="Video dims WxHxF (frames must satisfy frames%%8==1; W,H divisible by 32)",
     )
+    parser.add_argument(
+        "--lora-rank",
+        type=int,
+        default=16,
+        help="LoRA rank (also used for alpha unless --lora-alpha is given)",
+    )
+    parser.add_argument(
+        "--lora-alpha",
+        type=int,
+        default=None,
+        help="LoRA alpha (defaults to --lora-rank)",
+    )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=3,
+        help="Training steps per test case (1 is enough for OOM validation)",
+    )
+    parser.add_argument(
+        "--with-audio",
+        action="store_true",
+        help="Enable audio modality (generates dummy audio_latents and exercises video↔audio cross-attention)",
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        default="adamw",
+        choices=["adamw", "adamw8bit"],
+        help="Optimizer to use (adamw8bit matches the real audio-video LoRA config)",
+    )
     args = parser.parse_args()
     w, h, f = (int(x) for x in args.video_dims.split("x"))
     video_dims = (w, h, f)
@@ -277,7 +340,8 @@ def main() -> None:
     print(f"Working directory: {tmp_dir}")
 
     try:
-        create_dummy_data(data_dir, video_dims=video_dims)
+        num_samples = max(1, args.steps)
+        create_dummy_data(data_dir, num_samples=num_samples, video_dims=video_dims, with_audio=args.with_audio)
 
         base_kwargs = {
             "model_path": args.model_path,
@@ -294,6 +358,11 @@ def main() -> None:
             blocks_to_swap=args.blocks_to_swap,
             quantization=args.quantization,
             video_dims=video_dims,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            steps=args.steps,
+            with_audio=args.with_audio,
+            optimizer_type=args.optimizer,
         )
         results["offloading"] = run_test(
             f"block offloading (blocks_to_swap={args.blocks_to_swap})", cfg, tmp_dir
@@ -307,6 +376,11 @@ def main() -> None:
             audio_learning_rate=5e-5,
             quantization=args.quantization,
             video_dims=video_dims,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            steps=args.steps,
+            with_audio=args.with_audio,
+            optimizer_type=args.optimizer,
         )
         results["both"] = run_test("offloading + audio LR", cfg, tmp_dir)
 
