@@ -57,19 +57,26 @@ TMPFS_PREFIX = "ltx-shard-conditions-"
 _SCHEDULER_TOTAL_KEY: dict[str, str] = {
     "linear": "total_iters",
     "cosine": "T_max",
+    "cosine_with_warmup": "T_max",
     "polynomial": "total_iters",
     "cosine_with_restarts": "T_0",
 }
 
 
-def _scheduler_default_from_total(scheduler_type: str, total_steps: int) -> int:
+def _scheduler_default_from_total(
+    scheduler_type: str, total_steps: int, params: dict | None = None
+) -> int:
     """Default value to inject for the scheduler's sizing parameter, given
     the full run length. Mirrors the trainer's non-sharded defaults: for
     most schedulers the curve length equals ``total_steps``, but
     ``cosine_with_restarts`` uses ``T_0 = steps // 4`` — a restart cycle
-    length, not a run total — so we preserve that meaning."""
+    length, not a run total — so we preserve that meaning. ``cosine_with_warmup``
+    pins the cosine phase length, so the default subtracts the warmup."""
     if scheduler_type == "cosine_with_restarts":
         return total_steps // 4
+    if scheduler_type == "cosine_with_warmup":
+        warmup_steps = (params or {}).get("warmup_steps", min(300, max(1, total_steps // 20)))
+        return max(1, total_steps - warmup_steps)
     return total_steps
 
 
@@ -308,7 +315,12 @@ class ShardOrchestrator:
         key = _SCHEDULER_TOTAL_KEY.get(cfg.optimization.scheduler_type)
         if key is not None:
             params = dict(cfg.optimization.scheduler_params)
-            default = _scheduler_default_from_total(cfg.optimization.scheduler_type, total_steps)
+            # cosine_with_warmup pins both warmup_steps and T_max so the trainer's
+            # per-shard default (steps // 20 — small under sharding) doesn't
+            # silently undercut the curve length pinned for the full run.
+            if cfg.optimization.scheduler_type == "cosine_with_warmup":
+                params.setdefault("warmup_steps", min(300, max(1, total_steps // 20)))
+            default = _scheduler_default_from_total(cfg.optimization.scheduler_type, total_steps, params)
             params.setdefault(key, default)  # user override wins
             cfg.optimization.scheduler_params = params
 

@@ -874,6 +874,11 @@ class LtxvTrainer:
         elif scheduler_type == "cosine_with_warmup":
             warmup_steps = params.pop("warmup_steps", min(300, max(1, steps // 20)))
             eta_min = params.pop("eta_min", 0)
+            # T_max is the cosine phase length and must span the whole run
+            # post-warmup. Under sharded training, ``steps`` is per-shard, so the
+            # orchestrator pins this via scheduler_params; standalone training
+            # falls back to ``steps - warmup_steps``.
+            t_max = params.pop("T_max", max(1, steps - warmup_steps))
             warmup = LinearLR(
                 optimizer,
                 start_factor=params.pop("warmup_start_factor", 1e-3),
@@ -882,7 +887,7 @@ class LtxvTrainer:
             )
             cosine = CosineAnnealingLR(
                 optimizer,
-                T_max=max(1, steps - warmup_steps),
+                T_max=t_max,
                 eta_min=eta_min,
                 **params,
             )
