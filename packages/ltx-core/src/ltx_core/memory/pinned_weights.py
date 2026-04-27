@@ -1,7 +1,7 @@
 """Whole-model pinned-CPU weight cache for fast bulk DMA to GPU.
 
 Holds a model's frozen weights in pinned CPU memory so subsequent GPU
-loads are bulk DMA (~200 ms for a 12 GB Gemma at PCIe Gen5 x16) instead
+loads are bulk DMA (~200 ms for a 12 GB text encoder at PCIe Gen5 x16) instead
 of re-reading the safetensors from disk (~3-5 s per call).
 
 Use case: a model that fits on GPU when active but should be evicted
@@ -12,12 +12,12 @@ streaming, no forward hooks, no LRU. The whole model goes to GPU on
 :meth:`PinnedWeights.deactivate` by repointing each module's parameter
 slot back at a Parameter that wraps pinned CPU storage.
 
-Implements :class:`~ltx_core.memory.strategy.ModelStrategy` so it plugs
+Implements :class:`~block_offload.strategy.ModelStrategy` so it plugs
 into a model cache directly.
 
 Cross-cutting compatibility caveats (``torch.compile`` incompatibility,
 DDP/FSDP wrap-before requirement, single-thread contract) live in the
-:mod:`~ltx_core.memory` package docstring.
+:mod:`~block_offload` package docstring.
 
 Class-specific caveats
 ----------------------
@@ -61,8 +61,8 @@ from typing import Any
 import torch
 from torch import nn
 
-from ltx_core.memory.pinned_buffer import PinnedParamBuffer, storage_key
-from ltx_core.memory.strategy import SlotOwnership
+from .pinned_buffer import PinnedParamBuffer, storage_key
+from .strategy import SlotOwnership
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ def _set_buffer(module: nn.Module, name: str, value: torch.Tensor, persistent: b
 class PinnedWeights:
     """Whole-model pinned-CPU weight cache with bulk GPU transfer.
 
-    Implements :class:`~ltx_core.memory.strategy.ModelStrategy`.
+    Implements :class:`~block_offload.strategy.ModelStrategy`.
 
     On construction, every frozen parameter slot is replaced with a
     Parameter wrapping pinned CPU storage (handling quanto decomposition
@@ -260,7 +260,7 @@ class PinnedWeights:
                 "PinnedWeights requires at least one frozen parameter or, "
                 "when include_buffers=True, at least one registered buffer "
                 "to cache. The wrapped model has neither — for training "
-                "flows use ltx_core.memory.make_block_offloader instead, or "
+                "flows use block_offload.make_block_offloader instead, or "
                 "leave the model unwrapped."
             )
 

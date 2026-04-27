@@ -9,7 +9,7 @@ ordered list of components — typically:
 2. A :class:`TrainableMover` that moves LoRA / adapter weights to GPU
    on activate and back to CPU on deactivate.
 3. One :class:`BlockStreamer` per homogeneous block list (single-list
-   models like LTX use one; heterogeneous ones like Flux use two:
+   models use one; heterogeneous ones like Flux use two:
    ``transformer_blocks`` + ``single_transformer_blocks``).
 
 Activate iterates the components in order; deactivate reverses
@@ -36,10 +36,10 @@ from typing import Any
 import torch
 from torch import nn
 
-from ltx_core.memory.block_streamer import BlockStreamer
-from ltx_core.memory.pinned_buffer import storage_key
-from ltx_core.memory.pinned_weights import PinnedWeights
-from ltx_core.memory.strategy import SlotOwnership
+from .block_streamer import BlockStreamer
+from .pinned_buffer import storage_key
+from .pinned_weights import PinnedWeights
+from .strategy import SlotOwnership
 
 logger = logging.getLogger(__name__)
 
@@ -259,7 +259,7 @@ def detect_streaming_region_ties(  # noqa: PLR0912, PLR0915 (3-category check is
 
 
 class BlockStreamingStrategy:
-    """A :class:`~ltx_core.memory.strategy.ModelStrategy` that streams
+    """A :class:`~block_offload.strategy.ModelStrategy` that streams
     one or more block lists, plus pins everything else, plus moves
     trainable params, by composing an ordered list of components.
 

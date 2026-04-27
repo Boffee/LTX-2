@@ -1,7 +1,7 @@
 """Pinned-CPU storage primitive shared between ``block_offloader``
 (per-block streaming) and ``pinned_weights`` (whole-model bulk).
 
-Internal to the ``ltx_core.memory`` subpackage. Not part of the public
+Internal to the ``block_offload`` subpackage. Not part of the public
 API, but lives in its own module so both consumers can reach it without
 crossing each other's private namespaces.
 
@@ -45,9 +45,9 @@ def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
     and (for quanto) the same quant metadata; they can be deduplicated
     into a single :class:`PinnedParamBuffer`.
 
-    Used by both :class:`~ltx_core.memory.PinnedWeights` (for handle-
+    Used by both :class:`~block_offload.PinnedWeights` (for handle-
     level dedup of tied frozen params) and
-    :func:`~ltx_core.memory.make_block_offloader` (for cross-region tied-
+    :func:`~block_offload.make_block_offloader` (for cross-region tied-
     weight detection across blocks and non-block modules).
 
     Note: pure storage identity is not sufficient — two views into the

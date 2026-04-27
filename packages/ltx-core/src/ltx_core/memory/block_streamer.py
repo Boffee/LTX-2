@@ -12,10 +12,10 @@ This is the sharp, low-level primitive. It does NOT manage:
   modules) — caller composes :class:`PinnedWeights` with the
   streamer's :attr:`slot_filter` for that.
 - Trainable parameter movement — caller handles a separate
-  :class:`~ltx_core.memory.block_compose.TrainableMover`.
+  :class:`~block_offload.block_compose.TrainableMover`.
 - Cross-region tied-weight detection — that's a composer concern
   (see :func:`make_block_offloader` /
-  :class:`~ltx_core.memory.block_compose.BlockStreamingStrategy`).
+  :class:`~block_offload.block_compose.BlockStreamingStrategy`).
 
 Most users want :func:`make_block_offloader` (the blessed safe
 API). Reach for :class:`BlockStreamer` directly only when you need
@@ -37,8 +37,8 @@ from typing import Any
 import torch
 from torch import nn
 
-from ltx_core.memory.pinned_buffer import PinnedParamBuffer
-from ltx_core.memory.strategy import SlotOwnership
+from .pinned_buffer import PinnedParamBuffer
+from .strategy import SlotOwnership
 
 logger = logging.getLogger(__name__)
 
@@ -425,16 +425,16 @@ class BlockStreamer:
     are the composer's responsibility.
 
     A :class:`BlockStreamer` is a *component* meant to be composed
-    inside a :class:`~ltx_core.memory.block_compose.BlockStreamingStrategy`.
+    inside a :class:`~block_offload.block_compose.BlockStreamingStrategy`.
     It deliberately does NOT implement
-    :class:`~ltx_core.memory.strategy.ModelStrategy` (its
+    :class:`~block_offload.strategy.ModelStrategy` (its
     :meth:`activate` returns ``None`` because it doesn't own the
     model). For top-level use, build a strategy via
-    :func:`~ltx_core.memory.block_compose.make_block_offloader`.
+    :func:`~block_offload.block_compose.make_block_offloader`.
 
     Lifecycle is uniform with :class:`PinnedWeights`: ``__init__``
     pins (so ``cache_bytes`` is final at construction time, ready
-    for :class:`~ltx_core.memory.model_cache.ModelCache` admission),
+    for :class:`~block_offload.model_cache.ModelCache` admission),
     ``activate`` brings to GPU, ``deactivate`` returns slots to
     pinned CPU and removes hooks. There is no ``close()``; pinned
     memory in module slots is freed when the caller drops the

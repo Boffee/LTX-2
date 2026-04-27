@@ -54,7 +54,7 @@ This library gives you:
 
 ```python
 import torch
-from ltx_core.memory import PinnedWeights
+from block_offload import PinnedWeights
 
 model = build_my_model()  # any nn.Module with frozen params
 strategy = PinnedWeights(model, target_device=torch.device("cuda"))
@@ -86,7 +86,7 @@ and a CUDA-stream-based async prefetcher.
 
 ```python
 import torch
-from ltx_core.memory import make_block_offloader
+from block_offload import make_block_offloader
 
 # Constructor pins everything; cache_bytes is final immediately.
 strategy = make_block_offloader(
@@ -134,7 +134,7 @@ yourself and hand them to `BlockStreamingStrategy` directly.
 For multiple independent models swapping in and out of GPU.
 
 ```python
-from ltx_core.memory import ModelCache, ModelSpec, PinnedWeights
+from block_offload import ModelCache, ModelSpec, PinnedWeights
 
 cache = ModelCache(max_cache_bytes=80 * 1024**3)
 
@@ -318,59 +318,8 @@ snap.stats.peak_cache_bytes  # high-water mark
 ```
 
 `ModelCacheSnapshot`, `ModelCacheStats`, and `ModelInfo` are direct
-imports from `ltx_core.memory.model_cache` (not re-exported at the
+imports from `block_offload.model_cache` (not re-exported at the
 package level — they're observability types, not the typical
 acquire/use path).
 
-## Integrations
-
-### `ltx-pipelines` (optional)
-
-A monkey-patch installer routes `DiffusionStage._transformer_ctx` and
-`PromptEncoder._text_encoder_ctx` through a `ModelCache` with zero
-edits to the upstream `ltx-pipelines` source.
-
-```python
-from ltx_core.memory import ModelCache
-from ltx_core.memory.pipeline_install import install_model_cache
-from ltx_pipelines import TI2VidOneStagePipeline
-
-cache = ModelCache(max_cache_bytes=80 * 1024**3)
-install_model_cache(cache)
-
-pipeline = TI2VidOneStagePipeline(...)
-for prompt in prompts:
-    pipeline(prompt)  # text encoder + transformer cached across calls
-```
-
-Cache entries are keyed by block-instance object identity, so reusing
-a pipeline gets cache hits across calls; constructing a new pipeline
-gets a fresh entry. When a pipeline is garbage-collected, its cache
-entries are auto-evicted via `weakref.finalize`.
-
-Strategy choice per component:
-
-- **Transformer** follows the pipeline's `streaming_prefetch_count`
-  kwarg. `None` → PinnedWeights (whole-model bulk DMA); `int` →
-  make_block_offloader(prefetch_count=N). Cache key includes `stream{N}` vs
-  `pinned` so toggling produces distinct entries.
-- **Text encoder** always uses PinnedWeights. The pipeline's
-  `streaming_prefetch_count` kwarg is ignored for the text encoder
-  because text encoders fit on GPU and per-block streaming overhead
-  doesn't amortize over a single-shot encode call.
-
-`torch_compile=True` falls back to the original (non-cached) path
-because slot-swap is incompatible with compile's tensor-identity
-tracking.
-
-To uninstall:
-
-```python
-from ltx_core.memory.pipeline_install import uninstall_model_cache
-uninstall_model_cache()
-```
-
-`uninstall_model_cache()` raises `UninstallBusyError` (subclass of
-`ModelInUseError`) if any installer-owned entry is currently active —
-exit your `cache.use(...)` contexts and retry.
 

@@ -19,7 +19,7 @@ Two complementary offload strategies:
   CPU storage and the GPU storage is released by refcount.
 
 Both classes share the underlying per-parameter pinned storage from
-:class:`~ltx_core.memory.pinned_buffer.PinnedParamBuffer` (clone + pin
+:class:`~block_offload.pinned_buffer.PinnedParamBuffer` (clone + pin
 + optional quanto ``WeightQBytesTensor`` decomposition), so quantized
 models work with either.
 
@@ -38,8 +38,8 @@ everything to GPU; ``deactivate()`` returns to pinned CPU.
 that composes (in order):
   1. A non-block :class:`PinnedWeights` with a :class:`SlotOwnership`
      skip filter for everything outside the block list (sibling
-     modules + direct parent-module state like LTX's
-     ``velocity_model.scale_shift_table``).
+     modules + direct parent-module state, e.g. an unembedding head
+     or a learnable bias attached to the model root).
   2. A :class:`TrainableMover` for LoRA / adapter weights.
   3. One :class:`BlockStreamer` per ``layers_attr`` path.
 
@@ -69,21 +69,18 @@ Compatibility
 - **Single-thread / sequential.** No internal locking; concurrent use
   on the same strategy or cache is undefined behavior.
 
-Designed as a self-contained subpackage so it can be lifted out into
-its own library when a second consumer appears. The core strategy and
-cache modules avoid pipeline imports; the optional
-:mod:`~ltx_core.memory.pipeline_install` integration module imports
-``ltx_pipelines`` lazily at install time and is the only piece tied
-to the LTX repo layout.
+Designed as a self-contained, model-agnostic library — pipeline-specific
+glue (e.g. monkey-patching upstream pipeline classes to route
+construction through the cache) belongs in the consumer, not here.
 """
 
-from ltx_core.memory.block_compose import (
+from .block_compose import (
     BlockStreamingStrategy,
     TrainableMover,
     make_block_offloader,
 )
-from ltx_core.memory.block_streamer import BlockStreamer
-from ltx_core.memory.model_cache import (
+from .block_streamer import BlockStreamer
+from .model_cache import (
     ActivationError,
     DuplicateModelKeyError,
     ModelCache,
@@ -93,13 +90,13 @@ from ltx_core.memory.model_cache import (
     ModelSpec,
     ModelTooLargeError,
 )
-from ltx_core.memory.pinned_weights import PinnedWeights
-from ltx_core.memory.strategy import ModelStrategy, SlotOwnership
+from .pinned_weights import PinnedWeights
+from .strategy import ModelStrategy, SlotOwnership
 
 # `ModelCacheSnapshot`, `ModelCacheStats`, and `ModelInfo` are observability
 # types — used by callers who introspect cache state, not the typical
 # acquire/use path. Import them directly from
-# `ltx_core.memory.model_cache` when needed.
+# `block_offload.model_cache` when needed.
 
 __all__ = [
     "ActivationError",
