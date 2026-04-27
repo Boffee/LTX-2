@@ -289,7 +289,7 @@ def compute_captions_embeddings(  # noqa: PLR0913
         batch_size = 1
 
     # Create dataloader
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
     # Process batches
     total_batches = len(dataloader)

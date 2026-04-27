@@ -537,7 +537,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     if with_audio and batch_size > 1:
         logger.warning("Audio processing requires batch_size=1. Overriding batch_size to 1.")
         batch_size = 1
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=8)
 
     # Track audio statistics
     audio_success_count = 0
