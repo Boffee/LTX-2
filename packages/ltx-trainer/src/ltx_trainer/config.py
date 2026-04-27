@@ -138,6 +138,7 @@ class OptimizationConfig(ConfigBaseModel):
         "constant",
         "linear",
         "cosine",
+        "cosine_with_warmup",
         "cosine_with_restarts",
         "polynomial",
         "step",

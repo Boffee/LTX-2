@@ -24,6 +24,7 @@ from torch.optim.lr_scheduler import (
     LinearLR,
     LRScheduler,
     PolynomialLR,
+    SequentialLR,
     StepLR,
 )
 from torch.utils.data import DataLoader
@@ -870,6 +871,22 @@ class LtxvTrainer:
                 eta_min=params.pop("eta_min", 0),
                 **params,
             )
+        elif scheduler_type == "cosine_with_warmup":
+            warmup_steps = params.pop("warmup_steps", min(300, max(1, steps // 20)))
+            eta_min = params.pop("eta_min", 0)
+            warmup = LinearLR(
+                optimizer,
+                start_factor=params.pop("warmup_start_factor", 1e-3),
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            cosine = CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, steps - warmup_steps),
+                eta_min=eta_min,
+                **params,
+            )
+            scheduler = SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps])
         elif scheduler_type == "cosine_with_restarts":
             scheduler = CosineAnnealingWarmRestarts(
                 optimizer,
