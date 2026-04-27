@@ -43,6 +43,25 @@ from ltx_core.memory.strategy import SlotOwnership
 logger = logging.getLogger(__name__)
 
 
+def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
+    # Process-wide PyTorch CUDA allocator cache is the only state the
+    # refcount-based GC of a streamer can't release on its own. Without
+    # this, freed pinned/GPU pages stay held by the allocator until the
+    # next allocation pressure event, which manifests as OOMs at
+    # workload boundaries (e.g. successive trainers in one process).
+    # ``empty_cache()`` is process-global (not per-device), so a single
+    # bool is the right abstraction — capturing the device object would
+    # imply per-device scoping that PyTorch doesn't actually provide.
+    if not is_cuda:
+        return
+    try:
+        torch.cuda.empty_cache()
+    except Exception:
+        # Finalizers can run at interpreter shutdown when CUDA is
+        # already torn down — swallow rather than spam tracebacks.
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Pre-allocated GPU buffer pool
 # ---------------------------------------------------------------------------
@@ -510,6 +529,14 @@ class BlockStreamer:
         self._pending: dict[int, Future[None]] = {}
         self._prefetch_events: dict[int, torch.cuda.Event] = {}
         self._last_idx: int = -1
+
+        # Auto-flush the CUDA allocator cache when the streamer is GC'd,
+        # so callers don't need to remember an explicit empty_cache() at
+        # workload boundaries. Captures only a bool (no self ref) so it
+        # never blocks collection.
+        weakref.finalize(
+            self, _release_cuda_cache_on_drop, target_device.type == "cuda"
+        )
 
     @property
     def slot_filter(self) -> frozenset[SlotOwnership]:

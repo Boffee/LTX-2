@@ -179,8 +179,10 @@ def run_test(name: str, config: dict, tmp_dir: Path) -> bool:
     print(f"TEST: {name}")
     print(f"{'=' * 60}")
 
+    trainer = None
     try:
         from ltx_trainer.config import LtxTrainerConfig
+        from ltx_trainer.shard_orchestrator import tear_down_trainer
         from ltx_trainer.trainer import LtxvTrainer
 
         trainer_config = LtxTrainerConfig(**config)
@@ -234,24 +236,9 @@ def run_test(name: str, config: dict, tmp_dir: Path) -> bool:
         traceback.print_exc()
         return False
     finally:
-        # Explicit teardown: drop the trainer's strategy + heavy model
-        # refs so refcount-GC frees them before the next test starts.
-        # Without this, PyTorch's CUDA cache holds onto the previous
-        # trainer's allocations and the next test OOMs on small GPUs.
-        import gc
-        if "trainer" in locals():
-            offloader = getattr(trainer, "_block_offloader", None)
-            if offloader is not None:
-                offloader.deactivate()
-                trainer._block_offloader = None
-            for attr in ("_transformer", "_optimizer", "_text_encoder",
-                         "_embeddings_processor", "_vae_decoder", "_vae_encoder"):
-                if hasattr(trainer, attr):
-                    setattr(trainer, attr, None)
+        if trainer is not None:
+            tear_down_trainer(trainer)
             del trainer
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
 
 def main() -> None:

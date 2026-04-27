@@ -98,34 +98,29 @@ def _parse_resolution_buckets(s: str) -> list[tuple[int, int, int]]:
     return out
 
 
-def _tear_down_trainer(trainer: "LtxvTrainer") -> None:
+def tear_down_trainer(trainer: "LtxvTrainer") -> None:
     """Release shard-trainer GPU/pinned memory so the next shard can
-    construct cleanly.
-
-    The block offloader registers forward-pre hooks on transformer
-    block modules. The hook closures use ``weakref.ref(streamer)`` so
-    the strategy itself can be refcount-freed, but the model still
-    holds the hooks and pinned slot mutations until both the model
-    and strategy references are dropped. We do that here, then
-    explicitly run ``gc.collect()`` + ``torch.cuda.empty_cache()`` to
-    return CUDA cache memory to the allocator before shard N+1 starts
-    loading.
+    construct cleanly. Drops every trainer attr that holds GPU state,
+    then drops the block offloader last so its streamer finalizer
+    flushes the allocator cache *after* the optimizer/model
+    allocations are also freed.
     """
     try:
-        import torch
-
         offloader = getattr(trainer, "_block_offloader", None)
         if offloader is not None:
             offloader.deactivate()  # remove hooks, return slots to pinned-CPU
-            trainer._block_offloader = None  # drop strategy ref
-        # Drop the model + optimizer refs too — they hold the pinned slots.
-        for attr in ("_transformer", "_optimizer", "_text_encoder",
-                     "_embeddings_processor", "_vae_decoder", "_vae_encoder"):
+        # Drop optimizer/scheduler/model refs first so their tensors are
+        # freed back to the allocator before the streamer's finalizer
+        # runs ``empty_cache()`` (which fires when ``_block_offloader``
+        # is dropped below).
+        for attr in ("_optimizer", "_lr_scheduler", "_transformer",
+                     "_text_encoder", "_embeddings_processor",
+                     "_vae_decoder", "_vae_encoder"):
             if hasattr(trainer, attr):
                 setattr(trainer, attr, None)
+        if offloader is not None:
+            trainer._block_offloader = None  # triggers streamer finalize
         gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
     except Exception as e:  # noqa: BLE001
         logger.warning(f"⚠️  Trainer teardown encountered {type(e).__name__}: {e}")
 
@@ -518,14 +513,12 @@ class ShardOrchestrator:
                     _, last_checkpoint = self._latest_saved_checkpoint()
                     seen_initial = True
                     # Tear down the shard's trainer explicitly before the
-                    # next shard creates a new one. The block offloader's
-                    # forward-pre hooks form a cycle with the transformer
-                    # blocks (module → hook → closure → module), so the
-                    # trainer isn't reclaimed by refcount-only GC when the
-                    # loop rebinds ``trainer`` on the next iteration. Without
-                    # this, shard 2's model load OOMs on top of the still-
-                    # resident shard 1 parameters/optimizer state.
-                    _tear_down_trainer(trainer)
+                    # next shard creates a new one. Forces ``gc.collect()``
+                    # so any PEFT/accelerator-introduced cycles are broken
+                    # immediately and the streamer's finalizer flushes the
+                    # CUDA cache before shard 2 loads, instead of waiting
+                    # for the cycle collector to run on its own schedule.
+                    tear_down_trainer(trainer)
                     del trainer
 
                 if cumulative_target >= total_steps:
