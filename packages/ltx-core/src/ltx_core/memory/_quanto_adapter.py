@@ -182,14 +182,6 @@ class QuantoAdapter:
         dst.scale.copy_(src.scale, non_blocking=non_blocking)
 
     @staticmethod
-    def copy_back(src: _QuantoGpu, dst: _QuantoPinned) -> None:
-        # Quanto is inference-only — copy_back is only reached if a
-        # caller mistakenly enabled it for a quanto slot. Defensive
-        # round-trip so the deactivated state mirrors the GPU side.
-        dst.data.copy_(src.data, non_blocking=False)
-        dst.scale.copy_(src.scale, non_blocking=False)
-
-    @staticmethod
     def cache_bytes(state: _QuantoPinned) -> int:
         return (
             state.data.numel() * state.data.element_size()

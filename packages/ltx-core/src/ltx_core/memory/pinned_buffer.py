@@ -61,38 +61,28 @@ class PinnedParamBuffer:
     (:attr:`cpu_param`).
 
     The lifecycle methods (:meth:`allocate_gpu_storage`,
-    :meth:`make_gpu_param`, :meth:`copy_to_gpu`, :meth:`copy_back`,
-    :meth:`load_to_gpu`) all dispatch through the adapter. Consumers
-    work with the opaque :class:`GpuState` returned by
-    :meth:`allocate_gpu_storage`; the buffer round-trips that opaque
-    handle through subsequent calls.
+    :meth:`make_gpu_param`, :meth:`copy_to_gpu`, :meth:`load_to_gpu`)
+    all dispatch through the adapter. Consumers work with the opaque
+    :class:`GpuState` returned by :meth:`allocate_gpu_storage`; the
+    buffer round-trips that opaque handle through subsequent calls.
 
-    ``copy_back`` is required when the GPU-side parameter has been
-    mutated in place (training step, mutable buffer in train mode) and
-    the deactivated host state must reflect those updates before the
-    next activate. Callers set ``copy_back=True`` per-buffer at
-    construction time when the slot is trainable or otherwise mutates.
+    Frozen-only by design — callers slot-replace with the buffer's
+    :attr:`cpu_param` / pool ``gpu_param``, which orphans any pre-wrap
+    Parameter identity. Trainable params should be routed elsewhere.
     """
 
-    __slots__ = ("adapter", "copy_back_enabled", "cpu_param", "name", "pinned_state")
+    __slots__ = ("adapter", "cpu_param", "name", "pinned_state")
 
-    def __init__(
-        self,
-        name: str,
-        param: nn.Parameter,
-        *,
-        copy_back: bool = False,
-    ) -> None:
+    def __init__(self, name: str, param: nn.Parameter) -> None:
         self.name = name
         self.adapter: type[TensorAdapter] = select_adapter(param.data)
         self.pinned_state = self.adapter.clone_pin(param.data)
         self.cpu_param: nn.Parameter = self.adapter.cpu_param(self.pinned_state)
-        self.copy_back_enabled: bool = copy_back
 
     def allocate_gpu_storage(self, device: torch.device) -> Any:
         """Allocate empty GPU storage mirroring this buffer's layout.
         Returns an opaque adapter-specific handle; pass it back to
-        :meth:`make_gpu_param`, :meth:`copy_to_gpu`, and :meth:`copy_back`."""
+        :meth:`make_gpu_param` and :meth:`copy_to_gpu`."""
         return self.adapter.alloc_gpu(self.pinned_state, device)
 
     def make_gpu_param(self, gpu_state: Any) -> nn.Parameter:
@@ -104,13 +94,6 @@ class PinnedParamBuffer:
     def copy_to_gpu(self, gpu_state: Any, *, non_blocking: bool = False) -> None:
         """Bulk DMA pinned host bytes into pre-allocated GPU storage."""
         self.adapter.copy_to_gpu(self.pinned_state, gpu_state, non_blocking=non_blocking)
-
-    def copy_back(self, gpu_state: Any) -> None:
-        """Copy live GPU bytes back into pinned host state. No-op when
-        :attr:`copy_back_enabled` is False (frozen params don't need it).
-        Called on deactivate for buffers wrapping mutable params."""
-        if self.copy_back_enabled:
-            self.adapter.copy_back(gpu_state, self.pinned_state)
 
     def load_to_gpu(
         self, device: torch.device, non_blocking: bool = False

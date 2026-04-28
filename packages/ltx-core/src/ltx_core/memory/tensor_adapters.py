@@ -119,13 +119,6 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
         ...
 
     @staticmethod
-    def copy_back(src: GpuStateT, dst: PinnedStateT) -> None:
-        """Copy live GPU bytes back into the pinned host state. Required
-        when the model has mutated ``p.data`` on GPU (training step) and
-        the deactivated state must reflect those updates."""
-        ...
-
-    @staticmethod
     def cache_bytes(state: PinnedStateT) -> int:
         """Total bytes this state consumes in host memory. Used by
         :class:`ModelCache` for budget accounting."""
@@ -223,12 +216,6 @@ class RegularAdapter:
         src: _RegularPinned, dst: _RegularGpu, *, non_blocking: bool = False
     ) -> None:
         dst.data.copy_(src.data, non_blocking=non_blocking)
-
-    @staticmethod
-    def copy_back(gpu_state: _RegularGpu, dst: _RegularPinned) -> None:
-        # Blocking copy: callers run this on deactivate, where they
-        # need the host buffer up-to-date before the next activate.
-        dst.data.copy_(gpu_state.data, non_blocking=False)
 
     @staticmethod
     def cache_bytes(state: _RegularPinned) -> int:
