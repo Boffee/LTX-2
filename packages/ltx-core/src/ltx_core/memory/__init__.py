@@ -80,6 +80,7 @@ from .block_compose import (
     make_block_offloader,
 )
 from .block_streamer import BlockStreamer
+from .merged_lora import LoRABundle, LoRALayerFactors, MergedLoRAStrategy
 from .model_cache import (
     ActivationError,
     DuplicateModelKeyError,
@@ -103,6 +104,9 @@ __all__ = [
     "BlockStreamer",
     "BlockStreamingStrategy",
     "DuplicateModelKeyError",
+    "LoRABundle",
+    "LoRALayerFactors",
+    "MergedLoRAStrategy",
     "ModelCache",
     "ModelCacheError",
     "ModelInUseError",
