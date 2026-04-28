@@ -19,7 +19,7 @@ of the package (:class:`PinnedParamBuffer`, :class:`PinnedWeights`,
 :class:`BlockStreamer`) is type-agnostic and dispatches through
 :func:`select_adapter`.
 
-This module is internal to :mod:`block_offload`. Adapters are registered
+This module is internal to :mod:`ltx_core.memory`. Adapters are registered
 at module import time; new types can be added by writing a new adapter
 class and calling :func:`register_adapter`.
 """

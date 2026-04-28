@@ -276,7 +276,7 @@ def detect_streaming_region_ties(  # noqa: PLR0912, PLR0915 (3-category check is
 
 
 class BlockStreamingStrategy:
-    """A :class:`~block_offload.strategy.ModelStrategy` that streams
+    """A :class:`~ltx_core.memory.strategy.ModelStrategy` that streams
     one or more block lists, plus pins everything else, plus moves
     trainable params, by composing an ordered list of components.
 

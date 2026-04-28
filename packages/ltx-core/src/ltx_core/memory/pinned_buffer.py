@@ -1,6 +1,6 @@
 """Per-parameter pinned-CPU storage primitive.
 
-Internal to the ``block_offload`` subpackage. Shared by
+Internal to the ``ltx_core.memory`` subpackage. Shared by
 :class:`PinnedWeights` (whole-model bulk pin) and :class:`BlockStreamer`
 (per-block streaming). Both consumers reach this through the same
 abstraction so the addition of new tensor types only requires writing
@@ -40,9 +40,9 @@ def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
     and (for quanto) the same quant metadata; they can be deduplicated
     into a single :class:`PinnedParamBuffer`.
 
-    Used by :class:`~block_offload.PinnedWeights` (for handle-level
+    Used by :class:`~ltx_core.memory.PinnedWeights` (for handle-level
     dedup of tied frozen params) and
-    :func:`~block_offload.make_block_offloader` (for cross-region
+    :func:`~ltx_core.memory.make_block_offloader` (for cross-region
     tied-weight detection across blocks and non-block modules).
 
     Dispatches to the matching adapter so each tensor type contributes

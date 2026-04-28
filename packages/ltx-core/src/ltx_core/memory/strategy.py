@@ -3,12 +3,12 @@
 A :class:`ModelStrategy` owns one model plus the resources needed to
 make it usable for compute (pinned CPU buffers, GPU slot pools, forward
 hooks, mmap regions, etc.). It is the plug-in contract used by
-:class:`~block_offload.model_cache.ModelCache` so the manager does not
+:class:`~ltx_core.memory.model_cache.ModelCache` so the manager does not
 need to know how any particular strategy works.
 
-Implementations in this package: :class:`~block_offload.PinnedWeights`
+Implementations in this package: :class:`~ltx_core.memory.PinnedWeights`
 (whole-model bulk DMA between pinned CPU and GPU) and
-:func:`~block_offload.make_block_offloader` (block-level streaming for
+:func:`~ltx_core.memory.make_block_offloader` (block-level streaming for
 models too big for GPU). Future strategies (disk-mmap, NVMe-paged,
 multi-GPU shard) just have to satisfy this protocol.
 
@@ -16,7 +16,7 @@ Lifecycle
 ---------
 ``__init__`` sets up backing storage (pinning, etc.) so
 ``cache_bytes`` is final immediately and the strategy is ready for
-:class:`~block_offload.model_cache.ModelCache` admission →
+:class:`~ltx_core.memory.model_cache.ModelCache` admission →
 ``activate()`` (make model usable, returns the ``nn.Module``) →
 ``deactivate()`` (release transient compute resources, keep
 ``cache_bytes`` resident).

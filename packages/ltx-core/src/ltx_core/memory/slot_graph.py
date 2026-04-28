@@ -3,7 +3,7 @@ model and producing :class:`SlotOwnership` identities.
 
 A "slot" is a ``(parent_module, leaf_name, kind)`` triple identifying
 where a parameter or buffer lives in a module tree (see
-:class:`~block_offload.strategy.SlotOwnership`). The streaming and
+:class:`~ltx_core.memory.strategy.SlotOwnership`). The streaming and
 pinning components in this package all need to walk a model and resolve
 each named parameter/buffer back to its slot. This module owns that walk
 so the four-way duplication across ``pinned_weights``, ``block_streamer``,
@@ -29,10 +29,8 @@ from .strategy import SlotOwnership
 __all__ = [
     "BufferSlot",
     "ParamSlot",
-    "buffer_slot_for",
     "iter_buffer_slots",
     "iter_param_slots",
-    "param_slot_for",
 ]
 
 
@@ -100,22 +98,6 @@ def iter_buffer_slots(module: nn.Module) -> Iterator[BufferSlot]:
             parent=parent,
             leaf=leaf,
         )
-
-
-def param_slot_for(module: nn.Module, qual_name: str) -> SlotOwnership:
-    """Resolve a single qualified parameter name to its
-    :class:`SlotOwnership`. Use when iterating yields too much."""
-    modules_map = dict(module.named_modules(remove_duplicate=False))
-    parent, leaf = _resolve_parent_leaf(module, modules_map, qual_name)
-    return SlotOwnership(id(parent), leaf, "param")
-
-
-def buffer_slot_for(module: nn.Module, qual_name: str) -> SlotOwnership:
-    """Resolve a single qualified buffer name to its
-    :class:`SlotOwnership`."""
-    modules_map = dict(module.named_modules(remove_duplicate=False))
-    parent, leaf = _resolve_parent_leaf(module, modules_map, qual_name)
-    return SlotOwnership(id(parent), leaf, "buffer")
 
 
 def _resolve_parent_leaf(

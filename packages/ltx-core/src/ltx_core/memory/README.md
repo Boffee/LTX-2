@@ -54,7 +54,7 @@ This library gives you:
 
 ```python
 import torch
-from block_offload import PinnedWeights
+from ltx_core.memory import PinnedWeights
 
 model = build_my_model()  # any nn.Module with frozen params
 strategy = PinnedWeights(model, target_device=torch.device("cuda"))
@@ -86,7 +86,7 @@ and a CUDA-stream-based async prefetcher.
 
 ```python
 import torch
-from block_offload import make_block_offloader
+from ltx_core.memory import make_block_offloader
 
 # Constructor pins everything; cache_bytes is final immediately.
 strategy = make_block_offloader(
@@ -134,7 +134,7 @@ yourself and hand them to `BlockStreamingStrategy` directly.
 For multiple independent models swapping in and out of GPU.
 
 ```python
-from block_offload import ModelCache, ModelSpec, PinnedWeights
+from ltx_core.memory import ModelCache, ModelSpec, PinnedWeights
 
 cache = ModelCache(max_cache_bytes=80 * 1024**3)
 
@@ -318,7 +318,7 @@ snap.stats.peak_cache_bytes  # high-water mark
 ```
 
 `ModelCacheSnapshot`, `ModelCacheStats`, and `ModelInfo` are direct
-imports from `block_offload.model_cache` (not re-exported at the
+imports from `ltx_core.memory.model_cache` (not re-exported at the
 package level — they're observability types, not the typical
 acquire/use path).
 

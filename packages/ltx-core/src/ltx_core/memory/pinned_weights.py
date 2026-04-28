@@ -12,12 +12,12 @@ streaming, no forward hooks, no LRU. The whole model goes to GPU on
 :meth:`PinnedWeights.deactivate` by repointing each module's parameter
 slot back at a Parameter that wraps pinned CPU storage.
 
-Implements :class:`~block_offload.strategy.ModelStrategy` so it plugs
+Implements :class:`~ltx_core.memory.strategy.ModelStrategy` so it plugs
 into a model cache directly.
 
 Cross-cutting compatibility caveats (``torch.compile`` incompatibility,
 DDP/FSDP wrap-before requirement, single-thread contract) live in the
-:mod:`~block_offload` package docstring.
+:mod:`~ltx_core.memory` package docstring.
 
 Class-specific caveats
 ----------------------
@@ -78,7 +78,7 @@ def _set_buffer(module: nn.Module, name: str, value: torch.Tensor, persistent: b
 class PinnedWeights:
     """Whole-model pinned-CPU weight cache with bulk GPU transfer.
 
-    Implements :class:`~block_offload.strategy.ModelStrategy`.
+    Implements :class:`~ltx_core.memory.strategy.ModelStrategy`.
 
     On construction, every frozen parameter slot is replaced with a
     Parameter wrapping pinned CPU storage (handling quanto decomposition
@@ -268,7 +268,7 @@ class PinnedWeights:
                 "PinnedWeights requires at least one frozen parameter or, "
                 "when include_buffers=True, at least one registered buffer "
                 "to cache. The wrapped model has neither — for training "
-                "flows use block_offload.make_block_offloader instead, or "
+                "flows use ltx_core.memory.make_block_offloader instead, or "
                 "leave the model unwrapped."
             )
 

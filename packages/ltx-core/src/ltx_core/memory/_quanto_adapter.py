@@ -43,9 +43,6 @@ except ImportError:
     WeightQBytesTensor = None  # type: ignore[assignment,misc]
 
 
-__all__ = ["QuantoAdapter"]
-
-
 _QUANTO_LAYOUT_ATTRS = ("_data", "_scale", "qtype", "axis")
 """Attributes :class:`QuantoAdapter` reads from a ``WeightQBytesTensor``.
 If quanto refactors and any of these vanishes, :meth:`matches` raises a

@@ -19,7 +19,7 @@ Two complementary offload strategies:
   CPU storage and the GPU storage is released by refcount.
 
 Both classes share the underlying per-parameter pinned storage from
-:class:`~block_offload.pinned_buffer.PinnedParamBuffer` (clone + pin
+:class:`~ltx_core.memory.pinned_buffer.PinnedParamBuffer` (clone + pin
 + optional quanto ``WeightQBytesTensor`` decomposition), so quantized
 models work with either.
 
@@ -96,7 +96,7 @@ from .strategy import ModelStrategy, SlotOwnership
 # `ModelCacheSnapshot`, `ModelCacheStats`, and `ModelInfo` are observability
 # types — used by callers who introspect cache state, not the typical
 # acquire/use path. Import them directly from
-# `block_offload.model_cache` when needed.
+# `ltx_core.memory.model_cache` when needed.
 
 __all__ = [
     "ActivationError",
