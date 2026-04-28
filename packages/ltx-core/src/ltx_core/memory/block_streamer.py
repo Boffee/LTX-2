@@ -29,7 +29,7 @@ import functools
 import logging
 import weakref
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import TracebackType
 from typing import Any
@@ -162,6 +162,7 @@ class _BlockPinnedStore:
         layers: Sequence[nn.Module],
         *,
         skip_slots: set[SlotOwnership] | None = None,
+        post_load: Callable[[Any, int], None] | None = None,
     ) -> None:
         self._layers = list(layers)
         self._param_bufs: list[list[PinnedParamBuffer]] = []
@@ -173,6 +174,13 @@ class _BlockPinnedStore:
             list[tuple[torch.Tensor, nn.Module, str, torch.Tensor]]
         ] = []
         self._slots_applied = False
+        # Optional callback invoked on the prefetch stream after the
+        # pool slot's bytes are DMA'd in. Receives (slot, block_idx);
+        # the slot exposes ``get_param(qual_name) -> nn.Parameter``
+        # over its GPU-resident tensors. Used by composers that need
+        # to mutate freshly-loaded weights (e.g., LoRA merge) before
+        # the slot is handed off to the main compute stream.
+        self._post_load = post_load
         skip: set[SlotOwnership] = skip_slots or set()
         # Slot-ownership filter built during the same walk: identifies
         # every (parent_module, leaf, kind) slot the streamer will own.
@@ -333,6 +341,12 @@ class _BlockPinnedStore:
         self._pool.wait_if_needed(slot_id, stream)
         slot = self._pool.slot(slot_id)
         slot.copy_from(self._param_bufs[idx], non_blocking=non_blocking)
+        # Post-load hook on the prefetch stream — runs after the slot's
+        # bytes are DMA'd in, before the main stream waits on the
+        # readiness event. CUDA orders the hook's ops after copy_from
+        # automatically because both run on the same (current) stream.
+        if self._post_load is not None:
+            self._post_load(slot, idx)
 
         for qual_name, submod, local_name in self._param_locs[idx]:
             submod._parameters[local_name] = slot.get_param(qual_name)
@@ -340,6 +354,12 @@ class _BlockPinnedStore:
             mod_buf.data = cpu_clone.to(self._device, non_blocking=non_blocking)
 
     def _load_alloc(self, idx: int, device: torch.device, non_blocking: bool) -> None:
+        if self._post_load is not None:
+            raise NotImplementedError(
+                "post_load callback is only supported in the pooled path "
+                "(strict_homogeneous=True). The no-pool fallback exposes no "
+                "stable slot object for the callback to operate on."
+            )
         for buf, (_qn, submod, local_name) in zip(
             self._param_bufs[idx], self._param_locs[idx], strict=True,
         ):
@@ -491,6 +511,17 @@ class BlockStreamer:
         ``skip_slots`` triggers a contract-guard ValueError at
         construction; this is intentional, fail-loud over silent
         freezing of the param.
+    post_load:
+        Optional callback invoked on the prefetch stream after a
+        block's bytes are DMA'd into a pool slot, before the main
+        compute stream waits on the readiness event. Signature:
+        ``(slot, block_idx) -> None``, where ``slot.get_param(qual_name)``
+        returns the freshly-loaded GPU :class:`nn.Parameter`. Used by
+        composers that need to mutate the freshly-loaded weights —
+        e.g., LoRA merge via ``param.data.addmm_(B, A, alpha=scale)``.
+        CUDA orders the hook's ops after the DMA automatically because
+        both run on the current (prefetch) stream. Pooled path only;
+        raises if used with ``strict_homogeneous=False``.
     """
 
     def __init__(
@@ -503,6 +534,7 @@ class BlockStreamer:
         name: str | None = None,
         strict_homogeneous: bool = True,
         skip_slots: set[SlotOwnership] | None = None,
+        post_load: Callable[[Any, int], None] | None = None,
     ) -> None:
         self._blocks: list[nn.Module] = list(blocks)
         self._target_device = target_device
@@ -524,7 +556,9 @@ class BlockStreamer:
         # untouched.
         for block in self._blocks:
             block.to("cpu")
-        store = _BlockPinnedStore(self._blocks, skip_slots=skip_slots)
+        store = _BlockPinnedStore(
+            self._blocks, skip_slots=skip_slots, post_load=post_load,
+        )
         if strict_homogeneous and not store.is_homogeneous():
             raise ValueError(
                 f"{self._name}: blocks are not homogeneous (different "

@@ -1577,3 +1577,58 @@ class TestLoRAInBlockRouting:
                     )
         finally:
             strat.deactivate()
+
+
+class TestBlockStreamerPostLoad:
+    """The post_load hook fires on the prefetch stream after each
+    block's bytes land in a pool slot, before the main stream waits
+    on the readiness event. Used by composers that need to mutate
+    freshly-loaded weights (e.g., LoRA merge)."""
+
+    @CUDA
+    def test_post_load_fires_per_block(self) -> None:
+        m = _make_block_model(num_blocks=4)
+        target = torch.device("cuda")
+
+        invocations: list[int] = []
+
+        def on_load(slot, block_idx: int) -> None:
+            invocations.append(block_idx)
+            # Sanity: slot exposes get_param over the block's weights.
+            param = slot.get_param("weight")
+            assert param.is_cuda
+
+        streamer = BlockStreamer(
+            blocks=list(m.transformer_blocks),
+            target_device=target,
+            blocks_to_swap=2,
+            post_load=on_load,
+        )
+        try:
+            streamer.activate()
+            x = torch.randn(2, 8, device=target)
+            for blk in m.transformer_blocks:
+                x = blk(x)
+            torch.cuda.synchronize()
+            # Every block visited at least once.
+            assert set(invocations) == set(range(4))
+        finally:
+            streamer.deactivate()
+
+    def test_post_load_unsupported_in_no_pool_path(self) -> None:
+        # strict_homogeneous=False uses _load_alloc which has no slot
+        # to hand the callback. Should raise loudly rather than silently
+        # skip.
+        from ltx_core.memory.block_streamer import _BlockPinnedStore
+
+        class HetBlock(nn.Module):
+            def __init__(self, dim):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(dim), requires_grad=False)
+
+        blocks = [HetBlock(8), HetBlock(16)]
+        store = _BlockPinnedStore(
+            blocks, post_load=lambda slot, idx: None,
+        )
+        with pytest.raises(NotImplementedError, match="post_load callback"):
+            store._load_alloc(0, torch.device("cpu"), non_blocking=False)
