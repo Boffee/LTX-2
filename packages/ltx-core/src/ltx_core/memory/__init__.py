@@ -8,7 +8,7 @@ Two complementary offload strategies:
   supports gradient checkpointing through autograd backward. Returns
   a :class:`BlockStreamingStrategy` composing one
   :class:`BlockStreamer` per ``layers_attr`` path plus a non-block
-  :class:`PinnedWeights` plus a :class:`TrainableMover`. For bespoke
+  :class:`PinnedWeights` plus a :class:`TrainableWeights`. For bespoke
   configurations (per-group ``blocks_to_swap``), construct the
   components directly and pass them to :class:`BlockStreamingStrategy`.
 
@@ -40,7 +40,7 @@ that composes (in order):
      skip filter for everything outside the block list (sibling
      modules + direct parent-module state, e.g. an unembedding head
      or a learnable bias attached to the model root).
-  2. A :class:`TrainableMover` for LoRA / adapter weights.
+  2. A :class:`TrainableWeights` for LoRA / adapter weights.
   3. One :class:`BlockStreamer` per ``layers_attr`` path.
 
 Cross-region tied parameters (block ↔ non-block, cross-block, or
@@ -76,7 +76,7 @@ construction through the cache) belongs in the consumer, not here.
 
 from .block_compose import (
     BlockStreamingStrategy,
-    TrainableMover,
+    TrainableWeights,
     make_block_offloader,
 )
 from .block_streamer import BlockStreamer
@@ -112,6 +112,6 @@ __all__ = [
     "ModelTooLargeError",
     "PinnedWeights",
     "SlotOwnership",
-    "TrainableMover",
+    "TrainableWeights",
     "make_block_offloader",
 ]

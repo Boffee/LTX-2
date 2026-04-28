@@ -3,7 +3,7 @@
 Covers ``make_block_offloader`` (the blessed factory),
 ``BlockStreamingStrategy`` (the public composite),
 ``BlockStreamer`` (the per-block-list primitive),
-``TrainableMover`` (the trainable-param component),
+``TrainableWeights`` (the trainable-param component),
 and the cross-region tied-weight detector.
 
 Most lifecycle tests run on CPU (the machinery is device-agnostic);
@@ -24,7 +24,7 @@ from ltx_core.memory import (
     ModelStrategy,
     PinnedWeights,
     SlotOwnership,
-    TrainableMover,
+    TrainableWeights,
     make_block_offloader,
 )
 from ltx_core.memory.block_compose import detect_streaming_region_ties
@@ -480,7 +480,7 @@ class TestActivateFailurePoison:
     def test_partial_activate_failure_rolls_back_other_components(self, monkeypatch) -> None:
         # If a streamer's activate raises, the composite's `with stack:`
         # rolls back the already-activated components (PinnedWeights,
-        # TrainableMover). _teardown_stack stays None because pop_all()
+        # TrainableWeights). _teardown_stack stays None because pop_all()
         # was never reached. Caller's responsibility to drop the
         # strategy reference for full cleanup.
         m = _make_block_model()
@@ -577,7 +577,7 @@ class TestConstructedStateIsInactive:
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
-            # No PinnedWeights component, just TrainableMover + BlockStreamer.
+            # No PinnedWeights component, just TrainableWeights + BlockStreamer.
             non_block_components = [
                 c for c in strategy._components if isinstance(c, PinnedWeights)
             ]
@@ -1059,7 +1059,7 @@ class TestMultiComponentCleanup:
     @CUDA
     def test_trainable_move_failure_still_runs_other_deactivates(self) -> None:
         # ExitStack continues unwinding callbacks even when one raises.
-        # If TrainableMover's deactivate raises, BlockStreamer (earlier
+        # If TrainableWeights's deactivate raises, BlockStreamer (earlier
         # in unwind order) and non_block PinnedWeights (later in unwind)
         # still get their deactivate called.
         from unittest.mock import patch
@@ -1089,20 +1089,20 @@ class TestMultiComponentCleanup:
 
 
 # ---------------------------------------------------------------------------
-# TrainableMover (component-level tests)
+# TrainableWeights (component-level tests)
 # ---------------------------------------------------------------------------
 
 
-class TestTrainableMover:
+class TestTrainableWeights:
     def test_cache_bytes_is_zero(self) -> None:
         m = _make_block_model()
-        mover = TrainableMover(m, torch.device("cpu"))
+        mover = TrainableWeights(m, torch.device("cpu"))
         assert mover.cache_bytes == 0
         mover.deactivate()
 
     def test_activate_and_deactivate_noop_when_no_trainable(self) -> None:
         m = _make_block_model()  # all frozen
-        mover = TrainableMover(m, torch.device("cpu"))
+        mover = TrainableWeights(m, torch.device("cpu"))
         try:
             mover.activate()
             mover.deactivate()
@@ -1118,7 +1118,7 @@ class TestTrainableMover:
 
         m = M()
         target = torch.device("cuda")
-        mover = TrainableMover(m, target)
+        mover = TrainableWeights(m, target)
         try:
             mover.activate()
             assert m.lora.is_cuda
@@ -1129,7 +1129,7 @@ class TestTrainableMover:
 
     def test_deactivate_idempotent(self) -> None:
         m = _make_block_model()
-        mover = TrainableMover(m, torch.device("cpu"))
+        mover = TrainableWeights(m, torch.device("cpu"))
         mover.deactivate()
         mover.deactivate()
 
@@ -1326,7 +1326,7 @@ class TestMixedGradTieDetection:
 
     def test_all_trainable_distinct_parameter_tie_raises(self) -> None:
         # Two distinct Parameter objects sharing storage, both trainable.
-        # TrainableMover walks model.parameters() (deduped by id(p)) and
+        # TrainableWeights walks model.parameters() (deduped by id(p)) and
         # would move each Parameter independently, breaking the storage
         # alias on GPU. Reject upfront.
         shared = torch.randn(4, 4)
@@ -1421,7 +1421,7 @@ class TestMixedGradTieDetection:
 class TestLoRAInBlockRouting:
     """LoRA-shaped models: blocks contain frozen base layers plus
     trainable adapter layers. The composer must route the base to
-    BlockStreamer and the adapters to TrainableMover; neither
+    BlockStreamer and the adapters to TrainableWeights; neither
     strategy's contract guard should fire on a well-formed LoRA model.
     """
 
@@ -1452,9 +1452,9 @@ class TestLoRAInBlockRouting:
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
         try:
-            # Strategy composes a TrainableMover for the LoRA params.
+            # Strategy composes a TrainableWeights for the LoRA params.
             assert any(
-                isinstance(c, TrainableMover) for c in strat._components
+                isinstance(c, TrainableWeights) for c in strat._components
             )
             # Each BlockStreamer's slot_filter only contains frozen
             # base.weight slots; lora_a/lora_b are skipped.
@@ -1512,7 +1512,7 @@ class TestLoRAInBlockRouting:
                 c for c in strat._components if isinstance(c, PinnedWeights)
             )
             # PinnedWeights manages frozen_head.weight only — block content
-            # routed to BlockStreamer, trainable_bias to TrainableMover.
+            # routed to BlockStreamer, trainable_bias to TrainableWeights.
             managed_slot_ids = {
                 (id(parent), leaf)
                 for _buf, locs in pinned._slots

@@ -6,7 +6,7 @@ ordered list of components — typically:
 1. A non-block :class:`PinnedWeights` (sibling modules, parent-module
    direct state) constructed with the streamers' :class:`SlotOwnership`
    filter so it ignores block-owned slots.
-2. A :class:`TrainableMover` that moves LoRA / adapter weights to GPU
+2. A :class:`TrainableWeights` that moves LoRA / adapter weights to GPU
    on activate and back to CPU on deactivate.
 3. One :class:`BlockStreamer` per homogeneous block list (single-list
    models use one; heterogeneous ones like Flux use two:
@@ -46,20 +46,32 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# TrainableMover — a component that moves trainable params on activate
+# TrainableWeights — lifecycle handler for trainable params
 # ---------------------------------------------------------------------------
 
 
-class TrainableMover:
-    """Moves all ``requires_grad=True`` params (and their grads) to a
-    target device on activate; back to CPU on deactivate.
+class TrainableWeights:
+    """Strategy component for the model's trainable parameters.
 
-    Component shape (no model returned from activate). Reports
-    ``cache_bytes=0`` because it owns no pinned storage — it just
-    relocates parameters that already exist somewhere. Useful as a
-    component inside :class:`BlockStreamingStrategy` so the activate /
-    deactivate pipeline doesn't need to special-case trainable
-    movement.
+    The trainable counterpart to :class:`PinnedWeights`. Both components
+    bring their managed params to the target device on
+    :meth:`activate` and return them to CPU on :meth:`deactivate`,
+    but the mechanisms are mirror images:
+
+    - :class:`PinnedWeights` owns pinned-CPU clones, slot-replaces the
+      Parameter wrapper at every transition. Frozen-only — slot
+      replacement orphans optimizer state.
+    - :class:`TrainableWeights` owns nothing (``cache_bytes=0``); the
+      user's Parameter objects stay alive in their slots, and only
+      ``p.data`` storage moves via ``p.data = p.data.to(device)``.
+      Identity-preserving — optimizer state survives.
+
+    Walks ``model.parameters()`` each transition (deduped by Parameter
+    identity), so the standard ``tie_weights()`` pattern (one Parameter
+    aliased at multiple slots) is handled correctly. Distinct-Parameter
+    tied storage is rejected upstream by
+    :func:`detect_streaming_region_ties` because moving each Parameter
+    independently would untie the alias on GPU.
     """
 
     def __init__(self, model: nn.Module, target_device: torch.device) -> None:
@@ -72,7 +84,7 @@ class TrainableMover:
 
     @property
     def name(self) -> str:
-        return "TrainableMover"
+        return "TrainableWeights"
 
     def activate(self) -> None:
         _move_trainable(self._model, self._target_device)
@@ -182,7 +194,7 @@ def detect_streaming_region_ties(  # noqa: PLR0912, PLR0915 (3-category check is
                 "(trainable) mechanisms cannot share a tied storage. "
                 "Untie the parameters or freeze/unfreeze them consistently."
             )
-        # All-trainable distinct-Parameter ties: TrainableMover walks
+        # All-trainable distinct-Parameter ties: TrainableWeights walks
         # model.parameters() (deduplicated by Parameter identity) and
         # moves each Parameter independently via p.data = p.data.to(),
         # which breaks the storage alias on GPU. The standard
@@ -195,7 +207,7 @@ def detect_streaming_region_ties(  # noqa: PLR0912, PLR0915 (3-category check is
             if len(param_ids) > 1:
                 raise ValueError(
                     f"All-trainable tied storage with distinct Parameter "
-                    f"objects: {names}. TrainableMover moves each Parameter "
+                    f"objects: {names}. TrainableWeights moves each Parameter "
                     "independently via p.data = ... and would break the "
                     "storage alias on GPU. Untie the parameters or use "
                     "tie_weights() to share a single Parameter object."
@@ -292,7 +304,7 @@ class BlockStreamingStrategy:
 
     - :class:`PinnedWeights` (with a ``skip_slots`` filter for the
       streamers' slots)
-    - :class:`TrainableMover`
+    - :class:`TrainableWeights`
     - one or more :class:`BlockStreamer`s
 
     Parameters
@@ -469,7 +481,7 @@ def make_block_offloader(
 
     # Single source of truth for trainable partitioning. Both strategies
     # receive this set so they can route trainable params to
-    # TrainableMover instead of pinning/streaming them. SlotOwnership
+    # TrainableWeights instead of pinning/streaming them. SlotOwnership
     # tuples survive slot mutation, so the filter is stable across
     # construction order.
     trainable_slots: set[SlotOwnership] = {
@@ -495,7 +507,7 @@ def make_block_offloader(
         )
 
     # PinnedWeights skips both block-owned slots (claimed by streamers)
-    # and trainable slots (handled by TrainableMover). The streamer's
+    # and trainable slots (handled by TrainableWeights). The streamer's
     # slot_filter already excludes trainables in-block, so the union
     # is { frozen block slots } ∪ { trainable slots anywhere }.
     skip_slots: set[SlotOwnership] = set(trainable_slots)
@@ -509,7 +521,7 @@ def make_block_offloader(
     components: list[Any] = []
     if non_block is not None:
         components.append(non_block)
-    components.append(TrainableMover(model, target_device))
+    components.append(TrainableWeights(model, target_device))
     components.extend(streamers)
 
     return BlockStreamingStrategy(model=model, components=components)
@@ -553,7 +565,7 @@ def _has_non_block_pinnable_content(
 
 __all__ = [
     "BlockStreamingStrategy",
-    "TrainableMover",
+    "TrainableWeights",
     "detect_streaming_region_ties",
     "make_block_offloader",
 ]

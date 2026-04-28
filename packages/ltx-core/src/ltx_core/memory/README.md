@@ -15,7 +15,7 @@ into its own package when a second consumer appears.
 | `strategy.py` | `ModelStrategy` — the plug-in contract every strategy implements; `SlotOwnership` skip-filter type |
 | `pinned_weights.py` | `PinnedWeights` — whole-model bulk pinned-CPU↔GPU strategy |
 | `block_streamer.py` | `BlockStreamer` — sharp per-block-list streaming primitive (component) |
-| `block_compose.py` | `BlockStreamingStrategy` (composite), `TrainableMover` (component), `make_block_offloader` (factory) |
+| `block_compose.py` | `BlockStreamingStrategy` (composite), `TrainableWeights` (component), `make_block_offloader` (factory) |
 | `pinned_buffer.py` | `PinnedParamBuffer` — per-tensor pinning primitive (handles quanto) |
 | `model_cache.py` | `ModelCache` — LRU pool over strategies with active-set leases |
 | `pipeline_install.py` | Optional one-line monkey-patch installer (see [Integrations](#integrations)) |
@@ -104,7 +104,7 @@ del strategy, model  # drop refs to free pinned host memory
 ```
 
 Trainable parameters (e.g. LoRA adapters) move to GPU on activate
-and back to CPU on deactivate via the bundled `TrainableMover`
+and back to CPU on deactivate via the bundled `TrainableWeights`
 component — backward through them is unaffected by the offload.
 
 ### Heterogeneous block lists
@@ -126,7 +126,7 @@ strategy = make_block_offloader(
 ```
 
 For bespoke compositions (custom components, mixed strategies),
-construct the `BlockStreamer`s, `PinnedWeights`, and `TrainableMover`
+construct the `BlockStreamer`s, `PinnedWeights`, and `TrainableWeights`
 yourself and hand them to `BlockStreamingStrategy` directly.
 
 ## Quick start: ModelCache
@@ -198,7 +198,7 @@ with cache.use(spec) as vae:  # registers if missing, then uses
             │             │  components (ordered):              │
             │             │  • PinnedWeights (non-block,        │
             │             │    skip_slots = streamers' slots)   │
-            │             │  • TrainableMover                   │
+            │             │  • TrainableWeights                   │
             │             │  • N × BlockStreamer                │
             │             │   built by make_block_offloader()   │
             │             └──────────────────────────┬──────────┘

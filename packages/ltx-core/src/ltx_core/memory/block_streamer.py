@@ -12,7 +12,7 @@ This is the sharp, low-level primitive. It does NOT manage:
   modules) — caller composes :class:`PinnedWeights` with the
   streamer's :attr:`slot_filter` for that.
 - Trainable parameter movement — caller handles a separate
-  :class:`~ltx_core.memory.block_compose.TrainableMover`.
+  :class:`~ltx_core.memory.block_compose.TrainableWeights`.
 - Cross-region tied-weight detection — that's a composer concern
   (see :func:`make_block_offloader` /
   :class:`~ltx_core.memory.block_compose.BlockStreamingStrategy`).
@@ -206,7 +206,7 @@ class _BlockPinnedStore:
                         "streaming swaps slot Parameters with frozen pool "
                         "wrappers, breaking optimizer identity. Use "
                         "make_block_offloader (which partitions trainables "
-                        "into TrainableMover automatically), or pass the "
+                        "into TrainableWeights automatically), or pass the "
                         "slot in skip_slots and route it to a separate "
                         "trainable mover."
                     )

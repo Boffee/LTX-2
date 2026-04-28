@@ -179,7 +179,7 @@ class PinnedWeights:
                     "slot replacement installs a frozen Parameter wrapper, "
                     "orphaning any optimizer state keyed by the user's "
                     "pre-wrap Parameter. Use make_block_offloader (which "
-                    "partitions trainables into TrainableMover and validates "
+                    "partitions trainables into TrainableWeights and validates "
                     "tied storage upstream), or pass the slot in skip_slots "
                     "and validate ties yourself — splitting a tied group "
                     "between skip_slots and PinnedWeights silently breaks "
