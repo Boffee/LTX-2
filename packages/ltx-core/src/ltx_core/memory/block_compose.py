@@ -40,7 +40,7 @@ from .block_streamer import BlockStreamer
 from .pinned_buffer import storage_key
 from .pinned_weights import PinnedWeights
 from .slot_graph import iter_buffer_slots, iter_param_slots
-from .strategy import SlotOwnership
+from .strategy import ModelStrategyComponent, SlotOwnership
 
 logger = logging.getLogger(__name__)
 
@@ -321,10 +321,12 @@ class BlockStreamingStrategy:
     """
 
     def __init__(
-        self, model: nn.Module, components: Sequence[Any],
+        self,
+        model: nn.Module,
+        components: Sequence[ModelStrategyComponent],
     ) -> None:
         self._model: nn.Module | None = model
-        self._components: list[Any] = list(components)
+        self._components: list[ModelStrategyComponent] = list(components)
         # ExitStack of registered deactivate callbacks, set by
         # activate() and consumed by deactivate(). Presence is the
         # de-facto "active" indicator.
@@ -334,16 +336,24 @@ class BlockStreamingStrategy:
     def cache_bytes(self) -> int:
         return sum(c.cache_bytes for c in self._components)
 
+    @property
+    def model(self) -> nn.Module:
+        """The wrapped model. Stable across activate/deactivate cycles."""
+        assert self._model is not None
+        return self._model
+
     # ------------------------------------------------------------------
     # ModelStrategy lifecycle
     # ------------------------------------------------------------------
 
-    def activate(self) -> nn.Module:
+    def activate(self) -> None:
         """Activate components in order. ``with ExitStack`` auto-rolls
         back partial activation on exception (its ``__exit__`` chains
         cleanup failures via ``__context__`` so all are visible in the
         traceback). On full success, ``stack.pop_all()`` detaches the
         callbacks so they survive until our :meth:`deactivate`.
+
+        Reach the wrapped model via :attr:`model` once activated.
 
         **Lifecycle is caller's responsibility.** Calling activate()
         twice without an intervening deactivate() will double-activate
@@ -355,7 +365,6 @@ class BlockStreamingStrategy:
                 component.activate()
                 stack.callback(component.deactivate)
             self._teardown_stack = stack.pop_all()
-        return self._model
 
     def deactivate(self) -> None:
         """Run registered deactivate callbacks in reverse order.
@@ -374,7 +383,8 @@ class BlockStreamingStrategy:
             stack.close()
 
     def __enter__(self) -> nn.Module:
-        return self.activate()
+        self.activate()
+        return self.model
 
     def __exit__(
         self,
@@ -518,7 +528,7 @@ def make_block_offloader(
     if _has_non_block_pinnable_content(model, skip_slots):
         non_block = PinnedWeights(model, target_device, skip_slots=skip_slots)
 
-    components: list[Any] = []
+    components: list[ModelStrategyComponent] = []
     if non_block is not None:
         components.append(non_block)
     components.append(TrainableWeights(model, target_device))

@@ -54,8 +54,8 @@ class TestLifecycle:
         m = _make_simple_model()
         pw = PinnedWeights(m, torch.device("cuda"))
         try:
-            returned = pw.activate()
-            assert returned is m
+            pw.activate()
+            assert pw.model is m
             for p in m.parameters():
                 assert p.is_cuda
             pw.deactivate()

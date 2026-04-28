@@ -128,8 +128,8 @@ class TestLifecycle:
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
-            returned = strategy.activate()
-            assert returned is m
+            strategy.activate()
+            assert strategy.model is m
         finally:
             strategy.deactivate()
 

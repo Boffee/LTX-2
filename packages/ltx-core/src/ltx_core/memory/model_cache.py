@@ -1,6 +1,6 @@
 """LRU model cache over :class:`ModelStrategy` plug-ins.
 
-Manages cached pinned-CPU (or other handle-owned) backing storage for
+Manages cached pinned-CPU (or other strategy-owned) backing storage for
 multiple independent models. When a new model needs more cache than is
 free, the least-recently-used inactive entries are evicted until room is
 available. Active entries (currently inside an ``acquire()`` /
@@ -70,7 +70,7 @@ class ModelSpec:
     same key but a different factory silently returns the cached entry.
 
     ``estimated_cache_bytes`` is used to evict before building. The
-    cache reconciles against the actual ``handle.cache_bytes`` after
+    cache reconciles against the actual ``strategy.cache_bytes`` after
     construction; if the actual exceeds the estimate enough to overflow
     the budget, the cache evicts more or rejects the admission.
 
@@ -194,7 +194,7 @@ class ModelInUseError(ModelCacheError):
 
 class ActivationError(ModelCacheError):
     """A strategy's ``activate()`` raised. The cache discards the entry
-    (drops the handle reference, removes it from cache state) regardless
+    (drops the strategy reference, removes it from cache state) regardless
     of whether the entry was freshly built or previously cached —
     strategies with multi-step ``activate()`` (e.g.
     :func:`make_block_offloader`) can fail mid-way after partially
@@ -211,7 +211,7 @@ class ActivationError(ModelCacheError):
 @dataclass
 class _Entry:
     spec: ModelSpec
-    handle: ModelStrategy | None = None
+    strategy: ModelStrategy | None = None
     cache_bytes: int = 0           # actual, post-build
     active_count: int = 0
     active_module: nn.Module | None = None  # cached for re-entrant acquire
@@ -232,7 +232,7 @@ class ModelCache:
         pinned host memory). Must be ≥ 0.
     empty_host_cache:
         Optional callback invoked after every successful eviction (and
-        after dropping a rejected newly-built handle) to flush PyTorch's
+        after dropping a rejected newly-built strategy) to flush PyTorch's
         ``CachingHostAllocator`` so freed pinned pages return to the OS.
         If ``None`` and CUDA is available, defaults to
         ``torch._C._host_emptyCache`` when present. Pass a no-op
@@ -300,7 +300,7 @@ class ModelCache:
         self._entries[spec.key] = _Entry(spec=spec)
 
     def unregister(self, key: str, *, evict: bool = True) -> None:
-        """Drop a registration. If a built handle exists and
+        """Drop a registration. If a built strategy exists and
         ``evict=True`` (default), evict it; otherwise raise
         :class:`ModelInUseError` if it's cached or active."""
         entry = self._entries.get(key)
@@ -310,10 +310,10 @@ class ModelCache:
             raise ModelInUseError(
                 f"cannot unregister active model {key!r} (refcount={entry.active_count})"
             )
-        if entry.handle is not None:
+        if entry.strategy is not None:
             if not evict:
                 raise ModelInUseError(
-                    f"{key!r} has a built handle; pass evict=True to release it"
+                    f"{key!r} has a built strategy; pass evict=True to release it"
                 )
             self._evict_inactive(key)
         del self._entries[key]
@@ -351,7 +351,7 @@ class ModelCache:
         """Manually evict one inactive cached entry. Raises
         :class:`ModelInUseError` if active, no-op if not cached."""
         entry = self._entries.get(key)
-        if entry is None or entry.handle is None:
+        if entry is None or entry.strategy is None:
             return
         if entry.active_count > 0:
             raise ModelInUseError(f"cannot evict active model {key!r}")
@@ -376,8 +376,8 @@ class ModelCache:
             key=entry.spec.key,
             label=entry.spec.label,
             estimated_cache_bytes=entry.spec.estimated_cache_bytes,
-            cache_bytes=entry.cache_bytes if entry.handle is not None else None,
-            cached=entry.handle is not None,
+            cache_bytes=entry.cache_bytes if entry.strategy is not None else None,
+            cached=entry.strategy is not None,
             active_count=entry.active_count,
         )
 
@@ -418,15 +418,16 @@ class ModelCache:
             return
 
         # First lease: ensure built, then activate.
-        if entry.handle is None:
+        if entry.strategy is None:
             self._build_into_entry(entry)
         else:
             self._stats.hits += 1
             self._lru.pop(key, None)  # leaving inactive set
 
-        assert entry.handle is not None
+        assert entry.strategy is not None
         try:
-            module = entry.handle.activate()
+            entry.strategy.activate()
+            module = entry.strategy.model
         except BaseException as exc:
             self._stats.activation_errors += 1
             # Treat all activation failures as poisoned regardless of
@@ -450,14 +451,14 @@ class ModelCache:
         # active and being
         # yielded), so we log and continue — the user is over budget
         # but at least the accounting reflects it.
-        post_activate_bytes = entry.handle.cache_bytes
+        post_activate_bytes = entry.strategy.cache_bytes
         if post_activate_bytes < 0:
             # Same guard as the factory-admission path. A misbehaving
             # strategy returning negative cache_bytes after activate
             # would corrupt _used_bytes accounting just as it would
             # at admission. Treat the activation as failed and discard.
             with contextlib.suppress(BaseException):
-                entry.handle.deactivate()
+                entry.strategy.deactivate()
             self._stats.activation_errors += 1
             self._discard_entry(entry)
             raise ModelCacheError(
@@ -491,12 +492,12 @@ class ModelCache:
             entry.active_count -= 1
             if entry.active_count == 0:
                 # Strategy contract: deactivate is expected to leave
-                # the handle in a clean inactive state and not raise
+                # the strategy in a clean inactive state and not raise
                 # under normal use. If it does raise, the strategy's
                 # internal state is unknown — don't risk reusing it.
                 # Discard so a subsequent acquire rebuilds.
                 try:
-                    entry.handle.deactivate()
+                    entry.strategy.deactivate()
                 except BaseException:
                     self._discard_entry(entry, was_active=True)
                     raise
@@ -512,18 +513,18 @@ class ModelCache:
         # Pre-build eviction: trust the estimate.
         self._evict_until_room(key, estimate)
         try:
-            handle = entry.spec.factory()
+            strategy = entry.spec.factory()
         except BaseException:
             self._stats.factory_errors += 1
             raise
-        actual = handle.cache_bytes
+        actual = strategy.cache_bytes
         if actual < 0:
             # Misbehaving strategy. Don't admit it (would corrupt
             # _used_bytes accounting). Drop the local ref BEFORE the
             # host-cache flush so refcount-GC frees the strategy's
             # pinned tensors in time for empty_host_cache to actually
             # reclaim them.
-            del handle
+            del strategy
             self._after_release()
             raise ModelCacheError(
                 f"strategy.cache_bytes for {key!r} returned {actual} (must be >= 0)"
@@ -533,14 +534,14 @@ class ModelCache:
             try:
                 self._evict_until_room(key, actual)
             except BaseException:
-                # Can't fit the actual size — drop the new handle and
+                # Can't fit the actual size — drop the new strategy and
                 # re-raise. Don't mark as built. del-before-flush so
                 # refcount-GC frees the strategy before the host-cache
                 # flush runs.
-                del handle
+                del strategy
                 self._after_release()
                 raise
-        entry.handle = handle
+        entry.strategy = strategy
         entry.cache_bytes = actual
         self._used_bytes += actual
         self._stats.builds += 1
@@ -579,15 +580,15 @@ class ModelCache:
 
     def _evict_inactive(self, key: str) -> None:
         entry = self._entries[key]
-        assert entry.handle is not None
+        assert entry.strategy is not None
         assert entry.active_count == 0
         bytes_freed = entry.cache_bytes
-        # Detach from cache state — dropping `entry.handle` releases
+        # Detach from cache state — dropping `entry.strategy` releases
         # the cache's only reference to the strategy. If the entry's
         # factory built a fresh model (the typical pattern), the
         # strategy was the sole owner of the model and Python's
         # refcount-based GC frees the pinned tensors immediately.
-        entry.handle = None
+        entry.strategy = None
         entry.cache_bytes = 0
         self._lru.pop(key, None)
         self._used_bytes -= bytes_freed
@@ -603,20 +604,20 @@ class ModelCache:
             raise ModelInUseError(
                 f"cannot replace active registration {key!r} (refcount={entry.active_count})"
             )
-        if entry.handle is not None:
+        if entry.strategy is not None:
             self._evict_inactive(key)
 
     def _discard_entry(self, entry: _Entry, *, was_active: bool = False) -> None:
         """Detach an entry from cache state — for activation failures,
         deactivate poisoning, and unregistration. Dropping the
-        ``entry.handle`` reference triggers GC; if the cache was the
+        ``entry.strategy`` reference triggers GC; if the cache was the
         sole owner of the model, pinned tensors are freed immediately.
         ``was_active=True`` also clears the active-module bookkeeping
         (only relevant on the deactivate-poisoned path; active state
         is otherwise managed by the use() context)."""
         key = entry.spec.key
         bytes_to_free = entry.cache_bytes
-        entry.handle = None
+        entry.strategy = None
         entry.cache_bytes = 0
         if was_active:
             entry.active_module = None

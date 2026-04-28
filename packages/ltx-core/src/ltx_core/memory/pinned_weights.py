@@ -286,12 +286,19 @@ class PinnedWeights:
             total += pinned.numel() * pinned.element_size()
         return total
 
-    def activate(self) -> nn.Module:
-        """Bulk-DMA pinned weights to GPU and return the model.
+    @property
+    def model(self) -> nn.Module:
+        """The wrapped model. Stable across activate/deactivate cycles."""
+        assert self._model is not None
+        return self._model
+
+    def activate(self) -> None:
+        """Bulk-DMA pinned weights to GPU.
 
         Per-tensor ``.to()`` (non-blocking), then a single
         ``cuda.synchronize`` to make the writes visible. Tied parameter
-        slots all receive the same GPU Parameter.
+        slots all receive the same GPU Parameter. Reach the wrapped
+        model via :attr:`model` once activated.
 
         **Lifecycle is caller's responsibility.** Calling activate()
         twice without an intervening deactivate() double-allocates
@@ -306,7 +313,6 @@ class PinnedWeights:
         """
         assert self._model is not None
         self._move_to_gpu()
-        return self._model
 
     def deactivate(self) -> None:
         """Repoint slots back at pinned-CPU Parameters. Idempotent —
@@ -317,7 +323,8 @@ class PinnedWeights:
         self._move_to_pinned()
 
     def __enter__(self) -> nn.Module:
-        return self.activate()
+        self.activate()
+        return self.model
 
     def __exit__(
         self,

@@ -491,15 +491,17 @@ class TestUninstallBusy:
 class _UserStrategy:
     """Trivial user-owned strategy for testing uninstall isolation."""
     cache_bytes = 10
+    model = nn.Identity()
 
     def activate(self):
-        return nn.Identity()
+        pass
 
     def deactivate(self):
         pass
 
     def __enter__(self):
-        return self.activate()
+        self.activate()
+        return self.model
 
     def __exit__(self, *exc):
         self.deactivate()

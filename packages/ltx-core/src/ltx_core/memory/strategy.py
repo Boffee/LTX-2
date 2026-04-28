@@ -1,30 +1,40 @@
-"""Public protocol for model storage/placement strategies.
+"""Public protocols for model storage/placement strategies.
 
-A :class:`ModelStrategy` owns one model plus the resources needed to
-make it usable for compute (pinned CPU buffers, GPU slot pools, forward
-hooks, mmap regions, etc.). It is the plug-in contract used by
-:class:`~ltx_core.memory.model_cache.ModelCache` so the manager does not
-need to know how any particular strategy works.
+Two related Protocols form the contract:
 
-Implementations in this package: :class:`~ltx_core.memory.PinnedWeights`
-(whole-model bulk DMA between pinned CPU and GPU) and
-:func:`~ltx_core.memory.make_block_offloader` (block-level streaming for
-models too big for GPU). Future strategies (disk-mmap, NVMe-paged,
-multi-GPU shard) just have to satisfy this protocol.
+- :class:`ModelStrategyComponent` — pure lifecycle. A piece composable
+  inside a top-level strategy (see :class:`BlockStreamingStrategy`).
+  Just ``cache_bytes`` + ``activate()`` + ``deactivate()``. Components
+  don't expose a model because their parent composite owns it.
+
+- :class:`ModelStrategy` — top-level. Extends the component contract
+  with model exposure (``model`` property) and context-manager methods
+  for the ``with strategy as model:`` pattern. This is what
+  :class:`~ltx_core.memory.model_cache.ModelCache` registers and
+  manages.
+
+Top-level implementations in this package:
+:class:`~ltx_core.memory.PinnedWeights` (whole-model bulk DMA between
+pinned CPU and GPU) and :class:`BlockStreamingStrategy` (composite of
+streamers + pinning + trainable handling). Future strategies (disk-mmap,
+NVMe-paged, multi-GPU shard) just satisfy :class:`ModelStrategy`.
+
+Component implementations: :class:`~ltx_core.memory.BlockStreamer`,
+:class:`~ltx_core.memory.TrainableWeights`. (And :class:`PinnedWeights`
+also satisfies the component shape — composites use it inline.)
 
 Lifecycle
 ---------
 ``__init__`` sets up backing storage (pinning, etc.) so
-``cache_bytes`` is final immediately and the strategy is ready for
-:class:`~ltx_core.memory.model_cache.ModelCache` admission →
-``activate()`` (make model usable, returns the ``nn.Module``) →
-``deactivate()`` (release transient compute resources, keep
-``cache_bytes`` resident).
+``cache_bytes`` is final immediately and a top-level strategy is ready
+for :class:`~ltx_core.memory.model_cache.ModelCache` admission →
+``activate()`` (make model usable) → ``deactivate()`` (release transient
+compute resources, keep ``cache_bytes`` resident).
 
 ``activate()/deactivate()`` may be repeated as many times as you
-want. The strategy is also a context manager:
-``with strategy as model: ...`` is equivalent to ``activate()`` /
-``deactivate()``.
+want. Top-level strategies are also context managers:
+``with strategy as model: ...`` is equivalent to ``activate()`` then
+yielding ``strategy.model``.
 
 There is no ``close()``. To release ``cache_bytes`` (typically
 pinned host memory), drop the strategy reference (and the model
@@ -67,19 +77,19 @@ class SlotOwnership:
 
 
 @runtime_checkable
-class ModelStrategy(Protocol):
-    """Storage/placement strategy for one model.
+class ModelStrategyComponent(Protocol):
+    """Lifecycle-only contract for a piece composable inside a
+    top-level strategy.
 
-    ``cache_bytes`` is the only resource the manager budgets; everything
-    else (GPU memory, hooks, executor threads) is owned by the strategy
-    and not visible to callers.
+    Components don't expose a model — their parent composite owns
+    that. They just contribute to the lifecycle: report cache budget,
+    activate, deactivate. The composite calls ``activate()`` /
+    ``deactivate()`` on each component in order; return values are
+    ignored.
 
-    The ``@runtime_checkable`` decoration enables ``isinstance(x,
-    ModelStrategy)`` for sanity checks and tests, but the check is
-    structural and only verifies attribute *presence*, not signatures
-    or types — and most context managers already provide
-    ``__enter__``/``__exit__``, so passing this check is necessary but
-    not sufficient. Treat it as a weak guard, not a contract verifier.
+    A top-level :class:`ModelStrategy` is also a component (it extends
+    this Protocol), so a strategy can be used standalone OR as a piece
+    of a larger composite.
     """
 
     @property
@@ -88,17 +98,18 @@ class ModelStrategy(Protocol):
 
         Typically pinned host memory, but a strategy may report any
         resource it wants the cache to budget against — staging buffers,
-        mmap regions, etc. Strategies that don't consume cache budget
-        (e.g. an "always on GPU" passthrough) should return 0.
+        mmap regions, etc. Components that don't consume cache budget
+        (e.g. :class:`TrainableWeights` which only nudges existing
+        params) should return 0.
         """
         ...
 
-    def activate(self) -> nn.Module:
-        """Make the model usable for compute and return the module to call.
+    def activate(self) -> None:
+        """Make this piece's contribution ready for compute.
 
         Implementations may move weights to GPU, allocate a slot pool,
         register forward hooks, install an mmap, or do nothing for
-        always-resident strategies. Not necessarily re-entrant — call
+        always-resident pieces. Not necessarily re-entrant — call
         :meth:`deactivate` before activating again.
         """
         ...
@@ -115,8 +126,32 @@ class ModelStrategy(Protocol):
         """
         ...
 
+
+@runtime_checkable
+class ModelStrategy(ModelStrategyComponent, Protocol):
+    """Top-level strategy: a registerable, model-exposing variant of
+    :class:`ModelStrategyComponent`.
+
+    Adds ``model`` (so callers can reach the wrapped module) plus
+    context-manager methods (so ``with strategy as model: ...`` works).
+    This is what :class:`~ltx_core.memory.model_cache.ModelCache`
+    registers and manages.
+
+    The ``@runtime_checkable`` decoration enables ``isinstance(x,
+    ModelStrategy)`` for sanity checks, but the check is structural
+    and only verifies attribute *presence*, not signatures or types.
+    Treat it as a weak guard, not a contract verifier.
+    """
+
+    @property
+    def model(self) -> nn.Module:
+        """The wrapped model. Stable across activate/deactivate cycles
+        (the same Module is returned regardless of whether weights are
+        currently GPU-resident or pinned-CPU)."""
+        ...
+
     def __enter__(self) -> nn.Module:
-        """Equivalent to :meth:`activate`."""
+        """Calls :meth:`activate`, returns :attr:`model`."""
         ...
 
     def __exit__(

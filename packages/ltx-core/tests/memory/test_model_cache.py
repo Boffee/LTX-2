@@ -55,21 +55,25 @@ class FakeStrategy:
     def cache_bytes(self) -> int:
         return self._cache_bytes
 
-    def activate(self) -> nn.Module:
+    @property
+    def model(self) -> nn.Module:
+        return self.module
+
+    def activate(self) -> None:
         self.events.append("activate")
         if self._activate_raises is not None:
             raise self._activate_raises
         if self._active:
             raise RuntimeError("FakeStrategy already active")
         self._active = True
-        return self.module
 
     def deactivate(self) -> None:
         self.events.append("deactivate")
         self._active = False
 
     def __enter__(self) -> nn.Module:
-        return self.activate()
+        self.activate()
+        return self.model
 
     def __exit__(self, *exc) -> None:
         self.deactivate()
@@ -181,7 +185,7 @@ class TestRegistration:
         cache.register(_spec("a", 200), replace=True)
         # The freshly-replaced entry has not been built yet.
         assert cache.snapshot().used_cache_bytes == 0
-        # The previous handle was released during replace.
+        # The previous strategy was released during replace.
 
     def test_replace_active_raises(self) -> None:
         cache = ModelCache(1000)
@@ -391,11 +395,11 @@ class TestFailureModes:
         snap = cache.snapshot()
         assert snap.used_cache_bytes == 0
         assert snap.stats.factory_errors == 1
-        # Registration persisted (but no built handle).
+        # Registration persisted (but no built strategy).
         assert "bad" in snap.registered_keys
 
     def test_activation_failure_on_fresh_build_drops_entry(self) -> None:
-        # Activation failure on a freshly-built handle: discard it
+        # Activation failure on a freshly-built strategy: discard it
         # entirely so a retry rebuilds (the failed activation may have
         # left the strategy in an unknown state).
         cache = ModelCache(200)
@@ -597,10 +601,9 @@ class TestActualVsEstimate:
                 self._late_bytes = late_bytes
 
             def activate(self):
-                module = super().activate()
+                super().activate()
                 # Simulate pinning during activate.
                 self._cache_bytes = self._late_bytes
-                return module
 
         def factory():
             return LateBindStrategy(late_bytes=100)
@@ -624,7 +627,7 @@ class TestActualVsEstimate:
         with pytest.raises(ModelTooLargeError):
             with cache.use(spec):
                 pass
-        # The constructed handle reference was dropped.
+        # The constructed strategy reference was dropped.
         assert cache.snapshot().used_cache_bytes == 0
 
 
