@@ -196,3 +196,48 @@ class TestTmpfsDeferredValidation:
         cfg = _sharded(_base(fake_model_path, tmp_path), metadata_file, tmp_path)
         loaded = LtxTrainerConfig(**cfg)
         assert str(loaded.data.tmpfs_conditions_dir) == "/dev/shm"
+
+
+# ---------------------------------------------------------------------------
+# Distilled-sigma training: discrete_sigmas mode + base_lora wiring
+# ---------------------------------------------------------------------------
+
+
+class TestDiscreteSigmasMode:
+    def test_loads_with_sigmas_param(self, fake_model_path: Path, tmp_path: Path) -> None:
+        cfg = _base(fake_model_path, tmp_path)
+        cfg["flow_matching"] = {
+            "timestep_sampling_mode": "discrete_sigmas",
+            "timestep_sampling_params": {"sigmas": [1.0, 0.5, 0.25]},
+        }
+        loaded = LtxTrainerConfig(**cfg)
+        assert loaded.flow_matching.timestep_sampling_mode == "discrete_sigmas"
+        assert loaded.flow_matching.timestep_sampling_params["sigmas"] == [1.0, 0.5, 0.25]
+
+    def test_unknown_mode_rejected(self, fake_model_path: Path, tmp_path: Path) -> None:
+        cfg = _base(fake_model_path, tmp_path)
+        cfg["flow_matching"] = {"timestep_sampling_mode": "made_up_mode"}
+        with pytest.raises(ValueError):
+            LtxTrainerConfig(**cfg)
+
+
+class TestBaseLoraConfig:
+    def test_loads_with_existing_path(self, fake_model_path: Path, tmp_path: Path) -> None:
+        # fake_model_path is a real (empty) file from the fixture.
+        cfg = _base(fake_model_path, tmp_path)
+        cfg["model"]["base_lora"] = {"path": str(fake_model_path), "strength": 0.6}
+        loaded = LtxTrainerConfig(**cfg)
+        assert loaded.model.base_lora is not None
+        assert loaded.model.base_lora.strength == 0.6
+
+    def test_missing_path_rejected(self, fake_model_path: Path, tmp_path: Path) -> None:
+        cfg = _base(fake_model_path, tmp_path)
+        cfg["model"]["base_lora"] = {"path": str(tmp_path / "does_not_exist.safetensors")}
+        with pytest.raises(ValueError, match="does not exist"):
+            LtxTrainerConfig(**cfg)
+
+    def test_negative_strength_rejected(self, fake_model_path: Path, tmp_path: Path) -> None:
+        cfg = _base(fake_model_path, tmp_path)
+        cfg["model"]["base_lora"] = {"path": str(fake_model_path), "strength": -0.1}
+        with pytest.raises(ValueError):
+            LtxTrainerConfig(**cfg)

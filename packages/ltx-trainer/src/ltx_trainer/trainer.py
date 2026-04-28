@@ -490,6 +490,13 @@ class LtxvTrainer:
         transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
         self._transformer = self._transformer.to(dtype=transformer_dtype)
 
+        # Merge any pre-trained base LoRA into transformer weights
+        # BEFORE quantization (addmm_ does not support quanto/fp8
+        # tensors) and BEFORE PEFT wrapping. The new trainable LoRA
+        # then trains on top of the merged base.
+        if self._config.model.base_lora is not None:
+            self._merge_base_lora(self._transformer, self._config.model.base_lora)
+
         if self._config.acceleration.quantization is not None:
             if self._config.model.training_mode == "full":
                 raise ValueError("Quantization is not supported in full training mode.")
@@ -513,15 +520,6 @@ class LtxvTrainer:
 
     def _collect_trainable_params(self) -> None:
         """Collect trainable parameters based on training mode."""
-        # Merge any pre-trained base LoRA into transformer weights
-        # BEFORE wrapping with PEFT for the new trainable LoRA. This
-        # bakes the base LoRA into the (frozen) base; the new LoRA
-        # then trains on top of the modified base. Validation inherits
-        # the merged base automatically since both run against the
-        # same transformer object.
-        if self._config.model.base_lora is not None:
-            self._merge_base_lora(self._config.model.base_lora)
-
         if self._config.model.training_mode == "lora":
             # For LoRA training, first set up LoRA layers
             self._setup_lora()
@@ -534,69 +532,56 @@ class LtxvTrainer:
         self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
 
-    def _merge_base_lora(self, cfg: BaseLoraConfig) -> None:
+    @staticmethod
+    def _merge_base_lora(transformer: torch.nn.Module, cfg: BaseLoraConfig) -> None:
         """Load a pre-trained LoRA and merge its deltas into the
         transformer's base weights at the configured strength.
 
         For each (lora_A, lora_B) pair in the file, the per-layer
-        delta is ``(alpha / rank) * strength * (B @ A)``, added in
-        place to the matching transformer parameter. The matching
-        parameter is found by stripping the ``diffusion_model.``
-        prefix and the ``.lora_A.weight`` / ``.lora_B.weight`` suffix
-        and appending ``.weight``.
+        delta is ``strength * (B @ A)``, added in place to the matching
+        transformer parameter. This matches the LTX inference fuse path
+        (``ltx_core.loader.fuse_loras``), which applies LoRA deltas as
+        ``B @ A * strength`` with no alpha/rank scaling. The matching
+        parameter is found by stripping the ``diffusion_model.`` prefix
+        and the ``.lora_A.weight`` / ``.lora_B.weight`` suffix and
+        appending ``.weight``.
         """
         with safe_open(cfg.path, framework="pt") as f:
-            metadata = f.metadata() or {}
-            keys = list(f.keys())
-            tensors = {k: f.get_tensor(k) for k in keys}
+            pairs: dict[str, dict[str, str]] = {}
+            for k in f.keys():
+                if k.endswith(".lora_A.weight"):
+                    base = k[: -len(".lora_A.weight")]
+                    pairs.setdefault(base, {})["A"] = k
+                elif k.endswith(".lora_B.weight"):
+                    base = k[: -len(".lora_B.weight")]
+                    pairs.setdefault(base, {})["B"] = k
 
-        try:
-            alpha = float(metadata.get("lora_alpha", "1"))
-        except ValueError:
-            alpha = 1.0
-        logger.info(
-            f"📦 Merging base LoRA from {cfg.path} (alpha={alpha}, "
-            f"strength={cfg.strength}, {len(keys)} keys)"
-        )
+            logger.info(
+                f"📦 Merging base LoRA from {cfg.path} "
+                f"(strength={cfg.strength}, {len(pairs)} pairs)"
+            )
 
-        # Group keys by their base path (stripping the .lora_A.weight /
-        # .lora_B.weight suffix). Each base path should produce one
-        # (A, B) pair to merge.
-        pairs: dict[str, dict[str, torch.Tensor]] = {}
-        for k, v in tensors.items():
-            if k.endswith(".lora_A.weight"):
-                base = k[: -len(".lora_A.weight")]
-                pairs.setdefault(base, {})["A"] = v
-            elif k.endswith(".lora_B.weight"):
-                base = k[: -len(".lora_B.weight")]
-                pairs.setdefault(base, {})["B"] = v
-
-        # Resolve and merge.
-        params = dict(self._transformer.named_parameters())
-        merged = 0
-        skipped = 0
-        for lora_base, factors in pairs.items():
-            if "A" not in factors or "B" not in factors:
-                logger.warning(f"LoRA base {lora_base!r} missing A or B; skipping")
-                skipped += 1
-                continue
-            target_key = lora_base.removeprefix("diffusion_model.") + ".weight"
-            target = params.get(target_key)
-            if target is None:
-                logger.warning(
-                    f"LoRA base {lora_base!r} -> target {target_key!r} not "
-                    f"found in transformer; skipping"
-                )
-                skipped += 1
-                continue
-            a = factors["A"].to(device=target.device, dtype=target.dtype)
-            b = factors["B"].to(device=target.device, dtype=target.dtype)
-            rank = a.shape[0]
-            # PEFT convention: scaling = alpha / rank. Multiplied by
-            # the user-specified strength for fixed-fraction merge.
-            scaling = (alpha / rank) * cfg.strength
-            target.data.addmm_(b, a, alpha=scaling)
-            merged += 1
+            params = dict(transformer.named_parameters())
+            merged = 0
+            skipped = 0
+            for lora_base, factor_keys in pairs.items():
+                if "A" not in factor_keys or "B" not in factor_keys:
+                    logger.warning(f"LoRA base {lora_base!r} missing A or B; skipping")
+                    skipped += 1
+                    continue
+                target_key = lora_base.removeprefix("diffusion_model.") + ".weight"
+                target = params.get(target_key)
+                if target is None:
+                    logger.warning(
+                        f"LoRA base {lora_base!r} -> target {target_key!r} not "
+                        f"found in transformer; skipping"
+                    )
+                    skipped += 1
+                    continue
+                a = f.get_tensor(factor_keys["A"]).to(device=target.device, dtype=target.dtype)
+                b = f.get_tensor(factor_keys["B"]).to(device=target.device, dtype=target.dtype)
+                target.data.addmm_(b, a, alpha=cfg.strength)
+                merged += 1
         logger.info(f"✅ Merged {merged} LoRA pairs ({skipped} skipped)")
 
     def _init_timestep_sampler(self) -> None:
