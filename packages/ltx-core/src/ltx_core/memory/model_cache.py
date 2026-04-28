@@ -425,9 +425,14 @@ class ModelCache:
             self._lru.pop(key, None)  # leaving inactive set
 
         assert entry.strategy is not None
+        # Fetch model BEFORE activate. The Protocol contract says
+        # `strategy.model` is stable across cycles (available regardless
+        # of activation state), and reading first eliminates a post-
+        # activate exception window where a raising `model` getter
+        # would skip the deactivate path on the now-active strategy.
+        module = entry.strategy.model
         try:
             entry.strategy.activate()
-            module = entry.strategy.model
         except BaseException as exc:
             self._stats.activation_errors += 1
             # Treat all activation failures as poisoned regardless of

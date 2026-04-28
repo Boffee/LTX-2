@@ -91,7 +91,7 @@ from .model_cache import (
     ModelTooLargeError,
 )
 from .pinned_weights import PinnedWeights
-from .strategy import ModelStrategy, SlotOwnership
+from .strategy import ModelStrategy, ModelStrategyComponent, SlotOwnership
 
 # `ModelCacheSnapshot`, `ModelCacheStats`, and `ModelInfo` are observability
 # types — used by callers who introspect cache state, not the typical
@@ -109,6 +109,7 @@ __all__ = [
     "ModelNotRegisteredError",
     "ModelSpec",
     "ModelStrategy",
+    "ModelStrategyComponent",
     "ModelTooLargeError",
     "PinnedWeights",
     "SlotOwnership",

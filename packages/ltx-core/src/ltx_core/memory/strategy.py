@@ -147,7 +147,13 @@ class ModelStrategy(ModelStrategyComponent, Protocol):
     def model(self) -> nn.Module:
         """The wrapped model. Stable across activate/deactivate cycles
         (the same Module is returned regardless of whether weights are
-        currently GPU-resident or pinned-CPU)."""
+        currently GPU-resident or pinned-CPU).
+
+        Must be available immediately after construction and must not
+        depend on activation state. ``ModelCache`` reads this getter
+        BEFORE calling :meth:`activate` to avoid a post-activation
+        exception window where a raising getter would skip the
+        deactivate path on an already-active strategy."""
         ...
 
     def __enter__(self) -> nn.Module:

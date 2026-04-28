@@ -502,6 +502,54 @@ class TestActivateFailurePoison:
 
         assert strategy._teardown_stack is None
 
+    def test_failing_components_own_deactivate_runs(self) -> None:
+        # Regression: previously the composite registered each
+        # component's deactivate AFTER calling its activate. If a
+        # component's activate raised mid-way, only PRIOR siblings'
+        # deactivates ran — the failing component's own cleanup was
+        # skipped, leaking partial state. The fix registers deactivate
+        # FIRST, so the failing component is also unwound.
+        events: list[str] = []
+
+        class _Recorder:
+            def __init__(self, name: str, raise_on_activate: bool = False):
+                self._name = name
+                self._raise = raise_on_activate
+
+            cache_bytes = 0
+
+            def activate(self) -> None:
+                events.append(f"activate:{self._name}")
+                if self._raise:
+                    # Simulate partial mutation before failing.
+                    events.append(f"partial_state:{self._name}")
+                    raise RuntimeError(f"{self._name} activate failed")
+
+            def deactivate(self) -> None:
+                events.append(f"deactivate:{self._name}")
+
+        m = nn.Linear(4, 4)
+        components = [_Recorder("A"), _Recorder("B"), _Recorder("C", raise_on_activate=True)]
+        strat = BlockStreamingStrategy(m, components)
+
+        with pytest.raises(RuntimeError, match="C activate failed"):
+            strat.activate()
+
+        # Activates ran in order until C raised.
+        assert "activate:A" in events
+        assert "activate:B" in events
+        assert "activate:C" in events
+        assert "partial_state:C" in events
+        # Critical: C's own deactivate MUST run (the regression's bug
+        # was that it didn't). Plus prior siblings' deactivates run in
+        # reverse order via ExitStack.
+        assert "deactivate:C" in events
+        assert "deactivate:B" in events
+        assert "deactivate:A" in events
+        # Reverse order on unwind.
+        deact_events = [e for e in events if e.startswith("deactivate:")]
+        assert deact_events == ["deactivate:C", "deactivate:B", "deactivate:A"]
+
 
 # ---------------------------------------------------------------------------
 # Prefetch failure during deactivate

@@ -211,10 +211,11 @@ with cache.use(spec) as vae:  # registers if missing, then uses
                        └──────────────────┘
 ```
 
-`ModelStrategy` is the protocol every strategy implements —
-`cache_bytes`, `activate()`, `deactivate()`, plus the
-context-manager dunders. `ModelCache` only talks to this protocol;
-write a new strategy and it slots in:
+`ModelStrategy` is the protocol every top-level strategy implements:
+`cache_bytes`, `model` (the wrapped module, stable across cycles),
+`activate()`, `deactivate()`, plus context-manager dunders.
+`ModelCache` only talks to this protocol; write a new strategy and
+it slots in:
 
 ```python
 from torch import nn
@@ -222,11 +223,21 @@ from torch import nn
 class MyStrategy:
     @property
     def cache_bytes(self) -> int: ...
-    def activate(self) -> nn.Module: ...
+    @property
+    def model(self) -> nn.Module: ...
+    def activate(self) -> None: ...
     def deactivate(self) -> None: ...
-    def __enter__(self) -> nn.Module: return self.activate()
-    def __exit__(self, *exc) -> None: self.deactivate()
+    def __enter__(self) -> nn.Module:
+        self.activate()
+        return self.model
+    def __exit__(self, *exc) -> None:
+        self.deactivate()
 ```
+
+A narrower `ModelStrategyComponent` Protocol (just `cache_bytes` +
+`activate` + `deactivate`, no `model`) describes pieces composable
+inside a top-level strategy — `BlockStreamer`, `TrainableWeights`,
+and a `PinnedWeights` used as a non-block sibling all satisfy it.
 
 ## Strategy lifecycle
 

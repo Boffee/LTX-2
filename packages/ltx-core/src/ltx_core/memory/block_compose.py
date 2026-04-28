@@ -310,11 +310,11 @@ class BlockStreamingStrategy:
     Parameters
     ----------
     model:
-        The full model. ``activate()`` returns this. After
-        :meth:`deactivate`, drop both the strategy reference and the
-        model reference to release pinned memory — strategies don't
-        have a destructive ``close()``; resource cleanup happens via
-        reference dropping + GC.
+        The full model. Reachable via :attr:`model` regardless of
+        activation state. After :meth:`deactivate`, drop both the
+        strategy reference and the model reference to release pinned
+        memory — strategies don't have a destructive ``close()``;
+        resource cleanup happens via reference dropping + GC.
     components:
         Ordered list of components. Activated in order;
         deactivated in reverse via :class:`contextlib.ExitStack`.
@@ -355,6 +355,14 @@ class BlockStreamingStrategy:
 
         Reach the wrapped model via :attr:`model` once activated.
 
+        Per-component deactivate callbacks are registered BEFORE each
+        ``component.activate()`` call. If the component's activate
+        raises after partially mutating state (registered hooks,
+        allocated GPU pool, etc.), its own deactivate runs as part of
+        the unwind and cleans the partial state up — relying on the
+        component contract that deactivate is idempotent and safe to
+        call regardless of whether activate completed.
+
         **Lifecycle is caller's responsibility.** Calling activate()
         twice without an intervening deactivate() will double-activate
         components — undefined behavior."""
@@ -362,8 +370,11 @@ class BlockStreamingStrategy:
 
         with contextlib.ExitStack() as stack:
             for component in self._components:
-                component.activate()
+                # Register deactivate FIRST so a mid-activate exception
+                # still triggers the failing component's own cleanup,
+                # not just the prior siblings'.
                 stack.callback(component.deactivate)
+                component.activate()
             self._teardown_stack = stack.pop_all()
 
     def deactivate(self) -> None:
