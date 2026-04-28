@@ -79,7 +79,9 @@ class _QuantoGpu:
     scale: torch.Tensor
 
 
-def _build_qbytes(state: _QuantoPinned, data: torch.Tensor, scale: torch.Tensor):
+def _build_qbytes(
+    state: _QuantoPinned, data: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
     """Reconstruct a :class:`WeightQBytesTensor` from raw pieces +
     cached quant metadata."""
     return WeightQBytesTensor.create(  # type: ignore[union-attr]
@@ -101,6 +103,7 @@ class QuantoAdapter:
     uses_pinned_host: ClassVar[bool] = True
     supports_trainable: ClassVar[bool] = False
     moves_grad: ClassVar[bool] = False
+    is_quanto: ClassVar[bool] = True
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
@@ -188,13 +191,13 @@ class QuantoAdapter:
         dst.scale.copy_(src.scale, non_blocking=non_blocking)
 
     @staticmethod
-    def copy_back(gpu_state: _QuantoGpu, dst: _QuantoPinned) -> None:
+    def copy_back(src: _QuantoGpu, dst: _QuantoPinned) -> None:
         # Quanto is inference-only (supports_trainable=False); copy_back
         # would only be used if a caller mistakenly enabled it for a
         # quanto slot. Implement defensively: copy both pieces back so
         # the deactivated state reflects whatever the model produced.
-        dst.data.copy_(gpu_state.data, non_blocking=False)
-        dst.scale.copy_(gpu_state.scale, non_blocking=False)
+        dst.data.copy_(src.data, non_blocking=False)
+        dst.scale.copy_(src.scale, non_blocking=False)
 
     @staticmethod
     def cache_bytes(state: _QuantoPinned) -> int:

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from collections.abc import Hashable
 from dataclasses import dataclass
-from typing import ClassVar, Literal, Protocol, runtime_checkable
+from typing import Any, ClassVar, Literal, Protocol, TypeVar, runtime_checkable
 
 import torch
 from torch import nn
@@ -34,6 +34,12 @@ __all__ = [
     "register_adapter",
     "select_adapter",
 ]
+
+# Adapter-specific opaque state types. The Protocol is generic over
+# them so consumers (PinnedParamBuffer) can stay tensor-type-agnostic
+# while each adapter pins its own concrete state shape.
+PinnedStateT = TypeVar("PinnedStateT")
+GpuStateT = TypeVar("GpuStateT")
 
 
 ParamIdentity = Literal["original", "stable_replacement", "ephemeral_replacement"]
@@ -52,7 +58,7 @@ ParamIdentity = Literal["original", "stable_replacement", "ephemeral_replacement
 
 
 @runtime_checkable
-class TensorAdapter(Protocol):
+class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
     """Adapter encoding the mechanics of pinning, moving, and wrapping
     one tensor type. Adapters are stateless; they hold no per-param data.
 
@@ -61,9 +67,10 @@ class TensorAdapter(Protocol):
     :attr:`supports_trainable`, etc.) so the composer can validate
     compatibility (e.g., reject ``trainable + ephemeral_replacement``).
 
-    The state types (:class:`PinnedState`, :class:`GpuState`) are opaque
-    to consumers and adapter-specific. Keep them as small slotted
-    dataclasses inside each adapter's module.
+    Generic over two opaque state types: ``PinnedStateT`` (the pinned
+    host representation) and ``GpuStateT`` (the GPU storage). Each
+    adapter pins these to its own concrete dataclasses; consumers
+    round-trip the opaque types without inspecting them.
     """
 
     # ------- Capability flags -------
@@ -78,13 +85,22 @@ class TensorAdapter(Protocol):
     supports_trainable: ClassVar[bool]
     """True if this adapter can host trainable params correctly across
     activate/deactivate cycles. Implies ``param_identity == "original"``
-    or ``"stable_replacement"`` AND that ``copy_back`` round-trips
-    in-place updates."""
+    AND that ``copy_back`` round-trips in-place updates AND that the
+    user's pre-wrap Parameter object survives in-model. Currently no
+    adapter supports trainable through :class:`PinnedParamBuffer` — the
+    buffer's slot-replacement mechanism orphans the original Parameter.
+    This flag exists for future identity-preserving paths and for
+    composer-side compatibility checks."""
 
     moves_grad: ClassVar[bool]
     """True if the adapter handles ``param.grad`` migration alongside
     ``param.data``. Implementations that don't manage grads leave
     ``.grad`` as the user found it (typically GPU after backward)."""
+
+    is_quanto: ClassVar[bool]
+    """True for :class:`QuantoAdapter`, False for everyone else.
+    Lets compat shims and adapter-specific code paths branch on
+    quanto-ness without string comparison on adapter class names."""
 
     # ------- Per-tensor methods (stateless) -------
 
@@ -105,26 +121,26 @@ class TensorAdapter(Protocol):
         ...
 
     @staticmethod
-    def clone_pin(t: torch.Tensor) -> "PinnedState":
+    def clone_pin(t: torch.Tensor) -> PinnedStateT:
         """Clone ``t`` into pinned (or regular) host memory. Returns
         opaque adapter-specific state used by subsequent operations."""
         ...
 
     @staticmethod
-    def cpu_param(state: "PinnedState") -> nn.Parameter:
+    def cpu_param(state: PinnedStateT) -> nn.Parameter:
         """Build a stable :class:`nn.Parameter` wrapping the host state.
         Used as the deactivated-state slot value
         (``module._parameters[leaf] = cpu_param``)."""
         ...
 
     @staticmethod
-    def alloc_gpu(state: "PinnedState", device: torch.device) -> "GpuState":
+    def alloc_gpu(state: PinnedStateT, device: torch.device) -> GpuStateT:
         """Allocate empty GPU storage mirroring this state's layout.
         Returns opaque adapter-specific state."""
         ...
 
     @staticmethod
-    def gpu_param(pinned: "PinnedState", gpu_state: "GpuState") -> nn.Parameter:
+    def gpu_param(pinned: PinnedStateT, gpu_state: GpuStateT) -> nn.Parameter:
         """Build a stable :class:`nn.Parameter` wrapping the GPU state.
         Reused across many :meth:`copy_to_gpu` calls.
 
@@ -136,30 +152,31 @@ class TensorAdapter(Protocol):
 
     @staticmethod
     def copy_to_gpu(
-        src: "PinnedState", dst: "GpuState", *, non_blocking: bool = False
+        src: PinnedStateT, dst: GpuStateT, *, non_blocking: bool = False
     ) -> None:
         """Bulk DMA the pinned state's bytes into pre-allocated GPU storage."""
         ...
 
     @staticmethod
-    def copy_back(gpu_state: "GpuState", dst: "PinnedState") -> None:
+    def copy_back(src: GpuStateT, dst: PinnedStateT) -> None:
         """Copy live GPU bytes back into the pinned host state. Required
         when the model has mutated ``p.data`` on GPU (training step) and
         the deactivated state must reflect those updates."""
         ...
 
     @staticmethod
-    def cache_bytes(state: "PinnedState") -> int:
+    def cache_bytes(state: PinnedStateT) -> int:
         """Total bytes this state consumes in host memory. Used by
         :class:`ModelCache` for budget accounting."""
         ...
 
     @staticmethod
-    def homogeneity_key(state: "PinnedState") -> Hashable:
-        """Identity tuple used to test that a list of states is
+    def homogeneity_key(state: PinnedStateT) -> Hashable:
+        """Identity used to test that a list of states is
         layout-homogeneous (same dtype/shape/stride/quant-metadata).
         Required by :class:`BlockStreamer`'s GPU pool, which preallocates
-        slots assuming all blocks share the same layout."""
+        slots assuming all blocks share the same layout. Returns any
+        hashable value — typically a tuple of layout components."""
         ...
 
 
@@ -185,20 +202,30 @@ class _RegularGpu:
 class RegularAdapter:
     """Adapter for plain ``torch.Tensor`` (no subclass machinery).
 
-    Uses ``p.data = ...`` storage swap so :class:`nn.Parameter` identity
-    is preserved across cycles. This is the optimizer-safe path:
-    ``optim.state[id(p)]`` stays valid, ``exp_avg``/``exp_avg_sq``
-    references survive activate/deactivate.
+    Builds fresh stable :class:`nn.Parameter` objects for the deactivated
+    (pinned-CPU) and activated (GPU) states. Consumers slot-replace via
+    ``module._parameters[leaf] = ...``; the same two Parameter objects
+    are reused across all cycles, so this is ``stable_replacement``
+    identity — not ``original``. PyTorch optimizers keyed by the user's
+    *pre-wrap* Parameter become orphaned once :class:`PinnedParamBuffer`
+    installs ``cpu_param`` in the slot. **This adapter is frozen-only.**
 
-    Conservative on dispatch: only matches exactly ``type(t) is torch.Tensor``.
-    Unrecognized tensor subclasses fall through to other adapters or
-    raise via :func:`select_adapter`.
+    A future identity-preserving path (true ``p.data = ...`` swap on the
+    user's original Parameter, no slot replacement) would let
+    :class:`PinnedWeights` handle trainables; until then, trainable
+    params should be excluded from PinnedWeights via ``skip_slots``.
+
+    Conservative on dispatch: only matches exactly
+    ``type(t) is torch.Tensor`` (or ``nn.Parameter``). Unrecognized
+    tensor subclasses fall through to other adapters or raise via
+    :func:`select_adapter`.
     """
 
-    param_identity: ClassVar[ParamIdentity] = "original"
+    param_identity: ClassVar[ParamIdentity] = "stable_replacement"
     uses_pinned_host: ClassVar[bool] = True
-    supports_trainable: ClassVar[bool] = True
-    moves_grad: ClassVar[bool] = False  # caller handles .grad device
+    supports_trainable: ClassVar[bool] = False
+    moves_grad: ClassVar[bool] = False
+    is_quanto: ClassVar[bool] = False
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
@@ -234,8 +261,9 @@ class RegularAdapter:
         return _RegularGpu(data=torch.empty_like(state.data, device=device))
 
     @staticmethod
-    def gpu_param(pinned: _RegularPinned, gpu_state: _RegularGpu) -> nn.Parameter:
-        # pinned unused: regular tensors carry no metadata beyond storage
+    def gpu_param(pinned: _RegularPinned, gpu_state: _RegularGpu) -> nn.Parameter:  # noqa: ARG004
+        # pinned unused: regular tensors carry no metadata beyond storage.
+        # Argument kept for Protocol parity with QuantoAdapter, which needs it.
         return nn.Parameter(gpu_state.data, requires_grad=False)
 
     @staticmethod
@@ -267,10 +295,10 @@ class RegularAdapter:
 # returns True wins. RegularAdapter is appended last as the conservative
 # fallback for plain tensors. Subclass adapters (quanto, etc.) register
 # themselves at import time and slot in front.
-_ADAPTERS: list[type[TensorAdapter]] = []
+_ADAPTERS: list[type[TensorAdapter[Any, Any]]] = []
 
 
-def register_adapter(adapter: type[TensorAdapter]) -> None:
+def register_adapter(adapter: type[TensorAdapter[Any, Any]]) -> None:
     """Register an adapter for use by :func:`select_adapter`. Adapters
     registered later take priority over earlier ones for ``matches()``
     dispatch — this lets specialized adapters (quanto, FP8 variants)
@@ -279,7 +307,7 @@ def register_adapter(adapter: type[TensorAdapter]) -> None:
         _ADAPTERS.insert(0, adapter)
 
 
-def select_adapter(t: torch.Tensor) -> type[TensorAdapter]:
+def select_adapter(t: torch.Tensor) -> type[TensorAdapter[Any, Any]]:
     """Find the registered adapter that handles tensor ``t``.
 
     Tries adapters in reverse registration order (newest first), returning

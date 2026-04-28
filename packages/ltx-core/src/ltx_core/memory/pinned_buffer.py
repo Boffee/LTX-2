@@ -156,7 +156,7 @@ class PinnedParamBuffer:
 
     @property
     def is_quanto(self) -> bool:
-        return self.adapter.__name__ == "QuantoAdapter"
+        return self.adapter.is_quanto
 
     @property
     def qtype(self) -> Any:
