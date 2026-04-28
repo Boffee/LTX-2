@@ -121,18 +121,20 @@ def detect_streaming_region_ties(  # noqa: PLR0912, PLR0915 (3-category check is
 
     - **Cross-region ties** (block↔block, block↔non-block): the per-
       region pinning regimes can't coordinate to share storage.
-    - **Mixed frozen/trainable ties** across any region boundary:
-      the frozen side gets pinned and slot-swapped while the
-      trainable side is moved separately on activate, breaking the
-      sharing invariant silently.
+    - **Mixed frozen/trainable ties** anywhere — across regions OR
+      within a single region. The frozen side gets pinned and slot-
+      replaced while the trainable side is moved via storage swap on
+      activate; the two mechanisms cannot share a tied storage
+      without breaking aliasing invariants silently.
     - **Intra-block ties** (two slots in the same block sharing
       storage): per-block stores walk ``named_parameters()`` with
       default duplicate removal and only swap one alias slot,
       leaving the other pointing at non-pinned data.
 
-    Non-block-internal ties (the standard ``tie_weights()`` embed↔head
-    pattern) are handled correctly by :class:`PinnedWeights`'s
-    storage-key dedup and are NOT rejected here.
+    Non-block-internal all-frozen ties (the standard ``tie_weights()``
+    embed↔head pattern) are handled correctly by
+    :class:`PinnedWeights`'s storage-key dedup and are NOT rejected
+    here.
 
     Buffer detection classifies by SLOT location ``(parent_id, leaf)``,
     not by buffer object id. This catches the case where the same
@@ -172,6 +174,20 @@ def detect_streaming_region_ties(  # noqa: PLR0912, PLR0915 (3-category check is
                 "(neither frozen↔frozen nor frozen↔trainable). Use "
                 "whole-model PinnedWeights, disable block streaming, or "
                 "untie the parameters."
+            )
+        # Mixed-grad ties within a single region (block-internal or
+        # non-block-internal): slot replacement (frozen path) and
+        # storage swap (trainable path) cannot share a tied storage.
+        # The frozen alias would get a fresh wrapper while the trainable
+        # alias keeps the original Parameter, silently breaking the
+        # tying invariant on GPU. Reject upfront.
+        grads = {grad for _, _, grad, _, _ in members}
+        if len(grads) > 1:
+            raise ValueError(
+                f"Tied storage spans both trainable and frozen parameters: "
+                f"{names}. Slot-replace (frozen) and storage-swap "
+                "(trainable) mechanisms cannot share a tied storage. "
+                "Untie the parameters or freeze/unfreeze them consistently."
             )
         sole_region = next(iter(regions))
         if sole_region.startswith("block:"):
@@ -432,6 +448,15 @@ def make_block_offloader(
     # consolidates the move once for clarity.)
     model.to("cpu")
 
+    # Single source of truth for trainable partitioning. Both strategies
+    # receive this set so they can route trainable params to
+    # TrainableMover instead of pinning/streaming them. SlotOwnership
+    # tuples survive slot mutation, so the filter is stable across
+    # construction order.
+    trainable_slots: set[SlotOwnership] = {
+        s.slot for s in iter_param_slots(model) if s.param.requires_grad
+    }
+
     # Build streamers + PinnedWeights. If construction fails partway,
     # the partial state goes out of scope — GC frees the
     # PinnedParamBuffer objects. Any model slots already mutated stay
@@ -446,14 +471,15 @@ def make_block_offloader(
                 prefetch_count=pf_list[i],
                 name=f"BlockStreamer[{layer_paths[i]}]",
                 strict_homogeneous=strict_homogeneous,
+                skip_slots=trainable_slots,
             )
         )
 
-    # Union of every streamer's slot filter. SlotOwnership tuples
-    # are (id(parent), leaf, kind) which survive slot mutation,
-    # so the PinnedWeights walk below correctly skips block-owned
-    # slots.
-    skip_slots: set[SlotOwnership] = set()
+    # PinnedWeights skips both block-owned slots (claimed by streamers)
+    # and trainable slots (handled by TrainableMover). The streamer's
+    # slot_filter already excludes trainables in-block, so the union
+    # is { frozen block slots } ∪ { trainable slots anywhere }.
+    skip_slots: set[SlotOwnership] = set(trainable_slots)
     for s in streamers:
         skip_slots |= s.slot_filter
 
@@ -493,15 +519,17 @@ def _broadcast(value: int | Sequence[int], n: int, name: str) -> list[int]:
 def _has_non_block_pinnable_content(
     model: nn.Module, skip_slots: set[SlotOwnership]
 ) -> bool:
-    """True if the outer model has any frozen param or buffer at a
-    slot the streamers DON'T own. Decides whether to construct the
-    composed PinnedWeights at all (it raises on empty input)."""
-    if any(
-        not s.param.requires_grad and s.slot not in skip_slots
-        for s in iter_param_slots(model)
-    ):
-        return True
-    return any(s.slot not in skip_slots for s in iter_buffer_slots(model))
+    """True if the outer model has any param or buffer at a slot
+    not covered by ``skip_slots``. Decides whether to construct the
+    composed PinnedWeights at all (it raises on empty input).
+
+    The composer's ``skip_slots`` already includes both block-owned
+    slots and trainable slots, so any unskipped slot is content
+    PinnedWeights will manage."""
+    return (
+        any(s.slot not in skip_slots for s in iter_param_slots(model))
+        or any(s.slot not in skip_slots for s in iter_buffer_slots(model))
+    )
 
 
 __all__ = [

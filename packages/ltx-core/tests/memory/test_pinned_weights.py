@@ -125,8 +125,20 @@ class TestCleanup:
 
 
 class TestConstruction:
-    def test_rejects_all_trainable_model_with_no_buffers(self) -> None:
+    def test_rejects_unskipped_trainable_param(self) -> None:
+        # Direct use without a composer: a trainable slot must hit the
+        # contract guard. Slot replacement would orphan the user's
+        # Parameter and break optimizer state — fail loudly rather than
+        # silently freeze.
         m = nn.Linear(4, 4)  # default requires_grad=True, no buffers
+        with pytest.raises(ValueError, match="cannot manage trainable slot"):
+            PinnedWeights(m, torch.device("cpu"))
+
+    def test_rejects_empty_model(self) -> None:
+        # Frozen but with no params or buffers — nothing to manage.
+        class Empty(nn.Module):
+            pass
+        m = Empty()
         with pytest.raises(ValueError, match="at least one frozen parameter"):
             PinnedWeights(m, torch.device("cpu"))
 
@@ -312,15 +324,18 @@ class TestSharedSubmoduleAlias:
 class TestMixedTrainableFrozenTied:
     def test_raises_when_tied_group_has_mixed_grad(self) -> None:
         # Two distinct Parameter objects sharing storage, one trainable
-        # and one frozen. Silently skipping the trainable one would break
-        # the tying invariant — must raise.
+        # and one frozen. The contract guard fires on the trainable
+        # alias the iteration encounters first; the composer's
+        # detect_streaming_region_ties is the upstream layer that
+        # rejects this with a tied-storage-specific message before
+        # any pinning runs.
         shared = torch.randn(8, dtype=torch.bfloat16)
         a = nn.Parameter(shared, requires_grad=True)
         b = nn.Parameter(shared, requires_grad=False)
         m = nn.Module()
         m.a = a
         m.b = b
-        with pytest.raises(ValueError, match="mixed requires_grad|both trainable and frozen"):
+        with pytest.raises(ValueError, match="cannot manage trainable slot"):
             PinnedWeights(m, torch.device("cpu"))
 
 

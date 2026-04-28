@@ -1241,3 +1241,230 @@ class TestDetectStreamingRegionTies:
             detect_streaming_region_ties(
                 m, [list(m.group_a), list(m.group_b)],
             )
+
+
+# ---------------------------------------------------------------------------
+# Composer-driven trainable partitioning (contract guards + tie detection)
+# ---------------------------------------------------------------------------
+
+
+class TestBlockStreamerContractGuard:
+    """BlockStreamer is frozen-only by mechanism (slot replacement
+    breaks Parameter identity). Direct callers must partition trainables
+    via skip_slots; the composer does this automatically."""
+
+    def test_direct_unskipped_trainable_raises(self) -> None:
+        # Build a trainable block. No skip_slots → contract guard fires
+        # at construction. Fail loudly rather than silently freeze the
+        # param.
+        block = nn.Linear(4, 4, bias=False)  # default requires_grad=True
+        with pytest.raises(ValueError, match="cannot manage trainable slot"):
+            BlockStreamer(
+                blocks=[block, nn.Linear(4, 4, bias=False)],
+                target_device=torch.device("cpu"),
+                blocks_to_swap=1,
+            )
+
+    def test_direct_skipped_trainable_constructs(self) -> None:
+        # With the trainable slot in skip_slots, construction succeeds
+        # and the slot is excluded from slot_filter.
+        from ltx_core.memory.slot_graph import iter_param_slots
+
+        block_0 = nn.Linear(4, 4, bias=False)  # trainable
+        block_1 = nn.Linear(4, 4, bias=False)  # trainable
+        # Snapshot trainable slots before BlockStreamer construction.
+        trainable_slots = {
+            s.slot for s in iter_param_slots(block_0) if s.param.requires_grad
+        } | {
+            s.slot for s in iter_param_slots(block_1) if s.param.requires_grad
+        }
+        # No frozen content remains, so the streamer's pinning walk
+        # produces empty buffers but no contract violation.
+        streamer = BlockStreamer(
+            blocks=[block_0, block_1],
+            target_device=torch.device("cpu"),
+            blocks_to_swap=1,
+            skip_slots=trainable_slots,
+        )
+        assert streamer.slot_filter.isdisjoint(trainable_slots)
+
+
+class TestMixedGradTieDetection:
+    """detect_streaming_region_ties must catch mixed-grad ties anywhere
+    — across regions, intra-block, or intra-non-block. Slot replacement
+    (frozen) and storage swap (trainable) cannot cohabit a tied
+    storage."""
+
+    def test_intra_non_block_mixed_grad_tie_raises(self) -> None:
+        # Two distinct Parameter objects sharing storage, both in the
+        # non-block region, with mixed grad. Slot replacement on the
+        # frozen alias would diverge from the storage-swap-managed
+        # trainable alias on activate.
+        shared = torch.randn(4, 4)
+        a = nn.Parameter(shared, requires_grad=True)
+        b = nn.Parameter(shared, requires_grad=False)
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)]
+                )
+                self.alias_a = nn.Module()
+                self.alias_b = nn.Module()
+                self.alias_a.weight = a
+                self.alias_b.weight = b
+
+        m = M()
+        for p in m.transformer_blocks.parameters():
+            p.requires_grad = False
+        with pytest.raises(ValueError, match="trainable and frozen"):
+            make_block_offloader(
+                m, torch.device("cpu"),
+                layers_attr="transformer_blocks", blocks_to_swap=1,
+            )
+
+    def test_intra_block_mixed_grad_tie_raises(self) -> None:
+        # Two distinct Parameter objects sharing storage, both inside
+        # the same block, with mixed grad. The intra-block tie check
+        # already fires for distinct slots; this test ensures the
+        # mixed-grad message takes precedence (or at minimum, that the
+        # composer rejects).
+        shared = torch.randn(4, 4)
+
+        class TiedBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q = nn.Linear(4, 4, bias=False)
+                self.k = nn.Linear(4, 4, bias=False)
+                self.q.weight = nn.Parameter(shared, requires_grad=True)
+                self.k.weight = nn.Parameter(shared, requires_grad=False)
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [TiedBlock(), nn.Linear(4, 4, bias=False)]
+                )
+
+        m = M()
+        for p in m.transformer_blocks[1].parameters():
+            p.requires_grad = False
+        with pytest.raises(ValueError, match="trainable and frozen|intra-block tied"):
+            make_block_offloader(
+                m, torch.device("cpu"),
+                layers_attr="transformer_blocks", blocks_to_swap=1,
+            )
+
+
+class TestLoRAInBlockRouting:
+    """LoRA-shaped models: blocks contain frozen base layers plus
+    trainable adapter layers. The composer must route the base to
+    BlockStreamer and the adapters to TrainableMover; neither
+    strategy's contract guard should fire on a well-formed LoRA model.
+    """
+
+    def _make_lora_block(self) -> nn.Module:
+        """One LoRA-wrapped layer: frozen base.weight + trainable
+        lora_a/lora_b weights."""
+
+        class LoraBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.base = nn.Linear(4, 4, bias=False)
+                self.lora_a = nn.Linear(4, 2, bias=False)
+                self.lora_b = nn.Linear(2, 4, bias=False)
+                self.base.weight.requires_grad = False
+                # lora_a/lora_b stay trainable (default)
+
+        return LoraBlock()
+
+    def test_composer_routes_lora_to_trainable_mover(self) -> None:
+        class M(nn.Module):
+            def __init__(self, blocks):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(blocks)
+
+        m = M([self._make_lora_block() for _ in range(2)])
+        strat = make_block_offloader(
+            m, torch.device("cpu"),
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+        try:
+            # Strategy composes a TrainableMover for the LoRA params.
+            assert any(
+                isinstance(c, TrainableMover) for c in strat._components
+            )
+            # Each BlockStreamer's slot_filter only contains frozen
+            # base.weight slots; lora_a/lora_b are skipped.
+            streamers = [
+                c for c in strat._components if isinstance(c, BlockStreamer)
+            ]
+            assert len(streamers) == 1
+            streamer = streamers[0]
+            # Walk the model and confirm: lora slot ownerships are NOT in
+            # streamer's slot_filter; base.weight slot ownerships ARE.
+            from ltx_core.memory.slot_graph import iter_param_slots
+            for s in iter_param_slots(m):
+                if s.param.requires_grad:
+                    assert s.slot not in streamer.slot_filter, (
+                        f"trainable slot {s.name} leaked into streamer's "
+                        f"slot_filter"
+                    )
+                elif "transformer_blocks" in s.name and "base.weight" in s.name:
+                    assert s.slot in streamer.slot_filter, (
+                        f"frozen base slot {s.name} missing from "
+                        f"streamer's slot_filter"
+                    )
+        finally:
+            strat.deactivate()
+
+    def test_composer_partitions_skip_slots_correctly(self) -> None:
+        # Through-test: the composer's PinnedWeights receives skip_slots
+        # = block_slots ∪ trainable_slots. Verify by checking that no
+        # trainable param slot appears in PinnedWeights' managed slots
+        # and no block-internal slot does either.
+        from ltx_core.memory.slot_graph import iter_param_slots
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)]
+                )
+                # Non-block content: one frozen + one trainable.
+                self.frozen_head = nn.Linear(4, 4, bias=False)
+                self.trainable_bias = nn.Parameter(torch.zeros(4))
+
+        m = M()
+        for p in m.transformer_blocks.parameters():
+            p.requires_grad = False
+        m.frozen_head.weight.requires_grad = False
+        # m.trainable_bias stays trainable
+
+        strat = make_block_offloader(
+            m, torch.device("cpu"),
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+        try:
+            pinned = next(
+                c for c in strat._components if isinstance(c, PinnedWeights)
+            )
+            # PinnedWeights manages frozen_head.weight only — block content
+            # routed to BlockStreamer, trainable_bias to TrainableMover.
+            managed_slot_ids = {
+                (id(parent), leaf)
+                for _buf, locs in pinned._slots
+                for parent, leaf in locs
+            }
+            for s in iter_param_slots(m):
+                key = (id(s.parent), s.leaf)
+                if s.name == "frozen_head.weight":
+                    assert key in managed_slot_ids
+                else:
+                    assert key not in managed_slot_ids, (
+                        f"slot {s.name} (requires_grad={s.param.requires_grad}) "
+                        f"leaked into PinnedWeights"
+                    )
+        finally:
+            strat.deactivate()

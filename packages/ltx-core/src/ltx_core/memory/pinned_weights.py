@@ -88,7 +88,15 @@ class PinnedWeights:
     :meth:`deactivate` swaps the slots back at the pinned-CPU
     Parameters so the GPU storage is released by refcount.
 
-    Trainable parameters (``requires_grad=True``) are not pinned.
+    Frozen-only by mechanism. Slot replacement installs fresh
+    ``requires_grad=False`` Parameter wrappers, which orphans any
+    optimizer state keyed by the user's pre-wrap Parameter — a
+    trainable slot here would silently break training. Trainable
+    slots must be partitioned out via ``skip_slots`` (the composer
+    routes them to a separate strategy automatically; direct users
+    are on the hook). An unskipped trainable slot raises at
+    construction.
+
     Buffer-only modules (only registered buffers, no frozen params)
     are valid — common for sibling tables like RoPE/positional
     embeddings managed via :func:`make_block_offloader`'s non-block
@@ -113,9 +121,9 @@ class PinnedWeights:
         ``(parent_module, leaf, kind)`` slots to skip during the
         walk. Used by composers like :class:`BlockStreamingStrategy`
         that want to hand the *outer* model to PinnedWeights but
-        manage some subset of slots themselves (e.g., the streamed
-        block list). Skipped slots are not pinned. Slot identity is
-        based on
+        manage some subset of slots themselves (block-streamed slots,
+        trainable slots routed to a separate mover). Skipped slots are
+        not pinned. Slot identity is based on
         ``(id(parent), leaf, kind)`` rather than ``id(param)`` so the
         filter survives slot-mutating strategies regardless of
         construction order.
@@ -145,19 +153,35 @@ class PinnedWeights:
         #     alias rather than just one canonical name
         #   - the standard tie_weights() pattern (one Parameter under
         #     multiple names) shows up at every name
-        # We then group by storage identity and validate requires_grad
-        # uniformity per group: a tied group with mixed
-        # trainable/frozen members would silently break the tying
-        # invariant if we pinned only the frozen members, so we raise.
-        # All-trainable groups are skipped (PinnedWeights only manages
-        # frozen weights). All-frozen groups become one PinnedParamBuffer
-        # whose slot-location list is deduped by (id(parent), leaf) so
-        # we don't double-write into shared submodules.
+        # We then group by storage identity. All-frozen groups become
+        # one PinnedParamBuffer whose slot-location list is deduped by
+        # (id(parent), leaf) so we don't double-write into shared
+        # submodules.
+        #
+        # Trainable filtering and mixed-grad tie detection are NOT
+        # done here. They're the composer's job (make_block_offloader
+        # +detect_streaming_region_ties) — PinnedWeights' job is pure
+        # mechanism: pin and slot-replace what the caller hands it.
+        # A trainable slot that escapes into this walk is a caller
+        # bug; the contract guard below catches it.
         # storage_key -> list of (name, param, parent_module, leaf)
         groups: dict[tuple[Any, ...], list[tuple[str, nn.Parameter, nn.Module, str]]] = {}
         for s in iter_param_slots(model):
             if s.slot in self._skip_slots:
                 continue  # composer (e.g. BlockStreamingStrategy) owns this slot
+            # Contract guard: slot replacement installs a fresh
+            # requires_grad=False Parameter wrapper, orphaning the
+            # user's pre-wrap Parameter and any optimizer state keyed
+            # by it. Fail loudly rather than silently freeze.
+            if s.param.requires_grad:
+                raise ValueError(
+                    f"PinnedWeights cannot manage trainable slot {s.name!r}: "
+                    "slot replacement installs a frozen Parameter wrapper, "
+                    "orphaning any optimizer state keyed by the user's "
+                    "pre-wrap Parameter. Pass the slot in skip_slots, or "
+                    "use make_block_offloader which partitions trainables "
+                    "into TrainableMover automatically."
+                )
             if s.param.numel() == 0:
                 # Zero-sized tensors all share data_ptr()==0; key by id(p)
                 # to keep them in independent groups rather than spuriously
@@ -170,17 +194,6 @@ class PinnedWeights:
         # Per unique buffer: (PinnedParamBuffer, list of (parent, leaf)).
         self._slots: list[tuple[PinnedParamBuffer, list[tuple[nn.Module, str]]]] = []
         for members in groups.values():
-            grad_states = {p.requires_grad for _, p, _, _ in members}
-            if len(grad_states) > 1:
-                names = [n for n, _, _, _ in members]
-                raise ValueError(
-                    f"Tied storage spans both trainable and frozen parameters: "
-                    f"{names}. PinnedWeights cannot pin a tied group with mixed "
-                    "requires_grad without breaking the tying invariant. Untie "
-                    "the parameters or freeze/unfreeze them consistently."
-                )
-            if True in grad_states:
-                continue  # all trainable — PinnedWeights does not manage these
             first_name, first_p = members[0][0], members[0][1]
             buf = PinnedParamBuffer(first_name, first_p)
             seen_locs: set[tuple[int, str]] = set()

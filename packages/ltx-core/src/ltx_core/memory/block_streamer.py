@@ -157,7 +157,12 @@ class _BlockPinnedStore:
       state and :meth:`evict_block` is needed to restore CPU params.
     """
 
-    def __init__(self, layers: Sequence[nn.Module]) -> None:
+    def __init__(
+        self,
+        layers: Sequence[nn.Module],
+        *,
+        skip_slots: set[SlotOwnership] | None = None,
+    ) -> None:
         self._layers = list(layers)
         self._param_bufs: list[list[PinnedParamBuffer]] = []
         self._param_locs: list[list[tuple[str, nn.Module, str]]] = []
@@ -168,6 +173,7 @@ class _BlockPinnedStore:
             list[tuple[torch.Tensor, nn.Module, str, torch.Tensor]]
         ] = []
         self._slots_applied = False
+        skip: set[SlotOwnership] = skip_slots or set()
         # Slot-ownership filter built during the same walk: identifies
         # every (parent_module, leaf, kind) slot the streamer will own.
         # Stable across slot mutation, so consumers (PinnedWeights with
@@ -185,8 +191,24 @@ class _BlockPinnedStore:
             # Parameter on activate (the user's bug, not ours).
             seen_param_ids: set[int] = set()
             for s in iter_param_slots(layer):
-                if s.param.requires_grad:
+                if s.slot in skip:
                     continue
+                # Contract guard: streaming cycles slots through
+                # pre-allocated requires_grad=False Parameter wrappers,
+                # which destroys the per-Parameter identity that
+                # optimizers and grad accumulation rely on. Trainable
+                # slots must be partitioned out by the caller (composer
+                # routes them via skip_slots; direct users are on the
+                # hook). Fail loudly here rather than silently freezing.
+                if s.param.requires_grad:
+                    raise ValueError(
+                        f"BlockStreamer cannot manage trainable slot {s.name!r}: "
+                        "streaming swaps slot Parameters with frozen pool "
+                        "wrappers, breaking optimizer identity. Pass the slot "
+                        "in skip_slots, or use BlockStreamingStrategy / "
+                        "make_block_offloader which partitions trainables "
+                        "into TrainableMover automatically."
+                    )
                 slot_filter.add(s.slot)
                 if id(s.param) in seen_param_ids:
                     continue
@@ -458,6 +480,16 @@ class BlockStreamer:
         with :func:`make_block_offloader` /
         :class:`BlockStreamingStrategy` to get the pool benefit on
         heterogeneous models like Flux.
+    skip_slots:
+        Optional set of :class:`SlotOwnership` tuples identifying
+        ``(parent_module, leaf, kind)`` slots inside the blocks that
+        the streamer should not pin. Used by composers to route
+        trainable in-block params (LoRA / PEFT adapters) to a separate
+        strategy. Streaming cannot host trainables — slot replacement
+        breaks Parameter identity. A trainable slot not in
+        ``skip_slots`` triggers a contract-guard ValueError at
+        construction; this is intentional, fail-loud over silent
+        freezing of the param.
     """
 
     def __init__(
@@ -469,6 +501,7 @@ class BlockStreamer:
         prefetch_count: int = 2,
         name: str | None = None,
         strict_homogeneous: bool = True,
+        skip_slots: set[SlotOwnership] | None = None,
     ) -> None:
         self._blocks: list[nn.Module] = list(blocks)
         self._target_device = target_device
@@ -490,7 +523,7 @@ class BlockStreamer:
         # untouched.
         for block in self._blocks:
             block.to("cpu")
-        store = _BlockPinnedStore(self._blocks)
+        store = _BlockPinnedStore(self._blocks, skip_slots=skip_slots)
         if strict_homogeneous and not store.is_homogeneous():
             raise ValueError(
                 f"{self._name}: blocks are not homogeneous (different "
