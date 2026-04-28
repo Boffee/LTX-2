@@ -265,9 +265,7 @@ class PinnedWeights:
         """Total pinned host bytes held. Tied weights counted once."""
         total = 0
         for buf, _ in self._slots:
-            total += buf.pinned_data.numel() * buf.pinned_data.element_size()
-            if buf.pinned_scale is not None:
-                total += buf.pinned_scale.numel() * buf.pinned_scale.element_size()
+            total += buf.cache_bytes
         for pinned, _ in self._buffer_slots:
             total += pinned.numel() * pinned.element_size()
         return total

@@ -80,25 +80,22 @@ class _GpuSlot:
     for PEFT compatibility and to avoid Python ref churn).
     """
 
-    __slots__ = ("_gpu_data", "_gpu_params", "_gpu_scale")
+    __slots__ = ("_gpu_params", "_gpu_states")
 
     def __init__(self, template: list[PinnedParamBuffer], device: torch.device) -> None:
-        self._gpu_data: dict[str, torch.Tensor] = {}
-        self._gpu_scale: dict[str, torch.Tensor | None] = {}
+        # Opaque adapter-specific GPU state per buffer; the streamer
+        # round-trips it through copy_to_gpu / make_gpu_param without
+        # inspecting its shape.
+        self._gpu_states: dict[str, Any] = {}
         self._gpu_params: dict[str, nn.Parameter] = {}
         for buf in template:
-            gpu_data, gpu_scale = buf.allocate_gpu_storage(device)
-            self._gpu_data[buf.name] = gpu_data
-            self._gpu_scale[buf.name] = gpu_scale
-            self._gpu_params[buf.name] = buf.make_gpu_param(gpu_data, gpu_scale)
+            gpu_state = buf.allocate_gpu_storage(device)
+            self._gpu_states[buf.name] = gpu_state
+            self._gpu_params[buf.name] = buf.make_gpu_param(gpu_state)
 
     def copy_from(self, bufs: list[PinnedParamBuffer], non_blocking: bool = False) -> None:
         for buf in bufs:
-            buf.copy_to_gpu(
-                self._gpu_data[buf.name],
-                self._gpu_scale[buf.name],
-                non_blocking=non_blocking,
-            )
+            buf.copy_to_gpu(self._gpu_states[buf.name], non_blocking=non_blocking)
 
     def get_param(self, name: str) -> nn.Parameter:
         return self._gpu_params[name]
@@ -246,9 +243,7 @@ class _BlockPinnedStore:
         total = 0
         for block in self._param_bufs:
             for buf in block:
-                total += buf.pinned_data.numel() * buf.pinned_data.element_size()
-                if buf.pinned_scale is not None:
-                    total += buf.pinned_scale.numel() * buf.pinned_scale.element_size()
+                total += buf.cache_bytes
         for buf_records in self._buf_records:
             for _mb, _sm, _ln, cpu_clone in buf_records:
                 total += cpu_clone.numel() * cpu_clone.element_size()
@@ -259,13 +254,12 @@ class _BlockPinnedStore:
             return True
         ref = self._param_bufs[0]
 
+        # Per-block layout signature: each buffer's name (slot identity)
+        # paired with its adapter-provided homogeneity_key (storage
+        # shape/dtype/stride/quant-metadata, whatever the adapter
+        # considers layout-significant).
         def _key(b: PinnedParamBuffer) -> tuple:
-            return (
-                b.name, b.pinned_data.shape, b.pinned_data.dtype, b.is_quanto,
-                b.pinned_scale.shape if b.pinned_scale is not None else None,
-                b.pinned_scale.dtype if b.pinned_scale is not None else None,
-                b.qtype, b.axis, b.act_qt, b.size, b.stride,
-            )
+            return (b.name, b.homogeneity_key)
 
         ref_keys = [_key(b) for b in ref]
         for block in self._param_bufs[1:]:

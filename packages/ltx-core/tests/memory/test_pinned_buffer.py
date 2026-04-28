@@ -44,24 +44,23 @@ class TestPinnedParamBuffer:
         p = nn.Parameter(torch.randn(16, dtype=torch.bfloat16), requires_grad=False)
         buf = PinnedParamBuffer("w", p)
         device = torch.device("cuda")
-        gpu_data, gpu_scale = buf.allocate_gpu_storage(device)
-        gpu_param = buf.make_gpu_param(gpu_data, gpu_scale)
+        gpu_state = buf.allocate_gpu_storage(device)
+        gpu_param = buf.make_gpu_param(gpu_state)
         assert gpu_param.is_cuda
-        assert gpu_scale is None  # non-quanto
         # First copy
-        buf.copy_to_gpu(gpu_data, gpu_scale, non_blocking=True)
+        buf.copy_to_gpu(gpu_state, non_blocking=True)
         torch.cuda.synchronize()
-        assert torch.equal(gpu_data.cpu(), buf.pinned_data)
-        # Mutate pinned source and re-copy — gpu_data should track.
+        assert torch.equal(gpu_state.data.cpu(), buf.pinned_data)
+        # Mutate pinned source and re-copy — gpu state should track.
         new_vals = torch.randn(16, dtype=torch.bfloat16, pin_memory=True)
         buf.pinned_data.copy_(new_vals)
-        buf.copy_to_gpu(gpu_data, gpu_scale, non_blocking=True)
+        buf.copy_to_gpu(gpu_state, non_blocking=True)
         torch.cuda.synchronize()
-        assert torch.equal(gpu_data.cpu(), new_vals)
-        # Stable storage — gpu_param wraps the same GPU bytes as gpu_data.
+        assert torch.equal(gpu_state.data.cpu(), new_vals)
+        # Stable storage — gpu_param wraps the same GPU bytes as gpu_state.
         # _GpuSlot relies on this: build the Parameter wrapper once at slot
         # construction, mutate underlying storage in place on each load.
-        assert gpu_param.data_ptr() == gpu_data.data_ptr()
+        assert gpu_param.data_ptr() == gpu_state.data.data_ptr()
 
     def test_contiguous_format_forced(self) -> None:
         # A view of a transposed tensor is non-contiguous. clone() with
