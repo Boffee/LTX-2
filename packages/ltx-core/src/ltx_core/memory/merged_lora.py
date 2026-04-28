@@ -92,10 +92,8 @@ class LoRABundle:
     blocks: dict[int, dict[str, LoRALayerFactors]]
 
 
-# Per-block flat merge list, built at activate from the active subset
-# of pinned factors. Each entry is (qual, B_gpu, A_gpu, scaling) ready
-# for a single in-place addmm_ call. Iteration order within a block is
-# preserved for bf16-reproducible output.
+# Per-block flat merge list: (qual, B_gpu, A_gpu, scaling) tuples
+# ready for a single in-place addmm_ call.
 _MergePlan = dict[int, list[tuple[str, torch.Tensor, torch.Tensor, float]]]
 
 
@@ -147,13 +145,6 @@ class MergedLoRAStrategy:
         # Pin factors. Detects duplicate names while building.
         self._pinned: dict[str, dict[int, dict[str, LoRALayerFactors]]] = (
             self._pin_factors(loras, base_dtype, len(blocks), target_shapes)
-        )
-        # cache_bytes contribution from factors (final after pinning).
-        self._lora_bytes = sum(
-            f.A.numel() * f.A.element_size() + f.B.numel() * f.B.element_size()
-            for blocks_ in self._pinned.values()
-            for layers in blocks_.values()
-            for f in layers.values()
         )
 
         self._active: tuple[str, ...] = ()
@@ -224,9 +215,14 @@ class MergedLoRAStrategy:
 
     @property
     def cache_bytes(self) -> int:
-        total = self._streamer.cache_bytes + self._lora_bytes
+        total = self._streamer.cache_bytes
         if self._non_block is not None:
             total += self._non_block.cache_bytes
+        for blocks in self._pinned.values():
+            for layers in blocks.values():
+                for f in layers.values():
+                    total += f.A.numel() * f.A.element_size()
+                    total += f.B.numel() * f.B.element_size()
         return total
 
     def activate(self) -> None:
