@@ -238,20 +238,24 @@ class MergedLoRAStrategy:
         self._model: nn.Module | None = model
         self._device = target_device
 
-        # Pin factors up front; clone-and-cast to base dtype.
-        self._pinned_factors: _PinnedMap = self._pin_factors(loras, base_dtype)
-        self._available: set[str] = {b.name for b in loras}
-        if len(self._available) != len(loras):
-            raise ValueError("LoRA names must be unique")
-        self._active: tuple[str, ...] = ()
-        self._gpu_factors: _GpuMap | None = None
-
-        # Resolve blocks and build the streamer with our merge hook.
+        # Resolve blocks first so factor validation can range-check
+        # block indices against the actual ModuleList length.
         blocks = list(_resolve_attr(model, layers_attr))
         if not blocks:
             raise ValueError(
                 f"layers_attr={layers_attr!r} resolved to an empty ModuleList"
             )
+
+        self._available: set[str] = {b.name for b in loras}
+        if len(self._available) != len(loras):
+            raise ValueError("LoRA names must be unique")
+
+        # Pin factors up front; clone-and-cast to base dtype, validate.
+        self._pinned_factors: _PinnedMap = self._pin_factors(
+            loras, base_dtype, num_blocks=len(blocks),
+        )
+        self._active: tuple[str, ...] = ()
+        self._gpu_factors: _GpuMap | None = None
         self._streamer = BlockStreamer(
             blocks=blocks,
             target_device=target_device,
@@ -295,7 +299,14 @@ class MergedLoRAStrategy:
                 f"Unknown LoRA names: {sorted(unknown)}. "
                 f"Registered: {sorted(self._available)}"
             )
-        self._active = tuple(names)
+        active = tuple(names)
+        if len(set(active)) != len(active):
+            raise ValueError(
+                f"Duplicate LoRA names in active list: {active}. Each "
+                f"LoRA can be active at most once per window — repeated "
+                f"merges would compound the delta."
+            )
+        self._active = active
 
     @property
     def active(self) -> tuple[str, ...]:
@@ -326,27 +337,54 @@ class MergedLoRAStrategy:
 
     def activate(self) -> None:
         # Order: copy factors to GPU FIRST so they exist before any
-        # streamer prefetch can fire. Then activate streamers.
+        # streamer prefetch can fire. Then activate components, tracking
+        # which succeeded so a mid-activation failure can roll them back.
         self._gpu_factors = self._copy_factors_to_gpu(self._active)
+        activated: list[Any] = []
         try:
             if self._pinned is not None:
                 self._pinned.activate()
+                activated.append(self._pinned)
             self._streamer.activate()
+            activated.append(self._streamer)
         except BaseException:
-            # Activate failed midway — drop GPU factors to free their
-            # storage. The caller's recovery is to drop the strategy
-            # reference (existing poison-on-failure semantics).
+            # Best-effort rollback in reverse activation order. Swallow
+            # any rollback exceptions — the original activate failure is
+            # what surfaces.
+            for c in reversed(activated):
+                try:
+                    c.deactivate()
+                except BaseException:
+                    logger.exception(
+                        "MergedLoRAStrategy: rollback deactivate raised "
+                        "during activation cleanup; original error follows"
+                    )
             self._gpu_factors = None
             raise
+        # Sync to close the race between the streamer's resident-block
+        # initial merges (addmm_ enqueued on the default stream during
+        # streamer.activate(), kernels async even though copy_from is
+        # blocking) and any forward the caller may run on a non-default
+        # compute stream. The cost is microseconds; the alternative is a
+        # subtle cross-stream visibility race.
+        if self._device.type == "cuda":
+            torch.cuda.synchronize(self._device)
 
     def deactivate(self) -> None:
         # Order: deactivate streamers FIRST to drain prefetch (no
         # in-flight merge ops reference factors after this), then
-        # deactivate non-block, then free factor storage.
-        self._streamer.deactivate()
-        if self._pinned is not None:
-            self._pinned.deactivate()
-        self._gpu_factors = None
+        # non-block PinnedWeights, then free factor storage. Each step
+        # is in its own try/finally so a raise in one stage doesn't
+        # leak the rest — particularly the GPU factor storage, which
+        # would otherwise survive a poisoned strategy reference.
+        try:
+            self._streamer.deactivate()
+        finally:
+            try:
+                if self._pinned is not None:
+                    self._pinned.deactivate()
+            finally:
+                self._gpu_factors = None
 
     def __enter__(self) -> nn.Module:
         self.activate()
@@ -384,18 +422,53 @@ class MergedLoRAStrategy:
 
     @staticmethod
     def _pin_factors(
-        loras: Sequence[LoRABundle], base_dtype: torch.dtype,
+        loras: Sequence[LoRABundle],
+        base_dtype: torch.dtype,
+        num_blocks: int,
     ) -> _PinnedMap:
-        """Clone-cast-and-pin user-supplied factors to host memory."""
+        """Validate, clone-cast-and-pin user-supplied factors.
+
+        Validation surfaces bad bundles at construction rather than as
+        cryptic failures inside prefetch futures. Trainable factors are
+        silently detached (we own a frozen snapshot) — that's
+        intentional, not a bug, since the strategy is inference-only.
+        """
         pinned: _PinnedMap = {}
         for lora in loras:
             per_block: dict[int, dict[str, _PinnedFactors]] = {}
             for block_idx, layer_factors in lora.blocks.items():
+                if not 0 <= block_idx < num_blocks:
+                    raise ValueError(
+                        f"LoRA {lora.name!r}: block_idx={block_idx} out of "
+                        f"range [0, {num_blocks})"
+                    )
                 per_layer: dict[str, _PinnedFactors] = {}
                 for qual_name, f in layer_factors.items():
+                    if not f.A.is_floating_point() or not f.B.is_floating_point():
+                        raise ValueError(
+                            f"LoRA {lora.name!r} block {block_idx} "
+                            f"layer {qual_name!r}: factors must be floating-"
+                            f"point; got A.dtype={f.A.dtype}, B.dtype={f.B.dtype}"
+                        )
+                    if f.A.dim() != 2 or f.B.dim() != 2:
+                        raise ValueError(
+                            f"LoRA {lora.name!r} block {block_idx} "
+                            f"layer {qual_name!r}: A and B must be 2D; got "
+                            f"A.shape={tuple(f.A.shape)}, B.shape={tuple(f.B.shape)}"
+                        )
+                    if f.A.shape[0] != f.B.shape[1]:
+                        raise ValueError(
+                            f"LoRA {lora.name!r} block {block_idx} "
+                            f"layer {qual_name!r}: rank mismatch — A.shape[0]"
+                            f"={f.A.shape[0]}, B.shape[1]={f.B.shape[1]} "
+                            f"(expected A=(rank, in_dim), B=(out_dim, rank))"
+                        )
+                    # .cpu() handles the case of factors stored on GPU
+                    # (e.g., loaded from a model that's on GPU). Without
+                    # it, .pin_memory() would raise.
                     per_layer[qual_name] = _PinnedFactors(
-                        A=f.A.detach().to(base_dtype).clone().pin_memory(),
-                        B=f.B.detach().to(base_dtype).clone().pin_memory(),
+                        A=f.A.detach().cpu().to(base_dtype).clone().pin_memory(),
+                        B=f.B.detach().cpu().to(base_dtype).clone().pin_memory(),
                         scaling=float(f.scaling),
                     )
                 per_block[block_idx] = per_layer

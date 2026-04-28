@@ -145,6 +145,105 @@ class TestConstructionValidation:
                 blocks_to_swap=0,
             )
 
+    def test_rejects_out_of_range_block_idx(self) -> None:
+        m = _make_bf16_model(num_blocks=4, dim=16)
+        # LoRA targets a block index that doesn't exist.
+        bad = LoRABundle(
+            name="oob",
+            blocks={
+                99: {"attn.weight": LoRALayerFactors(
+                    A=torch.randn(4, 16), B=torch.randn(16, 4), scaling=1.0,
+                )},
+            },
+        )
+        with pytest.raises(ValueError, match="block_idx=99 out of range"):
+            MergedLoRAStrategy(
+                m, torch.device("cpu"),
+                loras=[bad],
+                layers_attr="transformer_blocks", blocks_to_swap=1,
+            )
+
+    def test_rejects_non_floating_factor_dtype(self) -> None:
+        m = _make_bf16_model(num_blocks=4, dim=16)
+        bad = LoRABundle(
+            name="int_factors",
+            blocks={
+                0: {"attn.weight": LoRALayerFactors(
+                    A=torch.zeros(4, 16, dtype=torch.int32),
+                    B=torch.zeros(16, 4, dtype=torch.int32),
+                    scaling=1.0,
+                )},
+            },
+        )
+        with pytest.raises(ValueError, match="floating-point"):
+            MergedLoRAStrategy(
+                m, torch.device("cpu"),
+                loras=[bad],
+                layers_attr="transformer_blocks", blocks_to_swap=1,
+            )
+
+    def test_rejects_non_2d_factor_shape(self) -> None:
+        m = _make_bf16_model(num_blocks=4, dim=16)
+        bad = LoRABundle(
+            name="bad_shape",
+            blocks={
+                0: {"attn.weight": LoRALayerFactors(
+                    A=torch.randn(4),                # 1D, not 2D
+                    B=torch.randn(16, 4),
+                    scaling=1.0,
+                )},
+            },
+        )
+        with pytest.raises(ValueError, match="must be 2D"):
+            MergedLoRAStrategy(
+                m, torch.device("cpu"),
+                loras=[bad],
+                layers_attr="transformer_blocks", blocks_to_swap=1,
+            )
+
+    def test_rejects_rank_mismatch(self) -> None:
+        m = _make_bf16_model(num_blocks=4, dim=16)
+        bad = LoRABundle(
+            name="rank_mismatch",
+            blocks={
+                0: {"attn.weight": LoRALayerFactors(
+                    A=torch.randn(4, 16),    # rank=4
+                    B=torch.randn(16, 8),    # rank=8 — mismatch
+                    scaling=1.0,
+                )},
+            },
+        )
+        with pytest.raises(ValueError, match="rank mismatch"):
+            MergedLoRAStrategy(
+                m, torch.device("cpu"),
+                loras=[bad],
+                layers_attr="transformer_blocks", blocks_to_swap=1,
+            )
+
+    def test_accepts_factors_already_on_gpu(self) -> None:
+        # If the user constructs factors on GPU (e.g., from a model on
+        # GPU), the strategy should .cpu() them before pinning rather
+        # than failing.
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        m = _make_bf16_model(num_blocks=4, dim=16)
+        gpu_factors = LoRABundle(
+            name="from_gpu",
+            blocks={
+                0: {"attn.weight": LoRALayerFactors(
+                    A=torch.randn(4, 16, device="cuda"),
+                    B=torch.randn(16, 4, device="cuda"),
+                    scaling=1.0,
+                )},
+            },
+        )
+        s = MergedLoRAStrategy(
+            m, torch.device("cuda"),
+            loras=[gpu_factors],
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+        assert "from_gpu" in s.register_lora_names()
+
 
 # ---------------------------------------------------------------------------
 # Active set management
@@ -161,6 +260,16 @@ class TestActiveSet:
         )
         with pytest.raises(ValueError, match="Unknown LoRA names"):
             s.set_active(["unknown"])
+
+    def test_set_active_rejects_duplicates(self) -> None:
+        m = _make_bf16_model()
+        s = MergedLoRAStrategy(
+            m, torch.device("cpu"),
+            loras=[_make_lora("a", 4, 16), _make_lora("b", 4, 16)],
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+        with pytest.raises(ValueError, match="Duplicate LoRA names"):
+            s.set_active(["a", "b", "a"])
 
     def test_set_active_preserves_order(self) -> None:
         m = _make_bf16_model()
