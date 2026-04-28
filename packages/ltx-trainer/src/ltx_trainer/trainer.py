@@ -15,6 +15,7 @@ from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft
 from peft.tuners.tuners_utils import BaseTunerLayer
 from peft.utils import ModulesToSaveWrapper
 from pydantic import BaseModel
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import Tensor
 from torch.optim import AdamW
@@ -32,7 +33,7 @@ from torchvision.transforms import functional as F  # noqa: N812
 
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
-from ltx_trainer.config import LtxTrainerConfig
+from ltx_trainer.config import BaseLoraConfig, LtxTrainerConfig
 from ltx_trainer.config_display import print_config
 from ltx_trainer.datasets import PrecomputedDataset
 from ltx_trainer.gpu_utils import free_gpu_memory, free_gpu_memory_context, get_gpu_memory_gb
@@ -512,6 +513,15 @@ class LtxvTrainer:
 
     def _collect_trainable_params(self) -> None:
         """Collect trainable parameters based on training mode."""
+        # Merge any pre-trained base LoRA into transformer weights
+        # BEFORE wrapping with PEFT for the new trainable LoRA. This
+        # bakes the base LoRA into the (frozen) base; the new LoRA
+        # then trains on top of the modified base. Validation inherits
+        # the merged base automatically since both run against the
+        # same transformer object.
+        if self._config.model.base_lora is not None:
+            self._merge_base_lora(self._config.model.base_lora)
+
         if self._config.model.training_mode == "lora":
             # For LoRA training, first set up LoRA layers
             self._setup_lora()
@@ -523,6 +533,71 @@ class LtxvTrainer:
 
         self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
+
+    def _merge_base_lora(self, cfg: BaseLoraConfig) -> None:
+        """Load a pre-trained LoRA and merge its deltas into the
+        transformer's base weights at the configured strength.
+
+        For each (lora_A, lora_B) pair in the file, the per-layer
+        delta is ``(alpha / rank) * strength * (B @ A)``, added in
+        place to the matching transformer parameter. The matching
+        parameter is found by stripping the ``diffusion_model.``
+        prefix and the ``.lora_A.weight`` / ``.lora_B.weight`` suffix
+        and appending ``.weight``.
+        """
+        with safe_open(cfg.path, framework="pt") as f:
+            metadata = f.metadata() or {}
+            keys = list(f.keys())
+            tensors = {k: f.get_tensor(k) for k in keys}
+
+        try:
+            alpha = float(metadata.get("lora_alpha", "1"))
+        except ValueError:
+            alpha = 1.0
+        logger.info(
+            f"📦 Merging base LoRA from {cfg.path} (alpha={alpha}, "
+            f"strength={cfg.strength}, {len(keys)} keys)"
+        )
+
+        # Group keys by their base path (stripping the .lora_A.weight /
+        # .lora_B.weight suffix). Each base path should produce one
+        # (A, B) pair to merge.
+        pairs: dict[str, dict[str, torch.Tensor]] = {}
+        for k, v in tensors.items():
+            if k.endswith(".lora_A.weight"):
+                base = k[: -len(".lora_A.weight")]
+                pairs.setdefault(base, {})["A"] = v
+            elif k.endswith(".lora_B.weight"):
+                base = k[: -len(".lora_B.weight")]
+                pairs.setdefault(base, {})["B"] = v
+
+        # Resolve and merge.
+        params = dict(self._transformer.named_parameters())
+        merged = 0
+        skipped = 0
+        for lora_base, factors in pairs.items():
+            if "A" not in factors or "B" not in factors:
+                logger.warning(f"LoRA base {lora_base!r} missing A or B; skipping")
+                skipped += 1
+                continue
+            target_key = lora_base.removeprefix("diffusion_model.") + ".weight"
+            target = params.get(target_key)
+            if target is None:
+                logger.warning(
+                    f"LoRA base {lora_base!r} -> target {target_key!r} not "
+                    f"found in transformer; skipping"
+                )
+                skipped += 1
+                continue
+            a = factors["A"].to(device=target.device, dtype=target.dtype)
+            b = factors["B"].to(device=target.device, dtype=target.dtype)
+            rank = a.shape[0]
+            # PEFT convention: scaling = alpha / rank. Multiplied by
+            # the user-specified strength for fixed-fraction merge.
+            scaling = (alpha / rank) * cfg.strength
+            target.data.addmm_(b, a, alpha=scaling)
+            merged += 1
+        logger.info(f"✅ Merged {merged} LoRA pairs ({skipped} skipped)")
 
     def _init_timestep_sampler(self) -> None:
         """Initialize the timestep sampler based on the config."""
@@ -1045,6 +1120,18 @@ class LtxvTrainer:
                 else None
             )
 
+            # If training uses discrete-sigmas sampling (distillation
+            # mode), validation should match the inference sigmas the
+            # model was trained against. Append 0.0 as the terminal
+            # value for Euler termination.
+            validation_sigmas: list[float] | None = None
+            if self._config.flow_matching.timestep_sampling_mode == "discrete_sigmas":
+                training_sigmas = list(
+                    self._config.flow_matching.timestep_sampling_params.get("sigmas", [])
+                )
+                if training_sigmas:
+                    validation_sigmas = [*training_sigmas, 0.0]
+
             # Create generation config
             gen_config = GenerationConfig(
                 prompt=prompt,
@@ -1054,6 +1141,7 @@ class LtxvTrainer:
                 num_frames=num_frames,
                 frame_rate=self._config.validation.frame_rate,
                 num_inference_steps=inference_steps,
+                sigmas=validation_sigmas,
                 guidance_scale=self._config.validation.guidance_scale,
                 seed=self._config.validation.seed,
                 condition_image=condition_image,

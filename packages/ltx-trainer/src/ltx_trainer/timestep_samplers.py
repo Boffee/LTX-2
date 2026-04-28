@@ -134,9 +134,45 @@ class ShiftedLogitNormalTimestepSampler(TimestepSampler):
         return shift
 
 
+class DiscreteSigmasTimestepSampler(TimestepSampler):
+    """Samples uniformly from a fixed list of sigma values.
+
+    Used for distillation training: pick from the exact set of sigmas
+    the model will see at inference (e.g. the 8 distilled sigmas of an
+    8-step distilled inference). The terminal sigma 0.0 is excluded
+    since the prediction target there is degenerate (clean = clean).
+
+    Standard convention from consistency-distillation literature
+    (LCM, etc.): include 1.0 (pure noise = first inference step's
+    starting point) and all interior values; exclude 0.0.
+    """
+
+    def __init__(self, sigmas: list[float]):
+        if not sigmas:
+            raise ValueError("DiscreteSigmasTimestepSampler requires a non-empty sigma list")
+        if any(s <= 0.0 for s in sigmas):
+            raise ValueError(
+                f"DiscreteSigmasTimestepSampler sigmas must be > 0; got {sigmas}. "
+                "The terminal sigma 0.0 has a degenerate training target and should be excluded."
+            )
+        self._sigmas = torch.tensor(sigmas, dtype=torch.float32)
+
+    def sample(
+        self, batch_size: int, seq_length: int | None = None, device: torch.device = None,  # noqa: ARG002
+    ) -> torch.Tensor:
+        idx = torch.randint(0, len(self._sigmas), (batch_size,), device=device)
+        return self._sigmas.to(device)[idx]
+
+    def sample_for(self, batch: torch.Tensor) -> torch.Tensor:
+        if batch.ndim != 3:
+            raise ValueError(f"Batch should have 3 dimensions, got {batch.ndim}")
+        return self.sample(batch.shape[0], device=batch.device)
+
+
 SAMPLERS = {
     "uniform": UniformTimestepSampler,
     "shifted_logit_normal": ShiftedLogitNormalTimestepSampler,
+    "discrete_sigmas": DiscreteSigmasTimestepSampler,
 }
 
 

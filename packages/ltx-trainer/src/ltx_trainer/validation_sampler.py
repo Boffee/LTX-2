@@ -81,7 +81,8 @@ class GenerationConfig:
     width: int = 960  # Output video width in pixels
     num_frames: int = 97  # Number of frames to generate
     frame_rate: float = 25.0  # Frame rate for temporal position scaling
-    num_inference_steps: int = 30  # Number of denoising steps
+    num_inference_steps: int = 30  # Number of denoising steps (ignored if `sigmas` is set)
+    sigmas: list[float] | None = None  # Optional explicit sigma schedule, must end at 0.0. Overrides num_inference_steps.
     guidance_scale: float = 4.0  # CFG guidance scale
     seed: int = 42  # Random seed for reproducibility
     condition_image: Tensor | None = None  # Optional first frame image for image-to-video
@@ -494,8 +495,19 @@ class ValidationSampler:
         device: torch.device,
     ) -> tuple[LatentState, LatentState | None]:
         """Run the denoising loop using X0 prediction with CFG and optional STG."""
-        scheduler = LTX2Scheduler()
-        sigmas = scheduler.execute(steps=config.num_inference_steps).to(device).float()
+        if config.sigmas is not None:
+            # Caller-supplied schedule (e.g., distilled 8-step sigmas).
+            # Must end at 0.0 for proper Euler termination.
+            if config.sigmas[-1] != 0.0:
+                raise ValueError(
+                    f"GenerationConfig.sigmas must end at 0.0 for Euler "
+                    f"termination; got {config.sigmas[-1]}. The standard "
+                    f"distilled schedule appends 0.0 as the terminal value."
+                )
+            sigmas = torch.tensor(config.sigmas, dtype=torch.float32, device=device)
+        else:
+            scheduler = LTX2Scheduler()
+            sigmas = scheduler.execute(steps=config.num_inference_steps).to(device).float()
         stepper = EulerDiffusionStep()
         cfg_guider = CFGGuider(config.guidance_scale)
         stg_guider = STGGuider(config.stg_scale)

@@ -13,6 +13,36 @@ class ConfigBaseModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class BaseLoraConfig(ConfigBaseModel):
+    """A pre-trained LoRA to merge into the base transformer weights.
+
+    Loaded once at startup, scaled by `strength`, and merged in place
+    via `target += strength * scaling * (B @ A)` per target layer. The
+    file is consumed -- the strategy holds no reference to it after the
+    merge runs. This is the right shape for fixed-strength distillation
+    LoRAs (the strength stays constant for the whole training run).
+    """
+
+    path: str | Path = Field(
+        ...,
+        description="Path to the LoRA safetensors file.",
+    )
+
+    strength: float = Field(
+        default=1.0,
+        description="Multiplier applied to the LoRA's per-layer scaling (alpha/rank). "
+        "1.0 reproduces the LoRA's nominal effect; 0.6 applies it at 60% strength.",
+        ge=0.0,
+    )
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, v: str | Path) -> str | Path:
+        if not Path(v).exists():
+            raise ValueError(f"base_lora.path does not exist: {v}")
+        return v
+
+
 class ModelConfig(ConfigBaseModel):
     """Configuration for the base model and training mode"""
 
@@ -35,6 +65,17 @@ class ModelConfig(ConfigBaseModel):
         default=None,
         description="Path to a checkpoint file or directory to load from. "
         "If a directory is provided, the latest checkpoint will be used.",
+    )
+
+    base_lora: BaseLoraConfig | None = Field(
+        default=None,
+        description="Optional pre-trained LoRA to merge into the transformer base "
+        "weights at startup, before any new trainable LoRA is added. The deltas "
+        "are scaled by `strength` and applied via in-place addition; the file "
+        "is consumed (not retained) and the merged weights become the new base. "
+        "Validation also runs against the merged base. Useful for distillation "
+        "training -- merge the distilled LoRA at strength<=1.0 and train a new "
+        "LoRA on top.",
     )
 
     @field_validator("model_path")
@@ -531,9 +572,11 @@ class WandbConfig(ConfigBaseModel):
 class FlowMatchingConfig(ConfigBaseModel):
     """Configuration for flow matching training"""
 
-    timestep_sampling_mode: Literal["uniform", "shifted_logit_normal"] = Field(
+    timestep_sampling_mode: Literal["uniform", "shifted_logit_normal", "discrete_sigmas"] = Field(
         default="shifted_logit_normal",
-        description="Mode to use for timestep sampling",
+        description="Mode to use for timestep sampling. 'discrete_sigmas' samples "
+        "uniformly from a fixed list (e.g. distillation inference sigmas); pass the "
+        "list via timestep_sampling_params.sigmas.",
     )
 
     timestep_sampling_params: dict = Field(
