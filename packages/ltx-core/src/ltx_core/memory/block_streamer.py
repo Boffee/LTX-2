@@ -11,11 +11,8 @@ This is the sharp, low-level primitive. It does NOT manage:
 - Non-block parts of the model (parent-module state, sibling
   modules) — caller composes :class:`PinnedWeights` with the
   streamer's :attr:`slot_filter` for that.
-- Trainable parameter movement — :class:`BlockStreamer` cannot host
-  trainables (its GPU pool reuses slots across blocks; a trainable
-  param's data would be overwritten by other blocks' weights). Route
-  trainables through :class:`PinnedWeights` instead via the
-  composer's ``skip_slots``.
+- Trainable parameter movement — caller handles a separate
+  :class:`~block_offload.block_compose.TrainableMover`.
 - Cross-region tied-weight detection — that's a composer concern
   (see :func:`make_block_offloader` /
   :class:`~block_offload.block_compose.BlockStreamingStrategy`).
@@ -189,12 +186,6 @@ class _BlockPinnedStore:
             seen_param_ids: set[int] = set()
             for s in iter_param_slots(layer):
                 if s.param.requires_grad:
-                    # BlockStreamer cannot host trainables: the GPU pool
-                    # reuses slots across blocks, so a trainable's .data
-                    # would be overwritten by another block's weights
-                    # mid-step. Skip silently here so the composer's
-                    # PinnedWeights picks them up (its storage-swap path
-                    # handles trainables correctly).
                     continue
                 slot_filter.add(s.slot)
                 if id(s.param) in seen_param_ids:

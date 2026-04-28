@@ -4,18 +4,19 @@ A :class:`BlockStreamingStrategy` glues together a model plus an
 ordered list of components — typically:
 
 1. A non-block :class:`PinnedWeights` (sibling modules, parent-module
-   direct state, plus any trainable params like LoRA adapters living
-   inside blocks but skipped by the streamers) constructed with the
-   streamers' :class:`SlotOwnership` filter so it ignores
-   block-owned-and-streamable slots.
-2. One :class:`BlockStreamer` per homogeneous block list (single-list
+   direct state) constructed with the streamers' :class:`SlotOwnership`
+   filter so it ignores block-owned slots.
+2. A :class:`TrainableMover` that moves LoRA / adapter weights to GPU
+   on activate and back to CPU on deactivate.
+3. One :class:`BlockStreamer` per homogeneous block list (single-list
    models use one; heterogeneous ones like Flux use two:
    ``transformer_blocks`` + ``single_transformer_blocks``).
 
 Activate iterates the components in order; deactivate reverses
 automatically via :class:`contextlib.ExitStack`. Cross-region tied
-weights — block↔block, block↔non-block — are detected at construction
-and raise; slot-local block streaming cannot preserve such ties.
+weights — block↔block, block↔non-block, or block↔trainable — are
+detected at construction and raise; slot-local block streaming
+cannot preserve such ties.
 
 :func:`make_block_offloader` is the blessed factory for the common
 "resolve a dotted attribute path to a block list and stream it"
@@ -42,6 +43,64 @@ from .slot_graph import iter_buffer_slots, iter_param_slots
 from .strategy import SlotOwnership
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# TrainableMover — a component that moves trainable params on activate
+# ---------------------------------------------------------------------------
+
+
+class TrainableMover:
+    """Moves all ``requires_grad=True`` params (and their grads) to a
+    target device on activate; back to CPU on deactivate.
+
+    Component shape (no model returned from activate). Reports
+    ``cache_bytes=0`` because it owns no pinned storage — it just
+    relocates parameters that already exist somewhere. Useful as a
+    component inside :class:`BlockStreamingStrategy` so the activate /
+    deactivate pipeline doesn't need to special-case trainable
+    movement.
+    """
+
+    def __init__(self, model: nn.Module, target_device: torch.device) -> None:
+        self._model = model
+        self._target_device = target_device
+
+    @property
+    def cache_bytes(self) -> int:
+        return 0
+
+    @property
+    def name(self) -> str:
+        return "TrainableMover"
+
+    def activate(self) -> None:
+        _move_trainable(self._model, self._target_device)
+
+    def deactivate(self) -> None:
+        """Idempotent — safe to call before activate or multiple
+        times (.to(cpu) on cpu tensor is a no-op)."""
+        _move_trainable(self._model, torch.device("cpu"))
+
+    def __enter__(self) -> None:
+        self.activate()
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.deactivate()
+
+
+def _move_trainable(model: nn.Module, device: torch.device) -> None:
+    for p in model.parameters():
+        if p.requires_grad:
+            if p.data.device != device:
+                p.data = p.data.to(device)
+            if p.grad is not None and p.grad.device != device:
+                p.grad = p.grad.to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +257,7 @@ class BlockStreamingStrategy:
 
     - :class:`PinnedWeights` (with a ``skip_slots`` filter for the
       streamers' slots)
+    - :class:`TrainableMover`
     - one or more :class:`BlockStreamer`s
 
     Parameters
@@ -404,6 +464,7 @@ def make_block_offloader(
     components: list[Any] = []
     if non_block is not None:
         components.append(non_block)
+    components.append(TrainableMover(model, target_device))
     components.extend(streamers)
 
     return BlockStreamingStrategy(model=model, components=components)
@@ -445,6 +506,7 @@ def _has_non_block_pinnable_content(
 
 __all__ = [
     "BlockStreamingStrategy",
+    "TrainableMover",
     "detect_streaming_region_ties",
     "make_block_offloader",
 ]

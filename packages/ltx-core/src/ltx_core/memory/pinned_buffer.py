@@ -86,24 +86,8 @@ class PinnedParamBuffer:
         self.name = name
         self.adapter: type[TensorAdapter] = select_adapter(param.data)
         self.pinned_state = self.adapter.clone_pin(param.data)
+        self.cpu_param: nn.Parameter = self.adapter.cpu_param(self.pinned_state)
         self.copy_back_enabled: bool = copy_back
-
-        if self.adapter.param_identity == "original":
-            # Identity-preserving path: retarget the user's Parameter
-            # at the pinned host storage. The same Parameter object
-            # survives every activate/deactivate cycle, so PyTorch
-            # optimizer state keyed on its id stays valid. Consumers
-            # that "slot-replace" with cpu_param see a no-op (the slot
-            # already holds this object).
-            param.data = self.pinned_state.data
-            self.cpu_param: nn.Parameter = param
-        else:
-            # Slot-replacement path (e.g. quanto): build a fresh
-            # Parameter wrapping the pinned state. Consumers install
-            # it via parent._parameters[leaf] = cpu_param. Optimizer
-            # references to the user's pre-wrap Parameter are orphaned;
-            # this path is frozen-only by design.
-            self.cpu_param = self.adapter.cpu_param(self.pinned_state)
 
     def allocate_gpu_storage(self, device: torch.device) -> Any:
         """Allocate empty GPU storage mirroring this buffer's layout.
@@ -113,16 +97,8 @@ class PinnedParamBuffer:
 
     def make_gpu_param(self, gpu_state: Any) -> nn.Parameter:
         """Build the GPU-side :class:`nn.Parameter` for this buffer.
-
-        For ``original`` identity adapters, retargets ``cpu_param.data``
-        at the GPU storage and returns the same Parameter — slot
-        replacement is a no-op for the consumer.
-
-        For ``stable_replacement`` / ``ephemeral_replacement`` adapters,
-        delegates to ``adapter.gpu_param`` to construct a fresh Parameter."""
-        if self.adapter.param_identity == "original":
-            self.cpu_param.data = gpu_state.data
-            return self.cpu_param
+        Adapter receives the paired pinned state so structured tensor
+        types (quanto) can reconstruct their wrappers."""
         return self.adapter.gpu_param(self.pinned_state, gpu_state)
 
     def copy_to_gpu(self, gpu_state: Any, *, non_blocking: bool = False) -> None:
@@ -132,16 +108,9 @@ class PinnedParamBuffer:
     def copy_back(self, gpu_state: Any) -> None:
         """Copy live GPU bytes back into pinned host state. No-op when
         :attr:`copy_back_enabled` is False (frozen params don't need it).
-
-        For ``original`` identity adapters, also retargets the user's
-        Parameter back at the pinned host storage so a subsequent
-        ``make_gpu_param`` on the next activate works against the
-        post-update host buffer."""
-        if not self.copy_back_enabled:
-            return
-        self.adapter.copy_back(gpu_state, self.pinned_state)
-        if self.adapter.param_identity == "original":
-            self.cpu_param.data = self.pinned_state.data
+        Called on deactivate for buffers wrapping mutable params."""
+        if self.copy_back_enabled:
+            self.adapter.copy_back(gpu_state, self.pinned_state)
 
     def load_to_gpu(
         self, device: torch.device, non_blocking: bool = False

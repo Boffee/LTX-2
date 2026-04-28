@@ -8,10 +8,9 @@ Two complementary offload strategies:
   supports gradient checkpointing through autograd backward. Returns
   a :class:`BlockStreamingStrategy` composing one
   :class:`BlockStreamer` per ``layers_attr`` path plus a non-block
-  :class:`PinnedWeights` for everything outside the streamed blocks.
-  For bespoke configurations (per-group ``blocks_to_swap``),
-  construct the components directly and pass them to
-  :class:`BlockStreamingStrategy`.
+  :class:`PinnedWeights` plus a :class:`TrainableMover`. For bespoke
+  configurations (per-group ``blocks_to_swap``), construct the
+  components directly and pass them to :class:`BlockStreamingStrategy`.
 
 - :class:`PinnedWeights` — whole-model pinned-CPU bulk cache. Use for
   models that fit on GPU when active but should be evicted between
@@ -40,11 +39,9 @@ that composes (in order):
   1. A non-block :class:`PinnedWeights` with a :class:`SlotOwnership`
      skip filter for everything outside the block list (sibling
      modules + direct parent-module state, e.g. an unembedding head
-     or a learnable bias attached to the model root). Trainable params
-     (e.g. LoRA / adapter weights) flow through the same PinnedWeights
-     via the ``original``-identity adapter path: storage swap on the
-     user's :class:`nn.Parameter` preserves optimizer references.
-  2. One :class:`BlockStreamer` per ``layers_attr`` path.
+     or a learnable bias attached to the model root).
+  2. A :class:`TrainableMover` for LoRA / adapter weights.
+  3. One :class:`BlockStreamer` per ``layers_attr`` path.
 
 Cross-region tied parameters (block ↔ non-block, cross-block, or
 mixed trainable/frozen across regions) are detected at construction
@@ -79,6 +76,7 @@ construction through the cache) belongs in the consumer, not here.
 
 from .block_compose import (
     BlockStreamingStrategy,
+    TrainableMover,
     make_block_offloader,
 )
 from .block_streamer import BlockStreamer
@@ -114,5 +112,6 @@ __all__ = [
     "ModelTooLargeError",
     "PinnedWeights",
     "SlotOwnership",
+    "TrainableMover",
     "make_block_offloader",
 ]
