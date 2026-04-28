@@ -38,6 +38,7 @@ import torch
 from torch import nn
 
 from .pinned_buffer import PinnedParamBuffer
+from .slot_graph import iter_buffer_slots, iter_param_slots
 from .strategy import SlotOwnership
 
 logger = logging.getLogger(__name__)
@@ -177,48 +178,36 @@ class _BlockPinnedStore:
         slot_filter: set[SlotOwnership] = set()
 
         for layer in self._layers:
-            modules_map = dict(layer.named_modules())
             block_bufs: list[PinnedParamBuffer] = []
             block_locs: list[tuple[str, nn.Module, str]] = []
-            # Walk with remove_duplicate=False so slot_filter covers
-            # every alias slot (so a composed PinnedWeights skips them
-            # all). Pinning is deduped by id(p) — intra-block aliasing
-            # is unsupported and must be rejected upstream by
-            # detect_streaming_region_ties; if the caller bypasses
-            # that, the alias slot silently keeps the original
+            # Slot filter covers every alias slot (so a composed
+            # PinnedWeights skips them all). Pinning is deduped by id(p) —
+            # intra-block aliasing is unsupported and must be rejected
+            # upstream by detect_streaming_region_ties; if the caller
+            # bypasses that, the alias slot silently keeps the original
             # Parameter on activate (the user's bug, not ours).
             seen_param_ids: set[int] = set()
-            for qual_name, p in layer.named_parameters(remove_duplicate=False):
-                if p.requires_grad:
+            for s in iter_param_slots(layer):
+                if s.param.requires_grad:
                     continue
-                parts = qual_name.rsplit(".", 1)
-                if len(parts) == 2:
-                    submod, local_name = modules_map[parts[0]], parts[1]
-                else:
-                    submod, local_name = layer, qual_name
-                slot_filter.add(SlotOwnership(id(submod), local_name, "param"))
-                if id(p) in seen_param_ids:
+                slot_filter.add(s.slot)
+                if id(s.param) in seen_param_ids:
                     continue
-                seen_param_ids.add(id(p))
-                block_bufs.append(PinnedParamBuffer(qual_name, p))
-                block_locs.append((qual_name, submod, local_name))
+                seen_param_ids.add(id(s.param))
+                block_bufs.append(PinnedParamBuffer(s.name, s.param))
+                block_locs.append((s.name, s.parent, s.leaf))
             self._param_bufs.append(block_bufs)
             self._param_locs.append(block_locs)
 
             buf_records: list[tuple[torch.Tensor, nn.Module, str, torch.Tensor]] = []
             seen_buffer_ids: set[int] = set()
-            for full_name, b in layer.named_buffers(remove_duplicate=False):
-                parts = full_name.rsplit(".", 1)
-                if len(parts) == 2:
-                    submod, local_name = modules_map[parts[0]], parts[1]
-                else:
-                    submod, local_name = layer, full_name
-                slot_filter.add(SlotOwnership(id(submod), local_name, "buffer"))
-                if id(b) in seen_buffer_ids:
+            for s in iter_buffer_slots(layer):
+                slot_filter.add(s.slot)
+                if id(s.buffer) in seen_buffer_ids:
                     continue
-                seen_buffer_ids.add(id(b))
-                cpu_clone = b.data.clone(memory_format=torch.contiguous_format).pin_memory()
-                buf_records.append((b, submod, local_name, cpu_clone))
+                seen_buffer_ids.add(id(s.buffer))
+                cpu_clone = s.buffer.data.clone(memory_format=torch.contiguous_format).pin_memory()
+                buf_records.append((s.buffer, s.parent, s.leaf, cpu_clone))
             self._buf_records.append(buf_records)
 
         self._slot_filter: frozenset[SlotOwnership] = frozenset(slot_filter)

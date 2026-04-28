@@ -62,6 +62,7 @@ import torch
 from torch import nn
 
 from .pinned_buffer import PinnedParamBuffer, storage_key
+from .slot_graph import iter_buffer_slots, iter_param_slots
 from .strategy import SlotOwnership
 
 logger = logging.getLogger(__name__)
@@ -152,26 +153,19 @@ class PinnedWeights:
         # frozen weights). All-frozen groups become one PinnedParamBuffer
         # whose slot-location list is deduped by (id(parent), leaf) so
         # we don't double-write into shared submodules.
-        modules_map = dict(model.named_modules(remove_duplicate=False))
         # storage_key -> list of (name, param, parent_module, leaf)
         groups: dict[tuple[Any, ...], list[tuple[str, nn.Parameter, nn.Module, str]]] = {}
-        for name, p in model.named_parameters(remove_duplicate=False):
-            parts = name.rsplit(".", 1)
-            if len(parts) == 2:
-                parent_path, leaf = parts
-                parent = modules_map[parent_path]
-            else:
-                parent, leaf = model, name
-            if SlotOwnership(id(parent), leaf, "param") in self._skip_slots:
+        for s in iter_param_slots(model):
+            if s.slot in self._skip_slots:
                 continue  # composer (e.g. BlockStreamingStrategy) owns this slot
-            if p.numel() == 0:
+            if s.param.numel() == 0:
                 # Zero-sized tensors all share data_ptr()==0; key by id(p)
                 # to keep them in independent groups rather than spuriously
                 # collapsing them.
-                skey = ("__empty__", id(p), name)
+                skey = ("__empty__", id(s.param), s.name)
             else:
-                skey = storage_key(p.data)
-            groups.setdefault(skey, []).append((name, p, parent, leaf))
+                skey = storage_key(s.param.data)
+            groups.setdefault(skey, []).append((s.name, s.param, s.parent, s.leaf))
 
         # Per unique buffer: (PinnedParamBuffer, list of (parent, leaf)).
         self._slots: list[tuple[PinnedParamBuffer, list[tuple[nn.Module, str]]]] = []
@@ -215,24 +209,22 @@ class PinnedWeights:
                 tuple[Any, ...],
                 tuple[torch.Tensor, list[tuple[nn.Module, str, bool]]],
             ] = {}
-            for full_name, b in list(model.named_buffers(remove_duplicate=False)):
-                parent = self._resolve_parent(model, full_name)
-                leaf = full_name.rsplit(".", 1)[-1]
-                if SlotOwnership(id(parent), leaf, "buffer") in self._skip_slots:
+            for s in iter_buffer_slots(model):
+                if s.slot in self._skip_slots:
                     continue  # composer owns this buffer
-                persistent = leaf not in parent._non_persistent_buffers_set
-                if b.numel() == 0:
-                    skey = ("__empty_buf__", id(b), full_name)
+                persistent = s.leaf not in s.parent._non_persistent_buffers_set
+                if s.buffer.numel() == 0:
+                    skey = ("__empty_buf__", id(s.buffer), s.name)
                 else:
-                    skey = storage_key(b)
+                    skey = storage_key(s.buffer)
                 existing = buf_groups.get(skey)
                 if existing is None:
-                    pinned = b.detach().clone(memory_format=torch.contiguous_format).pin_memory()
-                    buf_groups[skey] = (pinned, [(parent, leaf, persistent)])
+                    pinned = s.buffer.detach().clone(memory_format=torch.contiguous_format).pin_memory()
+                    buf_groups[skey] = (pinned, [(s.parent, s.leaf, persistent)])
                 else:
-                    seen_locs = {(id(p), l) for p, l, _ in existing[1]}
-                    if (id(parent), leaf) not in seen_locs:
-                        existing[1].append((parent, leaf, persistent))
+                    seen_locs = {(id(p), leaf) for p, leaf, _ in existing[1]}
+                    if (id(s.parent), s.leaf) not in seen_locs:
+                        existing[1].append((s.parent, s.leaf, persistent))
             self._buffer_slots = list(buf_groups.values())
 
         # Phase 2: apply ALL slot mutations together, AFTER all
@@ -263,14 +255,6 @@ class PinnedWeights:
                 "flows use block_offload.make_block_offloader instead, or "
                 "leave the model unwrapped."
             )
-
-    @staticmethod
-    def _resolve_parent(model: nn.Module, dotted_name: str) -> nn.Module:
-        parent: Any = model
-        parts = dotted_name.split(".")
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        return parent
 
     # ------------------------------------------------------------------
     # ModelStrategy protocol

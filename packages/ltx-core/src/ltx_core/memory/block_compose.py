@@ -39,6 +39,7 @@ from torch import nn
 from .block_streamer import BlockStreamer
 from .pinned_buffer import storage_key
 from .pinned_weights import PinnedWeights
+from .slot_graph import iter_buffer_slots, iter_param_slots
 from .strategy import SlotOwnership
 
 logger = logging.getLogger(__name__)
@@ -151,19 +152,13 @@ def detect_streaming_region_ties(  # noqa: PLR0912, PLR0915 (3-category check is
                 )
 
     groups: dict[tuple, list[tuple[str, str, bool, int, str]]] = {}
-    modules_map = dict(model.named_modules(remove_duplicate=False))
-    for qual_name, p in model.named_parameters(remove_duplicate=False):
-        if p.numel() == 0:
+    for s in iter_param_slots(model):
+        if s.param.numel() == 0:
             continue
-        parts = qual_name.rsplit(".", 1)
-        if len(parts) == 2:
-            parent_obj, leaf = modules_map[parts[0]], parts[1]
-        else:
-            parent_obj, leaf = model, qual_name
-        region = param_id_to_region.get(id(p), "non_block")
-        skey = storage_key(p.data)
+        region = param_id_to_region.get(id(s.param), "non_block")
+        skey = storage_key(s.param.data)
         groups.setdefault(skey, []).append(
-            (region, qual_name, p.requires_grad, id(parent_obj), leaf)
+            (region, s.name, s.param.requires_grad, id(s.parent), s.leaf)
         )
 
     for members in groups.values():
@@ -200,32 +195,19 @@ def detect_streaming_region_ties(  # noqa: PLR0912, PLR0915 (3-category check is
     block_buffer_slot_regions: dict[tuple[int, str], set[str]] = {}
     for group_idx, blocks in enumerate(block_groups):
         for block_idx, layer in enumerate(blocks):
-            block_modules_map = dict(layer.named_modules(remove_duplicate=False))
-            for full_name, _b in layer.named_buffers(remove_duplicate=False):
-                parts = full_name.rsplit(".", 1)
-                if len(parts) == 2:
-                    parent = block_modules_map[parts[0]]
-                    leaf = parts[1]
-                else:
-                    parent, leaf = layer, full_name
+            for s in iter_buffer_slots(layer):
                 block_buffer_slot_regions.setdefault(
-                    (id(parent), leaf), set()
+                    (id(s.parent), s.leaf), set()
                 ).add(f"block:{group_idx}:{block_idx}")
 
     buf_groups: dict[tuple, list[tuple[str, str, int]]] = {}
-    for qual_name, b in model.named_buffers(remove_duplicate=False):
-        if b.numel() == 0:
+    for s in iter_buffer_slots(model):
+        if s.buffer.numel() == 0:
             continue
-        parts = qual_name.rsplit(".", 1)
-        if len(parts) == 2:
-            parent = modules_map[parts[0]]
-            leaf = parts[1]
-        else:
-            parent, leaf = model, qual_name
-        regions = block_buffer_slot_regions.get((id(parent), leaf), {"non_block"})
+        regions = block_buffer_slot_regions.get((id(s.parent), s.leaf), {"non_block"})
         for region in regions:
-            buf_groups.setdefault(storage_key(b), []).append(
-                (region, qual_name, id(b))
+            buf_groups.setdefault(storage_key(s.buffer), []).append(
+                (region, s.name, id(s.buffer))
             )
 
     for members in buf_groups.values():
@@ -514,23 +496,12 @@ def _has_non_block_pinnable_content(
     """True if the outer model has any frozen param or buffer at a
     slot the streamers DON'T own. Decides whether to construct the
     composed PinnedWeights at all (it raises on empty input)."""
-    modules_map = dict(model.named_modules(remove_duplicate=False))
-
-    def _slot(name: str, kind: str) -> SlotOwnership:
-        parts = name.rsplit(".", 1)
-        if len(parts) == 2:
-            parent = modules_map[parts[0]]
-            leaf = parts[1]
-        else:
-            parent, leaf = model, name
-        return SlotOwnership(id(parent), leaf, kind)  # type: ignore[arg-type]
-
     if any(
-        not p.requires_grad and _slot(name, "param") not in skip_slots
-        for name, p in model.named_parameters()
+        not s.param.requires_grad and s.slot not in skip_slots
+        for s in iter_param_slots(model)
     ):
         return True
-    return any(_slot(name, "buffer") not in skip_slots for name, _ in model.named_buffers())
+    return any(s.slot not in skip_slots for s in iter_buffer_slots(model))
 
 
 __all__ = [
