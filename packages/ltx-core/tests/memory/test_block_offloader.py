@@ -1324,6 +1324,67 @@ class TestMixedGradTieDetection:
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
+    def test_all_trainable_distinct_parameter_tie_raises(self) -> None:
+        # Two distinct Parameter objects sharing storage, both trainable.
+        # TrainableMover walks model.parameters() (deduped by id(p)) and
+        # would move each Parameter independently, breaking the storage
+        # alias on GPU. Reject upfront.
+        shared = torch.randn(4, 4)
+        a = nn.Parameter(shared, requires_grad=True)
+        b = nn.Parameter(shared, requires_grad=True)
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [nn.Linear(4, 4, bias=False), nn.Linear(4, 4, bias=False)]
+                )
+                self.alias_a = nn.Module()
+                self.alias_b = nn.Module()
+                self.alias_a.weight = a
+                self.alias_b.weight = b
+
+        m = M()
+        for p in m.transformer_blocks.parameters():
+            p.requires_grad = False
+        with pytest.raises(
+            ValueError, match="distinct Parameter objects|tie_weights",
+        ):
+            make_block_offloader(
+                m, torch.device("cpu"),
+                layers_attr="transformer_blocks", blocks_to_swap=1,
+            )
+
+    def test_mixed_grad_cross_region_reports_grad_cause(self) -> None:
+        # When a tie is BOTH cross-region AND mixed-grad, the user
+        # should see the mixed-grad cause (the more specific one) — the
+        # cross-region recovery advice (whole-model PinnedWeights)
+        # wouldn't fix mixed-grad anyway.
+        shared = torch.randn(4, 4)
+        block_0 = nn.Linear(4, 4, bias=False)
+        block_0.weight = nn.Parameter(shared, requires_grad=True)
+        head = nn.Linear(4, 4, bias=False)
+        head.weight = nn.Parameter(shared, requires_grad=False)
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [block_0, nn.Linear(4, 4, bias=False)]
+                )
+                self.head = head
+
+        m = M()
+        for p in m.transformer_blocks[1].parameters():
+            p.requires_grad = False
+        with pytest.raises(
+            ValueError, match="trainable and frozen",
+        ):
+            make_block_offloader(
+                m, torch.device("cpu"),
+                layers_attr="transformer_blocks", blocks_to_swap=1,
+            )
+
     def test_intra_block_mixed_grad_tie_raises(self) -> None:
         # Two distinct Parameter objects sharing storage, both inside
         # the same block, with mixed grad. The intra-block tie check

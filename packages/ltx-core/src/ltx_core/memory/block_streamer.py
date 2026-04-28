@@ -204,10 +204,11 @@ class _BlockPinnedStore:
                     raise ValueError(
                         f"BlockStreamer cannot manage trainable slot {s.name!r}: "
                         "streaming swaps slot Parameters with frozen pool "
-                        "wrappers, breaking optimizer identity. Pass the slot "
-                        "in skip_slots, or use BlockStreamingStrategy / "
-                        "make_block_offloader which partitions trainables "
-                        "into TrainableMover automatically."
+                        "wrappers, breaking optimizer identity. Use "
+                        "make_block_offloader (which partitions trainables "
+                        "into TrainableMover automatically), or pass the "
+                        "slot in skip_slots and route it to a separate "
+                        "trainable mover."
                     )
                 slot_filter.add(s.slot)
                 if id(s.param) in seen_param_ids:

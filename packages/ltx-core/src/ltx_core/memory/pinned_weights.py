@@ -178,9 +178,12 @@ class PinnedWeights:
                     f"PinnedWeights cannot manage trainable slot {s.name!r}: "
                     "slot replacement installs a frozen Parameter wrapper, "
                     "orphaning any optimizer state keyed by the user's "
-                    "pre-wrap Parameter. Pass the slot in skip_slots, or "
-                    "use make_block_offloader which partitions trainables "
-                    "into TrainableMover automatically."
+                    "pre-wrap Parameter. Use make_block_offloader (which "
+                    "partitions trainables into TrainableMover and validates "
+                    "tied storage upstream), or pass the slot in skip_slots "
+                    "and validate ties yourself — splitting a tied group "
+                    "between skip_slots and PinnedWeights silently breaks "
+                    "the alias on GPU."
                 )
             if s.param.numel() == 0:
                 # Zero-sized tensors all share data_ptr()==0; key by id(p)

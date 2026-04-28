@@ -153,35 +153,28 @@ def detect_streaming_region_ties(  # noqa: PLR0912, PLR0915 (3-category check is
                     id(p), f"block:{group_idx}:{block_idx}"
                 )
 
-    groups: dict[tuple, list[tuple[str, str, bool, int, str]]] = {}
+    # (region, name, grad, parent_id, leaf, param_id)
+    groups: dict[tuple, list[tuple[str, str, bool, int, str, int]]] = {}
     for s in iter_param_slots(model):
         if s.param.numel() == 0:
             continue
         region = param_id_to_region.get(id(s.param), "non_block")
         skey = storage_key(s.param.data)
         groups.setdefault(skey, []).append(
-            (region, s.name, s.param.requires_grad, id(s.parent), s.leaf)
+            (region, s.name, s.param.requires_grad, id(s.parent), s.leaf, id(s.param))
         )
 
     for members in groups.values():
-        regions = {region for region, _, _, _, _ in members}
-        names = sorted(name for _, name, _, _, _ in members)
-        if len(regions) > 1:
-            raise ValueError(
-                f"Block streaming does not support tied parameters across "
-                f"streamed regions: storage shared by {names}. Slot-local "
-                "block streaming cannot preserve cross-region tying "
-                "(neither frozen↔frozen nor frozen↔trainable). Use "
-                "whole-model PinnedWeights, disable block streaming, or "
-                "untie the parameters."
-            )
-        # Mixed-grad ties within a single region (block-internal or
-        # non-block-internal): slot replacement (frozen path) and
-        # storage swap (trainable path) cannot share a tied storage.
-        # The frozen alias would get a fresh wrapper while the trainable
-        # alias keeps the original Parameter, silently breaking the
-        # tying invariant on GPU. Reject upfront.
-        grads = {grad for _, _, grad, _, _ in members}
+        regions = {region for region, _, _, _, _, _ in members}
+        names = sorted(name for _, name, _, _, _, _ in members)
+        # Mixed-grad ties FIRST — slot replacement (frozen) and
+        # storage swap (trainable) cannot share a tied storage anywhere
+        # (cross-region, intra-block, or intra-non-block). Check before
+        # the cross-region branch so a tie that's both cross-region AND
+        # mixed-grad reports the more specific cause; whole-model
+        # PinnedWeights (the cross-region recovery) wouldn't fix a
+        # mixed-grad tie either.
+        grads = {grad for _, _, grad, _, _, _ in members}
         if len(grads) > 1:
             raise ValueError(
                 f"Tied storage spans both trainable and frozen parameters: "
@@ -189,9 +182,35 @@ def detect_streaming_region_ties(  # noqa: PLR0912, PLR0915 (3-category check is
                 "(trainable) mechanisms cannot share a tied storage. "
                 "Untie the parameters or freeze/unfreeze them consistently."
             )
+        # All-trainable distinct-Parameter ties: TrainableMover walks
+        # model.parameters() (deduplicated by Parameter identity) and
+        # moves each Parameter independently via p.data = p.data.to(),
+        # which breaks the storage alias on GPU. The standard
+        # tie_weights() pattern (one Parameter object aliased at
+        # multiple slots) is unaffected because dedup yields a single
+        # move; this only catches the rarer distinct-wrapper-shared-
+        # storage configuration.
+        if all(grads):
+            param_ids = {pid for _, _, _, _, _, pid in members}
+            if len(param_ids) > 1:
+                raise ValueError(
+                    f"All-trainable tied storage with distinct Parameter "
+                    f"objects: {names}. TrainableMover moves each Parameter "
+                    "independently via p.data = ... and would break the "
+                    "storage alias on GPU. Untie the parameters or use "
+                    "tie_weights() to share a single Parameter object."
+                )
+        if len(regions) > 1:
+            raise ValueError(
+                f"Block streaming does not support tied parameters across "
+                f"streamed regions: storage shared by {names}. Slot-local "
+                "block streaming cannot preserve cross-region tying. Use "
+                "whole-model PinnedWeights, disable block streaming, or "
+                "untie the parameters."
+            )
         sole_region = next(iter(regions))
         if sole_region.startswith("block:"):
-            slot_locs = {(pid, leaf) for _, _, _, pid, leaf in members}
+            slot_locs = {(pid, leaf) for _, _, _, pid, leaf, _ in members}
             if len(slot_locs) > 1:
                 raise ValueError(
                     f"Block streaming does not support intra-block tied "
