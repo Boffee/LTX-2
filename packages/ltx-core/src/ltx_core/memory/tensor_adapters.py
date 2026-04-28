@@ -202,18 +202,13 @@ class _RegularGpu:
 class RegularAdapter:
     """Adapter for plain ``torch.Tensor`` (no subclass machinery).
 
-    Builds fresh stable :class:`nn.Parameter` objects for the deactivated
-    (pinned-CPU) and activated (GPU) states. Consumers slot-replace via
-    ``module._parameters[leaf] = ...``; the same two Parameter objects
-    are reused across all cycles, so this is ``stable_replacement``
-    identity — not ``original``. PyTorch optimizers keyed by the user's
-    *pre-wrap* Parameter become orphaned once :class:`PinnedParamBuffer`
-    installs ``cpu_param`` in the slot. **This adapter is frozen-only.**
-
-    A future identity-preserving path (true ``p.data = ...`` swap on the
-    user's original Parameter, no slot replacement) would let
-    :class:`PinnedWeights` handle trainables; until then, trainable
-    params should be excluded from PinnedWeights via ``skip_slots``.
+    Identity-preserving: :class:`PinnedParamBuffer` retargets the
+    user's :class:`nn.Parameter` ``.data`` between pinned host storage
+    and GPU storage on each activate/deactivate. The same Parameter
+    object survives all cycles, so PyTorch optimizer state keyed on
+    its id stays valid. Trainable params are supported via this path
+    (combined with ``copy_back=True`` on the buffer to round-trip
+    in-place updates).
 
     Conservative on dispatch: only matches exactly
     ``type(t) is torch.Tensor`` (or ``nn.Parameter``). Unrecognized
@@ -221,9 +216,9 @@ class RegularAdapter:
     :func:`select_adapter`.
     """
 
-    param_identity: ClassVar[ParamIdentity] = "stable_replacement"
+    param_identity: ClassVar[ParamIdentity] = "original"
     uses_pinned_host: ClassVar[bool] = True
-    supports_trainable: ClassVar[bool] = False
+    supports_trainable: ClassVar[bool] = True
     moves_grad: ClassVar[bool] = False
     is_quanto: ClassVar[bool] = False
 

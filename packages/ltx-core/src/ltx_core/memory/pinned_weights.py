@@ -168,21 +168,16 @@ class PinnedWeights:
             groups.setdefault(skey, []).append((s.name, s.param, s.parent, s.leaf))
 
         # Per unique buffer: (PinnedParamBuffer, list of (parent, leaf)).
+        # A tied storage group with any trainable member needs copy_back so
+        # in-place updates on the GPU side round-trip back to pinned host
+        # storage on deactivate. Mixed-grad ties are supported: storage
+        # swap (used by RegularAdapter) preserves tying because all aliases
+        # observe the same underlying GPU buffer during activate.
         self._slots: list[tuple[PinnedParamBuffer, list[tuple[nn.Module, str]]]] = []
         for members in groups.values():
-            grad_states = {p.requires_grad for _, p, _, _ in members}
-            if len(grad_states) > 1:
-                names = [n for n, _, _, _ in members]
-                raise ValueError(
-                    f"Tied storage spans both trainable and frozen parameters: "
-                    f"{names}. PinnedWeights cannot pin a tied group with mixed "
-                    "requires_grad without breaking the tying invariant. Untie "
-                    "the parameters or freeze/unfreeze them consistently."
-                )
-            if True in grad_states:
-                continue  # all trainable — PinnedWeights does not manage these
+            copy_back = any(p.requires_grad for _, p, _, _ in members)
             first_name, first_p = members[0][0], members[0][1]
-            buf = PinnedParamBuffer(first_name, first_p)
+            buf = PinnedParamBuffer(first_name, first_p, copy_back=copy_back)
             seen_locs: set[tuple[int, str]] = set()
             locs: list[tuple[nn.Module, str]] = []
             for _, _, parent, leaf in members:
@@ -318,9 +313,15 @@ class PinnedWeights:
     def _move_to_gpu(self) -> None:
         # One GPU Parameter per unique buffer. Tied slots all receive
         # the same Parameter object so the tying invariant survives on
-        # device.
+        # device. GPU state is held until deactivate so copy_back can
+        # round-trip in-place updates back into pinned host storage
+        # (no-op for buffers with copy_back_enabled=False).
+        self._gpu_states: dict[int, Any] = {}
         for buf, locs in self._slots:
-            gpu_param = buf.load_to_gpu(self._device, non_blocking=True)
+            gpu_state = buf.allocate_gpu_storage(self._device)
+            buf.copy_to_gpu(gpu_state, non_blocking=True)
+            gpu_param = buf.make_gpu_param(gpu_state)
+            self._gpu_states[id(buf)] = gpu_state
             for parent, leaf in locs:
                 parent._parameters[leaf] = gpu_param
         if self._include_buffers:
@@ -332,9 +333,18 @@ class PinnedWeights:
             torch.cuda.synchronize(self._device)
 
     def _move_to_pinned(self) -> None:
+        # Round-trip in-place GPU updates into pinned host storage for
+        # any buffer that opted in (typically trainable slots). The
+        # copy_back call is a no-op when copy_back_enabled is False.
+        gpu_states = getattr(self, "_gpu_states", {})
         for buf, locs in self._slots:
+            gpu_state = gpu_states.get(id(buf))
+            if gpu_state is not None:
+                buf.copy_back(gpu_state)
             for parent, leaf in locs:
                 parent._parameters[leaf] = buf.cpu_param
+        if hasattr(self, "_gpu_states"):
+            self._gpu_states.clear()
         if self._include_buffers:
             for pinned, locs in self._buffer_slots:
                 for parent, leaf, persistent in locs:
