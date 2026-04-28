@@ -1,70 +1,39 @@
 """Merged-LoRA strategy for stacked-LoRA inference.
 
-For workloads that need 3+ stacked LoRAs on a bf16/fp16 base, the
-PEFT-style routed forward pays a per-LoRA cost on every step. This
-strategy takes the alternative path used by ComfyUI's ModelPatcher
-and most production fp16 inference servers: merge LoRA deltas into
-the base weights at activation time, run forward as a single matmul
-per layer regardless of how many LoRAs are stacked.
+For 3+ stacked LoRAs on a bf16/fp16 base, the PEFT-style routed
+forward pays a per-LoRA cost on every step. This strategy takes
+ComfyUI's path: merge LoRA deltas into the base weights at prefetch
+time, run forward as a single matmul per layer regardless of K.
 
-Architecture
-------------
 Built on the existing :class:`BlockStreamer` + :class:`PinnedWeights`
-infrastructure. The novel piece is a ``post_load`` callback registered
-with the streamer that runs on the prefetch CUDA stream after each
-block's bytes are DMA'd in:
+infrastructure. The novel piece is a ``post_load`` callback that
+runs on the prefetch CUDA stream after each block's bytes are
+DMA'd in:
 
-    pinned bf16 base        ─DMA→  pool slot
-    GPU-resident LoRA factors ──→  slot.weights += scale * (B @ A)   (addmm_)
-                                    via post_load hook on prefetch stream
+    pinned bf16 base       --DMA-->  pool slot
+    GPU LoRA factors       --addmm_--> slot.weights += scale * (B @ A)
 
-CUDA orders the merge after the DMA automatically because both run
-on the same (prefetch) stream. The pool's existing readiness event
-fires AFTER both, so the main compute stream sees fully-merged
-weights when it consumes the slot.
-
-The "free unmerge" property comes from the streamer's slot recycling:
-when a block is evicted and re-loaded, ``slot.copy_from`` overwrites
-GPU bytes with pristine pinned base bytes. The next merge starts from
-clean base — no subtract-and-restore pattern, no drift.
+CUDA orders the merge after the DMA automatically (same stream).
+The "free unmerge" property: when a block is evicted and re-loaded,
+``slot.copy_from`` overwrites GPU bytes with pristine pinned base
+bytes, so the next merge starts from clean base. No subtract-and-
+restore, no drift.
 
 Constraints
 -----------
-- **Base must be bf16 or fp16**. ``addmm_`` requires arithmetic-
-  capable target dtype; fp8 wrappers and quanto :class:`WeightQBytesTensor`
-  do not support in-place add. For fp8 base, use PEFT routed mode
-  (no merge) — at K≤4 LoRAs, the fp8 forward speedup outweighs the
-  routing overhead anyway. fp8 + merge with prefetch-time upcast is
-  a planned v2 extension.
-- **LoRA set is fixed during the active window**. Switching combos
-  requires :meth:`deactivate` → :meth:`set_active` → :meth:`activate`.
-  In stream-offload mode this is cheap because activation doesn't
-  bulk-load anything — first forward triggers per-block merges with
-  the new active set lazily.
-- **All LoRAs registered at construction**. ``cache_bytes`` is final
-  at admission per the package contract. Adding a LoRA after admission
-  would invalidate :class:`ModelCache` budget accounting.
-- **Active list is ordered**. ``set_active`` takes a sequence, not a
-  set. bf16 addition is non-associative, so deterministic output
-  requires a stable iteration order.
-
-Cost
-----
-At LTX-2 shape (d≈2048, r=128, ~30 blocks, ~6 LoRA-target layers per
-block), the per-block merge cost is roughly 60μs per active LoRA
-(low-rank matmul + element-wise add). For K=3 active, that's ~180μs
-per block * ~30 blocks ~= 5ms total per forward, fully hidden by
-prefetch overlap when ``prefetch_count`` is appropriate. Steady-state
-forward overhead vs. unmerged base: ~0%.
-
-Compare PEFT routed at K=3 on the same hardware: ~10-15% forward
-overhead on every step, every layer.
+- Base must be bf16 or fp16. ``addmm_`` requires arithmetic-capable
+  target dtype; fp8 and quanto are unsupported in v1.
+- LoRA set is fixed during the active window. Switch combos via
+  deactivate -> set_active -> activate.
+- All LoRAs registered at construction (cache_bytes is final at
+  admission per the package contract).
+- Active list is ordered (Sequence, not set) for bf16-reproducible
+  output.
 """
 
 from __future__ import annotations
 
 import contextlib
-import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from types import TracebackType
@@ -78,9 +47,6 @@ from .block_streamer import BlockStreamer
 from .pinned_weights import PinnedWeights
 from .strategy import SlotOwnership
 
-logger = logging.getLogger(__name__)
-
-
 __all__ = [
     "LoRABundle",
     "LoRALayerFactors",
@@ -89,7 +55,7 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
-# LoRA data types — user-facing input format
+# LoRA data types
 # ---------------------------------------------------------------------------
 
 
@@ -98,15 +64,12 @@ class LoRALayerFactors:
     """LoRA factors for one target layer.
 
     ``A`` is shape ``(rank, in_dim)``; ``B`` is shape ``(out_dim, rank)``.
-    The merged delta is ``scaling * (B @ A)`` — a ``(out_dim, in_dim)``
-    matrix added to the corresponding base weight.
+    The merged delta is ``scaling * (B @ A)`` -- a ``(out_dim, in_dim)``
+    matrix added to the corresponding base weight. ``scaling`` follows
+    the standard PEFT convention (``alpha / rank``).
 
-    ``scaling`` follows the standard PEFT convention (``alpha / rank``)
-    when constructing from a PEFT-trained adapter.
-
-    The strategy clones, dtype-casts (to match base dtype), and pins
-    these tensors at construction. The user-supplied tensors are not
-    retained after :class:`MergedLoRAStrategy.__init__` returns.
+    The strategy clones, dtype-casts, and pins these tensors at
+    construction; the user-supplied tensors are not retained.
     """
 
     A: torch.Tensor
@@ -118,60 +81,22 @@ class LoRALayerFactors:
 class LoRABundle:
     """All factors for one named adapter.
 
-    ``blocks`` maps ``block_idx`` to a dict from in-block parameter
-    qualname (relative to the block module) to :class:`LoRALayerFactors`.
-    For example, with target attention's q-projection in block 0:
-
-        LoRABundle(
-            name="character_a",
-            blocks={
-                0: {"attn.q_proj.weight": LoRALayerFactors(A, B, scaling)},
-                1: {"attn.q_proj.weight": LoRALayerFactors(A, B, scaling)},
-                ...
-            }
-        )
-
-    Block indices align with positions in the ``layers_attr`` ModuleList
-    given to :class:`MergedLoRAStrategy`. In-block qualnames are the
-    paths used by the underlying :class:`BlockStreamer` slots
+    ``blocks[block_idx][in_block_qualname]`` -> :class:`LoRALayerFactors`.
+    Block indices align with positions in the ``layers_attr`` ModuleList.
+    In-block qualnames are paths used by the :class:`BlockStreamer` slot
     (e.g., ``"attn.q_proj.weight"``, not the full
     ``"transformer_blocks.0.attn.q_proj.weight"``).
-
-    Conversion from PEFT state-dict format is left to a future utility;
-    for v1 the caller is responsible for supplying parsed factors.
     """
 
     name: str
     blocks: dict[int, dict[str, LoRALayerFactors]]
 
 
-# ---------------------------------------------------------------------------
-# Internal pinned/GPU representations
-# ---------------------------------------------------------------------------
-
-
-@dataclass(slots=True)
-class _PinnedFactors:
-    """Host-pinned factors for one target layer of one LoRA."""
-
-    A: torch.Tensor   # pinned, base dtype
-    B: torch.Tensor   # pinned, base dtype
-    scaling: float
-
-
-@dataclass(slots=True)
-class _GpuFactors:
-    """GPU-resident factors for one target layer of one LoRA, valid
-    only during the active window."""
-
-    A: torch.Tensor
-    B: torch.Tensor
-    scaling: float
-
-
-# pinned/GPU container types: lora_name → block_idx → in_block_qualname → factors
-_PinnedMap = dict[str, dict[int, dict[str, _PinnedFactors]]]
-_GpuMap = dict[str, dict[int, dict[str, _GpuFactors]]]
+# Per-block flat merge list, built at activate from the active subset
+# of pinned factors. Each entry is (qual, B_gpu, A_gpu, scaling) ready
+# for a single in-place addmm_ call. Iteration order within a block is
+# preserved for bf16-reproducible output.
+_MergePlan = dict[int, list[tuple[str, torch.Tensor, torch.Tensor, float]]]
 
 
 # ---------------------------------------------------------------------------
@@ -183,43 +108,10 @@ class MergedLoRAStrategy:
     """Top-level :class:`ModelStrategy` that merges stacked LoRAs into
     block weights at prefetch time.
 
-    See module docstring for architecture, constraints, and cost.
-
-    Parameters
-    ----------
-    model:
-        The full model. Must be bf16 or fp16 throughout — fp8 and
-        quanto wrappers are unsupported (raises at construction).
-    target_device:
-        GPU device.
-    loras:
-        Sequence of all available :class:`LoRABundle` instances. The
-        strategy clones, dtype-casts, and pins their factors. After
-        construction, use :meth:`set_active` to choose which subset
-        merges during the next active window.
-    layers_attr:
-        Dotted attribute path to the ``nn.ModuleList`` of streamable
-        blocks (e.g., ``"transformer_blocks"``). Single list only in
-        v1 — heterogeneous block lists (Flux-style) are a planned
-        extension.
-    blocks_to_swap:
-        Number of blocks kept on CPU at any time, forwarded to the
-        underlying :class:`BlockStreamer`.
-    prefetch_count:
-        Background prefetch depth, forwarded to :class:`BlockStreamer`.
-
-    Lifecycle
-    ---------
-    1. Construct: pins LoRA factors, builds underlying streamer +
-       non-block :class:`PinnedWeights` (``cache_bytes`` final).
-    2. :meth:`set_active`: configure which LoRAs to merge. Must be
-       called before :meth:`activate` (raises if active).
-    3. :meth:`activate`: copy active factors to GPU (synchronous),
-       activate underlying components. Forward thereafter sees merged
-       weights.
-    4. :meth:`deactivate`: deactivate underlying first (drains any
-       in-flight prefetch — no merges referencing factors after this),
-       then free GPU factor storage.
+    See module docstring for architecture. bf16/fp16 base only;
+    raises at construction otherwise. All LoRAs must be passed at
+    construction; ``set_active`` chooses the active subset for the
+    next active window.
     """
 
     def __init__(
@@ -233,57 +125,44 @@ class MergedLoRAStrategy:
         prefetch_count: int = 2,
     ) -> None:
         self._validate_base_dtype(model)
-        base_dtype = next(iter(model.parameters())).dtype
+        base_dtype = next(model.parameters()).dtype
 
-        self._model: nn.Module | None = model
+        self._model = model
         self._device = target_device
 
-        # Resolve blocks first so factor validation can range-check
-        # block indices against the actual ModuleList length.
         blocks = list(_resolve_attr(model, layers_attr))
         if not blocks:
             raise ValueError(
                 f"layers_attr={layers_attr!r} resolved to an empty ModuleList"
             )
 
-        self._available: set[str] = {b.name for b in loras}
-        if len(self._available) != len(loras):
-            seen: dict[str, int] = {}
-            for b in loras:
-                seen[b.name] = seen.get(b.name, 0) + 1
-            dups = sorted(name for name, count in seen.items() if count > 1)
-            raise ValueError(
-                f"LoRA names must be unique; duplicates: {dups}"
-            )
+        # Per-block frozen-target shape map for factor validation.
+        target_shapes: list[dict[str, tuple[int, ...]]] = [
+            {qual: tuple(p.shape)
+             for qual, p in block.named_parameters()
+             if not p.requires_grad}
+            for block in blocks
+        ]
 
-        # Per-block map of frozen-param qualname → target shape.
-        # Used by _pin_factors to validate that LoRA targets exist
-        # in the streamable region and that B@A produces a tensor of
-        # the right shape for the target weight.
-        target_shapes: list[dict[str, tuple[int, ...]]] = []
-        for block in blocks:
-            shapes: dict[str, tuple[int, ...]] = {}
-            for qual, p in block.named_parameters():
-                if p.requires_grad:
-                    # LoRA targets must be frozen — trainable params
-                    # belong to the user's optimizer or to a separate
-                    # TrainableWeights component.
-                    continue
-                shapes[qual] = tuple(p.shape)
-            target_shapes.append(shapes)
-
-        # Pin factors up front; clone-and-cast to base dtype, validate.
-        self._pinned_factors: _PinnedMap = self._pin_factors(
-            loras, base_dtype,
-            num_blocks=len(blocks),
-            target_shapes=target_shapes,
+        # Pin factors. Detects duplicate names while building.
+        self._pinned: dict[str, dict[int, dict[str, LoRALayerFactors]]] = (
+            self._pin_factors(loras, base_dtype, len(blocks), target_shapes)
         )
+        # cache_bytes contribution from factors (final after pinning).
+        self._lora_bytes = sum(
+            f.A.numel() * f.A.element_size() + f.B.numel() * f.B.element_size()
+            for blocks_ in self._pinned.values()
+            for layers in blocks_.values()
+            for f in layers.values()
+        )
+
         self._active: tuple[str, ...] = ()
-        self._gpu_factors: _GpuMap | None = None
-        # ExitStack of registered deactivate callbacks, populated in
-        # activate() via stack.pop_all() and consumed in deactivate().
-        # Presence is the de-facto "active" indicator.
+        # Per-block merge list, populated at activate, drained on
+        # deactivate via ExitStack callback. Empty dict means "no
+        # merges" (unactivated, or active=()).
+        self._merge_plan: _MergePlan = {}
         self._teardown: contextlib.ExitStack | None = None
+
         self._streamer = BlockStreamer(
             blocks=blocks,
             target_device=target_device,
@@ -292,98 +171,78 @@ class MergedLoRAStrategy:
             name=f"BlockStreamer[{layers_attr}]",
             post_load=self._apply_active_loras,
         )
-
-        # Non-block content via PinnedWeights, scoped via skip_slots.
         skip: set[SlotOwnership] = set(self._streamer.slot_filter)
-        self._pinned: PinnedWeights | None = None
+        self._non_block: PinnedWeights | None = None
         if _has_non_block_pinnable_content(model, skip):
-            self._pinned = PinnedWeights(model, target_device, skip_slots=skip)
+            self._non_block = PinnedWeights(
+                model, target_device, skip_slots=skip,
+            )
 
     # ---------------------------------------------------------------- API
 
-    def register_lora_names(self) -> set[str]:
-        """The names of all LoRAs registered at construction."""
-        return set(self._available)
+    @property
+    def available(self) -> set[str]:
+        """Names of all LoRAs registered at construction."""
+        return set(self._pinned)
 
     def set_active(self, names: Sequence[str]) -> None:
-        """Configure which LoRAs to merge during the next active window.
+        """Set the LoRAs to merge during the next active window.
 
-        ``names`` is an ordered sequence — the merge order is preserved
-        because bf16 addition is non-associative and deterministic
-        output requires a stable order. Pass ``()`` to merge no LoRAs
-        (base-only forward).
-
-        Raises if called while active. To switch active sets:
-        :meth:`deactivate` → ``set_active(...)`` → :meth:`activate`.
+        ``names`` is ordered -- the merge order is preserved because
+        bf16 addition is non-associative. Pass ``()`` for base-only
+        forward. Raises if called while active.
         """
         if self._teardown is not None:
             raise RuntimeError(
                 "MergedLoRAStrategy.set_active() requires the strategy "
                 "to be inactive. Call deactivate() first."
             )
-        unknown = set(names) - self._available
+        unknown = set(names) - self._pinned.keys()
         if unknown:
             raise ValueError(
                 f"Unknown LoRA names: {sorted(unknown)}. "
-                f"Registered: {sorted(self._available)}"
+                f"Registered: {sorted(self._pinned)}"
             )
         active = tuple(names)
         if len(set(active)) != len(active):
             raise ValueError(
                 f"Duplicate LoRA names in active list: {active}. Each "
-                f"LoRA can be active at most once per window — repeated "
-                f"merges would compound the delta."
+                f"LoRA can be active at most once per window."
             )
         self._active = active
 
     @property
     def active(self) -> tuple[str, ...]:
-        """The current active LoRA list (snapshot at last set_active)."""
+        """The currently configured active LoRA list."""
         return self._active
 
     # --------------------------------------------------- ModelStrategy
 
     @property
     def model(self) -> nn.Module:
-        assert self._model is not None
         return self._model
 
     @property
     def cache_bytes(self) -> int:
-        total = self._streamer.cache_bytes
-        if self._pinned is not None:
-            total += self._pinned.cache_bytes
-        # Pinned LoRA factors are part of the host budget — count all
-        # registered factors regardless of active state, since they
-        # stay pinned for the strategy's lifetime.
-        for blocks in self._pinned_factors.values():
-            for layers in blocks.values():
-                for f in layers.values():
-                    total += f.A.numel() * f.A.element_size()
-                    total += f.B.numel() * f.B.element_size()
+        total = self._streamer.cache_bytes + self._lora_bytes
+        if self._non_block is not None:
+            total += self._non_block.cache_bytes
         return total
 
     def activate(self) -> None:
-        # Same ExitStack pattern BlockStreamingStrategy uses. Each
-        # cleanup callback is registered BEFORE its activation step,
-        # so a mid-activation exception unwinds cleanly via the
-        # context-manager exit. On full success, ``stack.pop_all()``
-        # transfers the cleanups to ``self._teardown`` for ``deactivate``.
-        #
-        # Component contracts say deactivate is idempotent and safe to
-        # call regardless of whether activate completed — so registering
-        # before activating is correct, not a hazard.
-        self._gpu_factors = self._copy_factors_to_gpu(self._active)
+        # ExitStack idiom from BlockStreamingStrategy: register cleanup
+        # before each activation step, pop_all on success. Component
+        # contracts make deactivate idempotent and safe-before-activate,
+        # so register-then-activate is correct.
+        self._merge_plan = self._build_merge_plan(self._active)
         with contextlib.ExitStack() as stack:
-            stack.callback(self._clear_gpu_factors)
-            if self._pinned is not None:
-                stack.callback(self._pinned.deactivate)
-                self._pinned.activate()
+            stack.callback(self._merge_plan.clear)
+            if self._non_block is not None:
+                stack.callback(self._non_block.deactivate)
+                self._non_block.activate()
             stack.callback(self._streamer.deactivate)
             self._streamer.activate()
-            # Sync inside the stack so a (rare) sync failure also
-            # triggers component rollback. Closes the cross-stream
-            # visibility race with the streamer's resident-block
+            # Sync to close the cross-stream race with resident-block
             # initial merges (addmm_ kernels enqueued async on the
             # default stream during streamer.activate()).
             if self._device.type == "cuda":
@@ -395,9 +254,6 @@ class MergedLoRAStrategy:
         self._teardown = None
         if stack is not None:
             stack.close()
-
-    def _clear_gpu_factors(self) -> None:
-        self._gpu_factors = None
 
     def __enter__(self) -> nn.Module:
         self.activate()
@@ -415,9 +271,6 @@ class MergedLoRAStrategy:
 
     @staticmethod
     def _validate_base_dtype(model: nn.Module) -> None:
-        """Raise if any parameter is not bf16/fp16. fp8 and quanto are
-        unsupported because :func:`torch.Tensor.addmm_` requires an
-        arithmetic-capable target dtype."""
         bad: list[tuple[str, torch.dtype]] = []
         for name, p in model.named_parameters():
             if p.dtype not in (torch.bfloat16, torch.float16):
@@ -427,10 +280,9 @@ class MergedLoRAStrategy:
         if bad:
             raise ValueError(
                 f"MergedLoRAStrategy requires bf16/fp16 base; found "
-                f"{bad}. fp8 and quanto are unsupported in v1 because "
-                f"the in-place merge (Tensor.addmm_) requires an "
-                f"arithmetic-capable target dtype. For fp8 base, use "
-                f"PEFT routed mode."
+                f"{bad}. fp8 and quanto are unsupported in v1 (in-place "
+                f"merge requires arithmetic-capable target dtype). For "
+                f"fp8 base, use PEFT routed mode."
             )
 
     @staticmethod
@@ -439,22 +291,22 @@ class MergedLoRAStrategy:
         base_dtype: torch.dtype,
         num_blocks: int,
         target_shapes: list[dict[str, tuple[int, ...]]],
-    ) -> _PinnedMap:
-        """Validate, clone-cast-and-pin user-supplied factors.
+    ) -> dict[str, dict[int, dict[str, LoRALayerFactors]]]:
+        """Validate and pin user-supplied factors.
 
-        Validation surfaces bad bundles at construction rather than as
-        cryptic failures inside prefetch futures. Trainable factors are
-        silently detached (we own a frozen snapshot) — that's
-        intentional, not a bug, since the strategy is inference-only.
-
-        ``target_shapes[block_idx]`` maps in-block qualname to the
-        frozen target weight's shape; used to verify that the LoRA
-        targets a real frozen param and that B @ A produces a delta
-        of the right shape.
+        Validation surfaces bad bundles at construction rather than
+        as cryptic prefetch-future failures. Trainable factors are
+        intentionally detached -- the strategy is inference-only.
         """
-        pinned: _PinnedMap = {}
+        pinned: dict[str, dict[int, dict[str, LoRALayerFactors]]] = {}
         for lora in loras:
-            per_block: dict[int, dict[str, _PinnedFactors]] = {}
+            if lora.name in pinned:
+                existing = sorted(pinned)
+                raise ValueError(
+                    f"LoRA names must be unique; {lora.name!r} appears "
+                    f"more than once. Already registered: {existing}"
+                )
+            per_block: dict[int, dict[str, LoRALayerFactors]] = {}
             for block_idx, layer_factors in lora.blocks.items():
                 if not 0 <= block_idx < num_blocks:
                     raise ValueError(
@@ -462,47 +314,42 @@ class MergedLoRAStrategy:
                         f"range [0, {num_blocks})"
                     )
                 block_targets = target_shapes[block_idx]
-                per_layer: dict[str, _PinnedFactors] = {}
-                for qual_name, f in layer_factors.items():
-                    if not f.A.is_floating_point() or not f.B.is_floating_point():
-                        raise ValueError(
-                            f"LoRA {lora.name!r} block {block_idx} "
-                            f"layer {qual_name!r}: factors must be floating-"
-                            f"point; got A.dtype={f.A.dtype}, B.dtype={f.B.dtype}"
-                        )
-                    if f.A.dim() != 2 or f.B.dim() != 2:
-                        raise ValueError(
-                            f"LoRA {lora.name!r} block {block_idx} "
-                            f"layer {qual_name!r}: A and B must be 2D; got "
-                            f"A.shape={tuple(f.A.shape)}, B.shape={tuple(f.B.shape)}"
-                        )
-                    if f.A.shape[0] != f.B.shape[1]:
-                        raise ValueError(
-                            f"LoRA {lora.name!r} block {block_idx} "
-                            f"layer {qual_name!r}: rank mismatch -- A.shape[0]"
-                            f"={f.A.shape[0]}, B.shape[1]={f.B.shape[1]} "
-                            f"(expected A=(rank, in_dim), B=(out_dim, rank))"
-                        )
-                    if qual_name not in block_targets:
+                per_layer: dict[str, LoRALayerFactors] = {}
+                for qual, f in layer_factors.items():
+                    expected = block_targets.get(qual)
+                    if expected is None:
                         raise ValueError(
                             f"LoRA {lora.name!r} block {block_idx}: target "
-                            f"{qual_name!r} is not a frozen param in the "
-                            f"block. Available frozen targets: "
-                            f"{sorted(block_targets)}"
+                            f"{qual!r} is not a frozen param. Available "
+                            f"frozen targets: {sorted(block_targets)}"
                         )
-                    target_shape = block_targets[qual_name]
-                    expected_delta_shape = (f.B.shape[0], f.A.shape[1])
-                    if target_shape != expected_delta_shape:
+                    if not f.A.is_floating_point() or not f.B.is_floating_point():
                         raise ValueError(
-                            f"LoRA {lora.name!r} block {block_idx} "
-                            f"layer {qual_name!r}: shape mismatch -- target "
-                            f"weight has shape {target_shape}, but B @ A "
-                            f"produces shape {expected_delta_shape}"
+                            f"LoRA {lora.name!r} block {block_idx} layer "
+                            f"{qual!r}: factors must be floating-point; got "
+                            f"A.dtype={f.A.dtype}, B.dtype={f.B.dtype}. "
+                            f"Casting integer factors to bf16 silently "
+                            f"truncates values."
                         )
-                    # .cpu() handles the case of factors stored on GPU
-                    # (e.g., loaded from a model that's on GPU). Without
-                    # it, .pin_memory() would raise.
-                    per_layer[qual_name] = _PinnedFactors(
+                    # Combined shape guard: 2D + rank match + target
+                    # compatibility, one diagnostic instead of three.
+                    if (
+                        f.A.dim() != 2 or f.B.dim() != 2
+                        or f.A.shape[0] != f.B.shape[1]
+                        or expected != (f.B.shape[0], f.A.shape[1])
+                    ):
+                        raise ValueError(
+                            f"LoRA {lora.name!r} block {block_idx} layer "
+                            f"{qual!r}: factor shape mismatch -- "
+                            f"A.shape={tuple(f.A.shape)}, "
+                            f"B.shape={tuple(f.B.shape)}, target shape "
+                            f"{expected}. Expected A=(rank, in_dim), "
+                            f"B=(out_dim, rank), B@A.shape == target."
+                        )
+                    # .cpu() handles factors stored on GPU (e.g., loaded
+                    # from a GPU-resident model). Without it, .pin_memory()
+                    # would raise.
+                    per_layer[qual] = LoRALayerFactors(
                         A=f.A.detach().cpu().to(base_dtype).clone().pin_memory(),
                         B=f.B.detach().cpu().to(base_dtype).clone().pin_memory(),
                         scaling=float(f.scaling),
@@ -511,47 +358,26 @@ class MergedLoRAStrategy:
             pinned[lora.name] = per_block
         return pinned
 
-    def _copy_factors_to_gpu(self, names: tuple[str, ...]) -> _GpuMap:
-        """Copy the active subset of pinned factors to the target device.
-        Synchronous — all factors are GPU-resident and ready before
-        the streamer can start prefetching."""
-        gpu: _GpuMap = {}
-        for name in names:
-            blocks_pinned = self._pinned_factors[name]
-            per_block: dict[int, dict[str, _GpuFactors]] = {}
-            for block_idx, layer_factors in blocks_pinned.items():
-                per_layer: dict[str, _GpuFactors] = {}
-                for qual_name, p in layer_factors.items():
-                    per_layer[qual_name] = _GpuFactors(
-                        A=p.A.to(self._device, non_blocking=True),
-                        B=p.B.to(self._device, non_blocking=True),
-                        scaling=p.scaling,
-                    )
-                per_block[block_idx] = per_layer
-            gpu[name] = per_block
+    def _build_merge_plan(self, active: tuple[str, ...]) -> _MergePlan:
+        """Copy active LoRAs' factors to GPU and build a per-block
+        merge list ready for the prefetch-time addmm_."""
+        plan: _MergePlan = {}
+        for name in active:
+            for block_idx, layer_factors in self._pinned[name].items():
+                bucket = plan.setdefault(block_idx, [])
+                for qual, f in layer_factors.items():
+                    bucket.append((
+                        qual,
+                        f.B.to(self._device, non_blocking=True),
+                        f.A.to(self._device, non_blocking=True),
+                        f.scaling,
+                    ))
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)
-        return gpu
+        return plan
 
     def _apply_active_loras(self, slot: Any, block_idx: int) -> None:  # noqa: ANN401
-        """post_load callback invoked on the prefetch stream after each
-        block's DMA. Merges every active LoRA's factors for this block
-        into the slot's weights via in-place ``addmm_``.
-
-        CUDA orders these ops after the preceding ``slot.copy_from``
-        because both run on the current (prefetch) stream. The pool's
-        readiness event records after this returns, so the main stream
-        sees fully-merged weights."""
-        if self._gpu_factors is None or not self._active:
-            return
-        for name in self._active:
-            block_factors = self._gpu_factors[name].get(block_idx)
-            if not block_factors:
-                continue
-            for qual_name, f in block_factors.items():
-                # slot.get_param returns the GPU nn.Parameter wrapping
-                # the slot's storage; .data is the underlying Tensor.
-                # addmm_ computes target += alpha * (B @ A) in place,
-                # without allocating a (d, d) intermediate.
-                target = slot.get_param(qual_name).data
-                target.addmm_(f.B, f.A, beta=1.0, alpha=f.scaling)
+        """post_load callback: merge active LoRAs for this block via
+        in-place addmm_ on the prefetch stream."""
+        for qual, b_gpu, a_gpu, scaling in self._merge_plan.get(block_idx, ()):
+            slot.get_param(qual).data.addmm_(b_gpu, a_gpu, beta=1.0, alpha=scaling)

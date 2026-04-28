@@ -194,7 +194,7 @@ class TestConstructionValidation:
                 )},
             },
         )
-        with pytest.raises(ValueError, match="must be 2D"):
+        with pytest.raises(ValueError, match="factor shape mismatch"):
             MergedLoRAStrategy(
                 m, torch.device("cpu"),
                 loras=[bad],
@@ -213,7 +213,7 @@ class TestConstructionValidation:
                 )},
             },
         )
-        with pytest.raises(ValueError, match="rank mismatch"):
+        with pytest.raises(ValueError, match="factor shape mismatch"):
             MergedLoRAStrategy(
                 m, torch.device("cpu"),
                 loras=[bad],
@@ -264,7 +264,7 @@ class TestConstructionValidation:
             _make_lora("dup", 4, 16, seed=1),
             _make_lora("solo", 4, 16, seed=2),
         ]
-        with pytest.raises(ValueError, match=r"duplicates: \['dup'\]"):
+        with pytest.raises(ValueError, match="appears more than once"):
             MergedLoRAStrategy(
                 m, torch.device("cpu"),
                 loras=loras,
@@ -293,7 +293,7 @@ class TestConstructionValidation:
             loras=[gpu_factors],
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
-        assert "from_gpu" in s.register_lora_names()
+        assert "from_gpu" in s.available
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +517,9 @@ class TestDeactivateCleanupInvariants:
         # and continues — factor cleanup still runs.
         with pytest.raises(RuntimeError):
             s.deactivate()
-        assert s._gpu_factors is None
+        # Merge plan cleared (the architectural invariant: GPU factor
+        # tensors no longer referenced; PyTorch refcount frees them).
+        assert s._merge_plan == {}
 
 
 class TestCacheBytes:
