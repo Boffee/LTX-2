@@ -63,6 +63,7 @@ overhead on every step, every layer.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -279,6 +280,10 @@ class MergedLoRAStrategy:
         )
         self._active: tuple[str, ...] = ()
         self._gpu_factors: _GpuMap | None = None
+        # ExitStack of registered deactivate callbacks, populated in
+        # activate() via stack.pop_all() and consumed in deactivate().
+        # Presence is the de-facto "active" indicator.
+        self._teardown: contextlib.ExitStack | None = None
         self._streamer = BlockStreamer(
             blocks=blocks,
             target_device=target_device,
@@ -311,7 +316,7 @@ class MergedLoRAStrategy:
         Raises if called while active. To switch active sets:
         :meth:`deactivate` → ``set_active(...)`` → :meth:`activate`.
         """
-        if self._gpu_factors is not None:
+        if self._teardown is not None:
             raise RuntimeError(
                 "MergedLoRAStrategy.set_active() requires the strategy "
                 "to be inactive. Call deactivate() first."
@@ -359,71 +364,40 @@ class MergedLoRAStrategy:
         return total
 
     def activate(self) -> None:
-        # Order: copy factors to GPU FIRST so they exist before any
-        # streamer prefetch can fire. Then activate components, tracking
-        # which succeeded so a mid-activation failure can roll them back.
+        # Same ExitStack pattern BlockStreamingStrategy uses. Each
+        # cleanup callback is registered BEFORE its activation step,
+        # so a mid-activation exception unwinds cleanly via the
+        # context-manager exit. On full success, ``stack.pop_all()``
+        # transfers the cleanups to ``self._teardown`` for ``deactivate``.
+        #
+        # Component contracts say deactivate is idempotent and safe to
+        # call regardless of whether activate completed — so registering
+        # before activating is correct, not a hazard.
         self._gpu_factors = self._copy_factors_to_gpu(self._active)
-        activated: list[Any] = []
-        try:
+        with contextlib.ExitStack() as stack:
+            stack.callback(self._clear_gpu_factors)
             if self._pinned is not None:
+                stack.callback(self._pinned.deactivate)
                 self._pinned.activate()
-                activated.append(self._pinned)
+            stack.callback(self._streamer.deactivate)
             self._streamer.activate()
-            activated.append(self._streamer)
-        except BaseException:
-            # Best-effort rollback in reverse activation order. Swallow
-            # any rollback exceptions — the original activate failure is
-            # what surfaces.
-            for c in reversed(activated):
-                try:
-                    c.deactivate()
-                except BaseException:
-                    logger.exception(
-                        "MergedLoRAStrategy: rollback deactivate raised "
-                        "during activation cleanup; original error follows"
-                    )
-            self._gpu_factors = None
-            raise
-        # Sync to close the race between the streamer's resident-block
-        # initial merges (addmm_ enqueued on the default stream during
-        # streamer.activate(), kernels async even though copy_from is
-        # blocking) and any forward the caller may run on a non-default
-        # compute stream. The cost is microseconds; the alternative is a
-        # subtle cross-stream visibility race.
-        if self._device.type == "cuda":
-            torch.cuda.synchronize(self._device)
+            # Sync inside the stack so a (rare) sync failure also
+            # triggers component rollback. Closes the cross-stream
+            # visibility race with the streamer's resident-block
+            # initial merges (addmm_ kernels enqueued async on the
+            # default stream during streamer.activate()).
+            if self._device.type == "cuda":
+                torch.cuda.synchronize(self._device)
+            self._teardown = stack.pop_all()
 
     def deactivate(self) -> None:
-        # Order: deactivate streamers FIRST to drain prefetch (no
-        # in-flight merge ops reference factors after this), then
-        # non-block PinnedWeights, then free factor storage. Each
-        # step's exception is captured rather than allowed to mask
-        # earlier ones — a raise in `_pinned.deactivate()` from a
-        # finally block would otherwise replace the streamer's
-        # prefetch exception (the more diagnostic one) on the wire.
-        # Surface the FIRST captured exception (typically the streamer
-        # one); log any subsequent cleanup failures for diagnosis.
-        errors: list[BaseException] = []
-        try:
-            self._streamer.deactivate()
-        except BaseException as e:
-            errors.append(e)
-        if self._pinned is not None:
-            try:
-                self._pinned.deactivate()
-            except BaseException as e:
-                errors.append(e)
-        # Always free factor storage, regardless of any prior error.
+        stack = self._teardown
+        self._teardown = None
+        if stack is not None:
+            stack.close()
+
+    def _clear_gpu_factors(self) -> None:
         self._gpu_factors = None
-        if not errors:
-            return
-        for e in errors[1:]:
-            logger.exception(
-                "MergedLoRAStrategy.deactivate: secondary cleanup failure "
-                "(suppressed in favor of the original exception)",
-                exc_info=e,
-            )
-        raise errors[0]
 
     def __enter__(self) -> nn.Module:
         self.activate()

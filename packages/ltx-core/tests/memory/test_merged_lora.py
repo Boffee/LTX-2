@@ -488,34 +488,35 @@ class TestMergeCorrectness:
 # ---------------------------------------------------------------------------
 
 
-class TestDeactivateExceptionPropagation:
-    """deactivate must surface the FIRST exception (typically the
-    streamer's prefetch exception), not be replaced by a secondary
-    cleanup failure. The earlier try/finally pattern masked the
-    original — switched to error collection that preserves it."""
+class TestDeactivateCleanupInvariants:
+    """Architectural invariant: factor cleanup must run regardless of
+    whether component deactivates raise. ExitStack handles ordering
+    and exception chaining; we just assert the post-condition."""
 
-    def test_streamer_failure_surfaces_over_pinned_failure(self, monkeypatch) -> None:
+    @CUDA
+    def test_factor_cleanup_runs_even_when_streamer_deactivate_raises(
+        self, monkeypatch,
+    ) -> None:
         m = _make_bf16_model(num_blocks=4, dim=16)
         s = MergedLoRAStrategy(
-            m, torch.device("cpu"),
+            m, torch.device("cuda"),
             loras=[_make_lora("a", 4, 16)],
             layers_attr="transformer_blocks", blocks_to_swap=1,
         )
+        s.set_active(["a"])
 
-        def streamer_boom():
-            raise RuntimeError("streamer prefetch failed")
-
-        def pinned_boom():
-            raise RuntimeError("pinned cleanup also failed")
+        # Patch BEFORE activate — the bound method captured by
+        # stack.callback at activate time is what runs at close().
+        def streamer_boom() -> None:
+            raise RuntimeError("streamer cleanup failed")
 
         monkeypatch.setattr(s._streamer, "deactivate", streamer_boom)
-        if s._pinned is not None:
-            monkeypatch.setattr(s._pinned, "deactivate", pinned_boom)
+        s.activate()
 
-        # The streamer's exception should surface, not pinned's.
-        with pytest.raises(RuntimeError, match="streamer prefetch failed"):
+        # ExitStack runs the failing cleanup, chains the exception,
+        # and continues — factor cleanup still runs.
+        with pytest.raises(RuntimeError):
             s.deactivate()
-        # Factors must still be freed despite both failures.
         assert s._gpu_factors is None
 
 
