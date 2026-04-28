@@ -132,48 +132,10 @@ class PinnedParamBuffer:
     def homogeneity_key(self) -> Hashable:
         """Identity tuple for layout homogeneity checks. Used by
         :class:`BlockStreamer` to verify all blocks share the same
-        layout before allocating a single GPU pool slot."""
-        return self.adapter.homogeneity_key(self.pinned_state)
+        layout before allocating a single GPU pool slot.
 
-    # ------------------------------------------------------------------
-    # Backward-compat shims
-    # ------------------------------------------------------------------
-    # The pre-adapter PinnedParamBuffer exposed a fixed set of fields
-    # (pinned_data, pinned_scale, is_quanto, qtype, axis, act_qt, size,
-    # stride). Those leaked tensor-type-specific shape into consumers.
-    # The adapter-based design replaces them with cache_bytes /
-    # homogeneity_key methods. Keep the old names as read-only
-    # properties so existing test code and any external probes keep
-    # working during migration; remove in a later release.
-
-    @property
-    def pinned_data(self) -> torch.Tensor:
-        return self.pinned_state.data  # type: ignore[attr-defined]
-
-    @property
-    def pinned_scale(self) -> torch.Tensor | None:
-        return getattr(self.pinned_state, "scale", None)
-
-    @property
-    def is_quanto(self) -> bool:
-        return self.adapter.is_quanto
-
-    @property
-    def qtype(self) -> Any:
-        return getattr(self.pinned_state, "qtype", None)
-
-    @property
-    def axis(self) -> Any:
-        return getattr(self.pinned_state, "axis", None)
-
-    @property
-    def act_qt(self) -> Any:
-        return getattr(self.pinned_state, "act_qt", None)
-
-    @property
-    def size(self) -> Any:
-        return getattr(self.pinned_state, "size", None)
-
-    @property
-    def stride(self) -> Any:
-        return getattr(self.pinned_state, "stride", None)
+        Includes the adapter class so distinct adapters can never
+        collide on tuple shape — a quanto state and a regular state
+        with coincidentally matching layout fields stay distinguishable.
+        """
+        return (self.adapter, self.adapter.homogeneity_key(self.pinned_state))

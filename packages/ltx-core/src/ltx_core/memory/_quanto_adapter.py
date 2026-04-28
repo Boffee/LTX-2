@@ -10,10 +10,8 @@ Parameter's wrapped object, not its bytes. So this adapter:
   pins each separately.
 - Reconstructs a fresh ``WeightQBytesTensor`` (and thus a fresh
   :class:`nn.Parameter`) on each activate via slot replacement.
-  This is the ``ephemeral_replacement`` identity mode — incompatible
-  with PyTorch optimizers (Adam state keyed by Parameter id is
-  orphaned across cycles). The composer rejects ``trainable + quanto``
-  combinations.
+  PyTorch optimizers keyed by the user's pre-wrap Parameter id are
+  orphaned across cycles — quanto-quantized weights are inference-only.
 
 Reaches into quanto's private attributes (``_data``, ``_scale``,
 ``qtype``, ``axis``, ``activation_qtype``). Pinned to the
@@ -30,12 +28,11 @@ if optimum-quanto is not installed — quanto support is optional.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ClassVar
 
 import torch
 from torch import nn
 
-from .tensor_adapters import ParamIdentity, register_adapter
+from .tensor_adapters import register_adapter
 
 try:
     from optimum.quanto.tensor.weights.qbytes import WeightQBytesTensor
@@ -98,12 +95,6 @@ class QuantoAdapter:
     installed via slot replacement. This breaks PyTorch optimizer
     references — quanto-quantized weights are inference-only.
     """
-
-    param_identity: ClassVar[ParamIdentity] = "ephemeral_replacement"
-    uses_pinned_host: ClassVar[bool] = True
-    supports_trainable: ClassVar[bool] = False
-    moves_grad: ClassVar[bool] = False
-    is_quanto: ClassVar[bool] = True
 
     @staticmethod
     def matches(t: torch.Tensor) -> bool:
@@ -192,10 +183,9 @@ class QuantoAdapter:
 
     @staticmethod
     def copy_back(src: _QuantoGpu, dst: _QuantoPinned) -> None:
-        # Quanto is inference-only (supports_trainable=False); copy_back
-        # would only be used if a caller mistakenly enabled it for a
-        # quanto slot. Implement defensively: copy both pieces back so
-        # the deactivated state reflects whatever the model produced.
+        # Quanto is inference-only — copy_back is only reached if a
+        # caller mistakenly enabled it for a quanto slot. Defensive
+        # round-trip so the deactivated state mirrors the GPU side.
         dst.data.copy_(src.data, non_blocking=False)
         dst.scale.copy_(src.scale, non_blocking=False)
 

@@ -20,12 +20,14 @@ class TestPinnedParamBuffer:
     def test_non_quanto_pin_and_load(self) -> None:
         p = nn.Parameter(torch.randn(8, 16, dtype=torch.bfloat16), requires_grad=False)
         buf = PinnedParamBuffer("w", p)
-        assert not buf.is_quanto
-        assert buf.pinned_data.is_pinned()
-        assert buf.pinned_data.shape == p.shape
-        assert buf.pinned_scale is None
-        # cpu_param wraps the pinned tensor.
-        assert buf.cpu_param.data.data_ptr() == buf.pinned_data.data_ptr()
+        # cpu_param wraps a plain pinned tensor — no quanto subclass.
+        assert type(buf.cpu_param.data) is torch.Tensor
+        assert buf.cpu_param.data.is_pinned()
+        assert buf.cpu_param.data.shape == p.shape
+        # cpu_param is a zero-copy wrapper around the pinned host buffer,
+        # not a second clone — callers slot-replace at this and rely on
+        # the storage staying alive for the buffer's lifetime.
+        assert buf.cpu_param.data.data_ptr() == buf.pinned_state.data.data_ptr()
 
     @CUDA
     def test_load_to_gpu_non_quanto(self) -> None:
@@ -35,7 +37,7 @@ class TestPinnedParamBuffer:
         assert gpu.is_cuda
         assert gpu.shape == p.shape
         torch.cuda.synchronize()
-        assert torch.equal(gpu.cpu(), buf.pinned_data)
+        assert torch.equal(gpu.cpu(), buf.cpu_param.data)
 
     @CUDA
     def test_pool_pattern_allocate_and_copy(self) -> None:
@@ -50,10 +52,10 @@ class TestPinnedParamBuffer:
         # First copy
         buf.copy_to_gpu(gpu_state, non_blocking=True)
         torch.cuda.synchronize()
-        assert torch.equal(gpu_state.data.cpu(), buf.pinned_data)
+        assert torch.equal(gpu_state.data.cpu(), buf.cpu_param.data)
         # Mutate pinned source and re-copy — gpu state should track.
         new_vals = torch.randn(16, dtype=torch.bfloat16, pin_memory=True)
-        buf.pinned_data.copy_(new_vals)
+        buf.cpu_param.data.copy_(new_vals)
         buf.copy_to_gpu(gpu_state, non_blocking=True)
         torch.cuda.synchronize()
         assert torch.equal(gpu_state.data.cpu(), new_vals)
@@ -71,18 +73,8 @@ class TestPinnedParamBuffer:
         assert not non_contig.is_contiguous()
         p = nn.Parameter(non_contig, requires_grad=False)
         buf = PinnedParamBuffer("w", p)
-        assert buf.pinned_data.is_contiguous()
-        assert buf.pinned_data.is_pinned()
-
-    def test_cpu_param_data_ptr_stable(self) -> None:
-        # The cpu_param.data must be the same tensor object as pinned_data
-        # (or a quanto wrapper around it) — callers repoint module
-        # _parameters at it and expect the storage to be alive for the
-        # buffer's lifetime.
-        p = nn.Parameter(torch.randn(4, dtype=torch.bfloat16), requires_grad=False)
-        buf = PinnedParamBuffer("w", p)
-        ptr_before = buf.cpu_param.data.data_ptr()
-        assert ptr_before == buf.pinned_data.data_ptr()
+        assert buf.cpu_param.data.is_contiguous()
+        assert buf.cpu_param.data.is_pinned()
 
     @CUDA
     def test_slot_param_identity_stable_across_loads(self) -> None:
@@ -132,21 +124,23 @@ class TestPinnedParamBufferQuanto:
         p = nn.Parameter(qt, requires_grad=False)
         buf = PinnedParamBuffer("w", p)
 
-        assert buf.is_quanto
-        assert buf.pinned_data.is_pinned()
-        assert buf.pinned_data.is_contiguous()
-        assert buf.pinned_data.dtype == torch.int8
-        assert buf.pinned_scale is not None
-        assert buf.pinned_scale.is_pinned()
-        assert buf.qtype is quanto.qint8
-        assert buf.axis == 0
-        assert tuple(buf.size) == (rows, cols)
-        assert buf.stride == (cols, 1)
-        assert buf.act_qt is None
-        # cpu_param wraps a quanto tensor pointing at the pinned tensors.
+        # cpu_param wraps a quanto tensor whose _data and _scale are
+        # pinned, contiguous, and carry the original quant metadata.
         assert isinstance(buf.cpu_param.data, WeightQBytesTensor)
-        assert buf.cpu_param.data._data.data_ptr() == buf.pinned_data.data_ptr()
-        assert buf.cpu_param.data._scale.data_ptr() == buf.pinned_scale.data_ptr()
+        qt_pinned = buf.cpu_param.data
+        assert qt_pinned._data.is_pinned()
+        assert qt_pinned._data.is_contiguous()
+        assert qt_pinned._data.dtype == torch.int8
+        assert qt_pinned._scale.is_pinned()
+        assert qt_pinned.qtype is quanto.qint8
+        assert qt_pinned.axis == 0
+        assert tuple(qt_pinned.size()) == (rows, cols)
+        assert qt_pinned.stride() == (cols, 1)
+        assert getattr(qt_pinned, "activation_qtype", None) is None
+        # Zero-copy: the wrapper's _data and _scale point at the same
+        # pinned host buffers the adapter pinned, not separate clones.
+        assert qt_pinned._data.data_ptr() == buf.pinned_state.data.data_ptr()
+        assert qt_pinned._scale.data_ptr() == buf.pinned_state.scale.data_ptr()
 
     @CUDA
     def test_load_to_gpu_round_trip(self) -> None:
@@ -167,5 +161,6 @@ class TestPinnedParamBufferQuanto:
         assert isinstance(gpu_param.data, WeightQBytesTensor)
         assert gpu_param.data._data.is_cuda
         assert gpu_param.data._scale.is_cuda
-        assert torch.equal(gpu_param.data._data.cpu(), buf.pinned_data)
-        assert torch.equal(gpu_param.data._scale.cpu(), buf.pinned_scale)
+        qt_pinned = buf.cpu_param.data
+        assert torch.equal(gpu_param.data._data.cpu(), qt_pinned._data)
+        assert torch.equal(gpu_param.data._scale.cpu(), qt_pinned._scale)
