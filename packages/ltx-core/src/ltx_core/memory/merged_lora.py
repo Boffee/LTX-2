@@ -53,7 +53,7 @@ Cost
 At LTX-2 shape (d≈2048, r=128, ~30 blocks, ~6 LoRA-target layers per
 block), the per-block merge cost is roughly 60μs per active LoRA
 (low-rank matmul + element-wise add). For K=3 active, that's ~180μs
-per block × ~30 blocks ≈ 5ms total per forward — fully hidden by
+per block * ~30 blocks ~= 5ms total per forward, fully hidden by
 prefetch overlap when ``prefetch_count`` is appropriate. Steady-state
 forward overhead vs. unmerged base: ~0%.
 
@@ -75,7 +75,6 @@ from torch import nn
 from .block_compose import _has_non_block_pinnable_content, _resolve_attr
 from .block_streamer import BlockStreamer
 from .pinned_weights import PinnedWeights
-from .slot_graph import iter_param_slots
 from .strategy import SlotOwnership
 
 logger = logging.getLogger(__name__)
@@ -248,11 +247,35 @@ class MergedLoRAStrategy:
 
         self._available: set[str] = {b.name for b in loras}
         if len(self._available) != len(loras):
-            raise ValueError("LoRA names must be unique")
+            seen: dict[str, int] = {}
+            for b in loras:
+                seen[b.name] = seen.get(b.name, 0) + 1
+            dups = sorted(name for name, count in seen.items() if count > 1)
+            raise ValueError(
+                f"LoRA names must be unique; duplicates: {dups}"
+            )
+
+        # Per-block map of frozen-param qualname → target shape.
+        # Used by _pin_factors to validate that LoRA targets exist
+        # in the streamable region and that B@A produces a tensor of
+        # the right shape for the target weight.
+        target_shapes: list[dict[str, tuple[int, ...]]] = []
+        for block in blocks:
+            shapes: dict[str, tuple[int, ...]] = {}
+            for qual, p in block.named_parameters():
+                if p.requires_grad:
+                    # LoRA targets must be frozen — trainable params
+                    # belong to the user's optimizer or to a separate
+                    # TrainableWeights component.
+                    continue
+                shapes[qual] = tuple(p.shape)
+            target_shapes.append(shapes)
 
         # Pin factors up front; clone-and-cast to base dtype, validate.
         self._pinned_factors: _PinnedMap = self._pin_factors(
-            loras, base_dtype, num_blocks=len(blocks),
+            loras, base_dtype,
+            num_blocks=len(blocks),
+            target_shapes=target_shapes,
         )
         self._active: tuple[str, ...] = ()
         self._gpu_factors: _GpuMap | None = None
@@ -373,18 +396,34 @@ class MergedLoRAStrategy:
     def deactivate(self) -> None:
         # Order: deactivate streamers FIRST to drain prefetch (no
         # in-flight merge ops reference factors after this), then
-        # non-block PinnedWeights, then free factor storage. Each step
-        # is in its own try/finally so a raise in one stage doesn't
-        # leak the rest — particularly the GPU factor storage, which
-        # would otherwise survive a poisoned strategy reference.
+        # non-block PinnedWeights, then free factor storage. Each
+        # step's exception is captured rather than allowed to mask
+        # earlier ones — a raise in `_pinned.deactivate()` from a
+        # finally block would otherwise replace the streamer's
+        # prefetch exception (the more diagnostic one) on the wire.
+        # Surface the FIRST captured exception (typically the streamer
+        # one); log any subsequent cleanup failures for diagnosis.
+        errors: list[BaseException] = []
         try:
             self._streamer.deactivate()
-        finally:
+        except BaseException as e:
+            errors.append(e)
+        if self._pinned is not None:
             try:
-                if self._pinned is not None:
-                    self._pinned.deactivate()
-            finally:
-                self._gpu_factors = None
+                self._pinned.deactivate()
+            except BaseException as e:
+                errors.append(e)
+        # Always free factor storage, regardless of any prior error.
+        self._gpu_factors = None
+        if not errors:
+            return
+        for e in errors[1:]:
+            logger.exception(
+                "MergedLoRAStrategy.deactivate: secondary cleanup failure "
+                "(suppressed in favor of the original exception)",
+                exc_info=e,
+            )
+        raise errors[0]
 
     def __enter__(self) -> nn.Module:
         self.activate()
@@ -425,6 +464,7 @@ class MergedLoRAStrategy:
         loras: Sequence[LoRABundle],
         base_dtype: torch.dtype,
         num_blocks: int,
+        target_shapes: list[dict[str, tuple[int, ...]]],
     ) -> _PinnedMap:
         """Validate, clone-cast-and-pin user-supplied factors.
 
@@ -432,6 +472,11 @@ class MergedLoRAStrategy:
         cryptic failures inside prefetch futures. Trainable factors are
         silently detached (we own a frozen snapshot) — that's
         intentional, not a bug, since the strategy is inference-only.
+
+        ``target_shapes[block_idx]`` maps in-block qualname to the
+        frozen target weight's shape; used to verify that the LoRA
+        targets a real frozen param and that B @ A produces a delta
+        of the right shape.
         """
         pinned: _PinnedMap = {}
         for lora in loras:
@@ -442,6 +487,7 @@ class MergedLoRAStrategy:
                         f"LoRA {lora.name!r}: block_idx={block_idx} out of "
                         f"range [0, {num_blocks})"
                     )
+                block_targets = target_shapes[block_idx]
                 per_layer: dict[str, _PinnedFactors] = {}
                 for qual_name, f in layer_factors.items():
                     if not f.A.is_floating_point() or not f.B.is_floating_point():
@@ -459,9 +505,25 @@ class MergedLoRAStrategy:
                     if f.A.shape[0] != f.B.shape[1]:
                         raise ValueError(
                             f"LoRA {lora.name!r} block {block_idx} "
-                            f"layer {qual_name!r}: rank mismatch — A.shape[0]"
+                            f"layer {qual_name!r}: rank mismatch -- A.shape[0]"
                             f"={f.A.shape[0]}, B.shape[1]={f.B.shape[1]} "
                             f"(expected A=(rank, in_dim), B=(out_dim, rank))"
+                        )
+                    if qual_name not in block_targets:
+                        raise ValueError(
+                            f"LoRA {lora.name!r} block {block_idx}: target "
+                            f"{qual_name!r} is not a frozen param in the "
+                            f"block. Available frozen targets: "
+                            f"{sorted(block_targets)}"
+                        )
+                    target_shape = block_targets[qual_name]
+                    expected_delta_shape = (f.B.shape[0], f.A.shape[1])
+                    if target_shape != expected_delta_shape:
+                        raise ValueError(
+                            f"LoRA {lora.name!r} block {block_idx} "
+                            f"layer {qual_name!r}: shape mismatch -- target "
+                            f"weight has shape {target_shape}, but B @ A "
+                            f"produces shape {expected_delta_shape}"
                         )
                     # .cpu() handles the case of factors stored on GPU
                     # (e.g., loaded from a model that's on GPU). Without
@@ -497,7 +559,7 @@ class MergedLoRAStrategy:
             torch.cuda.synchronize(self._device)
         return gpu
 
-    def _apply_active_loras(self, slot: Any, block_idx: int) -> None:
+    def _apply_active_loras(self, slot: Any, block_idx: int) -> None:  # noqa: ANN401
         """post_load callback invoked on the prefetch stream after each
         block's DMA. Merges every active LoRA's factors for this block
         into the slot's weights via in-place ``addmm_``.

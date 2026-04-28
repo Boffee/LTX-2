@@ -220,6 +220,57 @@ class TestConstructionValidation:
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
 
+    def test_rejects_unknown_qual_name(self) -> None:
+        m = _make_bf16_model(num_blocks=4, dim=16)
+        bad = LoRABundle(
+            name="typo",
+            blocks={
+                0: {"attn.typo_weight": LoRALayerFactors(
+                    A=torch.randn(4, 16), B=torch.randn(16, 4), scaling=1.0,
+                )},
+            },
+        )
+        with pytest.raises(ValueError, match="not a frozen param"):
+            MergedLoRAStrategy(
+                m, torch.device("cpu"),
+                loras=[bad],
+                layers_attr="transformer_blocks", blocks_to_swap=1,
+            )
+
+    def test_rejects_target_shape_mismatch(self) -> None:
+        m = _make_bf16_model(num_blocks=4, dim=16)
+        # Target weight is (16, 16) but B @ A produces (8, 16)
+        bad = LoRABundle(
+            name="shape_mismatch",
+            blocks={
+                0: {"attn.weight": LoRALayerFactors(
+                    A=torch.randn(4, 16),
+                    B=torch.randn(8, 4),         # out_dim=8, target out=16
+                    scaling=1.0,
+                )},
+            },
+        )
+        with pytest.raises(ValueError, match="shape mismatch"):
+            MergedLoRAStrategy(
+                m, torch.device("cpu"),
+                loras=[bad],
+                layers_attr="transformer_blocks", blocks_to_swap=1,
+            )
+
+    def test_duplicate_lora_names_lists_dups(self) -> None:
+        m = _make_bf16_model()
+        loras = [
+            _make_lora("dup", 4, 16, seed=0),
+            _make_lora("dup", 4, 16, seed=1),
+            _make_lora("solo", 4, 16, seed=2),
+        ]
+        with pytest.raises(ValueError, match=r"duplicates: \['dup'\]"):
+            MergedLoRAStrategy(
+                m, torch.device("cpu"),
+                loras=loras,
+                layers_attr="transformer_blocks", blocks_to_swap=1,
+            )
+
     def test_accepts_factors_already_on_gpu(self) -> None:
         # If the user constructs factors on GPU (e.g., from a model on
         # GPU), the strategy should .cpu() them before pinning rather
@@ -435,6 +486,37 @@ class TestMergeCorrectness:
 # ---------------------------------------------------------------------------
 # Cache budget reporting
 # ---------------------------------------------------------------------------
+
+
+class TestDeactivateExceptionPropagation:
+    """deactivate must surface the FIRST exception (typically the
+    streamer's prefetch exception), not be replaced by a secondary
+    cleanup failure. The earlier try/finally pattern masked the
+    original — switched to error collection that preserves it."""
+
+    def test_streamer_failure_surfaces_over_pinned_failure(self, monkeypatch) -> None:
+        m = _make_bf16_model(num_blocks=4, dim=16)
+        s = MergedLoRAStrategy(
+            m, torch.device("cpu"),
+            loras=[_make_lora("a", 4, 16)],
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+
+        def streamer_boom():
+            raise RuntimeError("streamer prefetch failed")
+
+        def pinned_boom():
+            raise RuntimeError("pinned cleanup also failed")
+
+        monkeypatch.setattr(s._streamer, "deactivate", streamer_boom)
+        if s._pinned is not None:
+            monkeypatch.setattr(s._pinned, "deactivate", pinned_boom)
+
+        # The streamer's exception should surface, not pinned's.
+        with pytest.raises(RuntimeError, match="streamer prefetch failed"):
+            s.deactivate()
+        # Factors must still be freed despite both failures.
+        assert s._gpu_factors is None
 
 
 class TestCacheBytes:
