@@ -1,8 +1,8 @@
 """Tests for ``ltx_core.memory.merged_lora.MergedLoRAStrategy``.
 
-Covers construction validation, lifecycle (activate/deactivate),
-active-set switching, factor lifetime ordering, and forward-output
-correctness against a manually-merged baseline.
+Covers construction validation, set_loras validation, lifecycle
+(activate/deactivate), LoRA switching, and forward-output correctness
+against a manually-merged baseline.
 
 Most lifecycle tests run on CPU (the merge math is device-agnostic);
 CUDA-only tests gate on availability.
@@ -15,8 +15,7 @@ import torch
 from torch import nn
 
 from ltx_core.memory import (
-    LoRABundle,
-    LoRALayerFactors,
+    LoRA,
     MergedLoRAStrategy,
 )
 
@@ -63,37 +62,55 @@ def _make_bf16_model(num_blocks: int = 4, dim: int = 16) -> nn.Module:
 
 
 def _make_lora(
-    name: str, num_blocks: int, dim: int, rank: int = 4, scaling: float = 1.0,
-    seed: int = 0,
-) -> LoRABundle:
-    """Build a LoRABundle with random factors for the given attention
-    q-projection target across all blocks."""
+    num_blocks: int, dim: int, rank: int = 4, strength: float = 1.0,
+    seed: int = 0, prefix: str = "",
+) -> LoRA:
+    """Build a LoRA with flat safetensors-style keys targeting attn.weight
+    across all blocks."""
     g = torch.Generator().manual_seed(seed)
-    blocks: dict[int, dict[str, LoRALayerFactors]] = {}
+    sd: dict[str, torch.Tensor] = {}
     for b in range(num_blocks):
-        # Target the attn.weight in each block — single target for
-        # simplicity. Real LoRAs target multiple layers per block.
-        A = torch.randn(rank, dim, generator=g, dtype=torch.float32)
-        B = torch.randn(dim, rank, generator=g, dtype=torch.float32)
-        blocks[b] = {
-            "attn.weight": LoRALayerFactors(A=A, B=B, scaling=scaling),
-        }
-    return LoRABundle(name=name, blocks=blocks)
+        base = f"{prefix}transformer_blocks.{b}.attn"
+        sd[f"{base}.lora_A.weight"] = torch.randn(
+            rank, dim, generator=g, dtype=torch.float32,
+        )
+        sd[f"{base}.lora_B.weight"] = torch.randn(
+            dim, rank, generator=g, dtype=torch.float32,
+        )
+    return LoRA(state_dict=sd, strength=strength)
 
 
 def _expected_merged_weight(
-    base: torch.Tensor, loras: list[LoRABundle], block_idx: int, qual: str,
+    base: torch.Tensor, loras: list[LoRA], block_idx: int, qual: str,
+    key_transform=None,
 ) -> torch.Tensor:
-    """Compute the target weight for a layer by summing all LoRA deltas
-    onto the base, in the same order MergedLoRAStrategy will."""
+    """Compute the target weight by summing all LoRA deltas onto the base."""
     out = base.clone()
     for lora in loras:
-        f = lora.blocks.get(block_idx, {}).get(qual)
-        if f is None:
-            continue
-        delta = f.scaling * (f.B.to(base.dtype) @ f.A.to(base.dtype))
-        out = out + delta
+        stem = qual.replace(".weight", "")
+        for key in lora.state_dict:
+            if not key.endswith(".lora_A.weight"):
+                continue
+            base_key = key[: -len(".lora_A.weight")]
+            target = f"{base_key}.weight"
+            if key_transform is not None:
+                target = key_transform(target)
+            if target != f"transformer_blocks.{block_idx}.{qual}":
+                continue
+            a = lora.state_dict[f"{base_key}.lora_A.weight"].to(base.dtype)
+            b = lora.state_dict[f"{base_key}.lora_B.weight"].to(base.dtype)
+            out = out + lora.strength * (b @ a)
     return out
+
+
+def _make_strategy(model, device="cpu", blocks_to_swap=1, **kwargs):
+    """Shorthand for constructing the strategy with sensible defaults."""
+    return MergedLoRAStrategy(
+        model, torch.device(device),
+        layers_attr="transformer_blocks",
+        blocks_to_swap=blocks_to_swap,
+        **kwargs,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -105,249 +122,133 @@ class TestConstructionValidation:
     def test_rejects_fp32_base(self) -> None:
         m = _make_bf16_model().to(torch.float32)
         with pytest.raises(ValueError, match="bf16/fp16 base"):
-            MergedLoRAStrategy(
-                m, torch.device("cpu"),
-                loras=[_make_lora("a", 4, 16)],
-                layers_attr="transformer_blocks",
-                blocks_to_swap=1,
-            )
+            _make_strategy(m)
 
     def test_accepts_fp16_base(self) -> None:
         m = _make_bf16_model().to(torch.float16)
-        # Construction should succeed without raising.
-        s = MergedLoRAStrategy(
-            m, torch.device("cpu"),
-            loras=[_make_lora("a", 4, 16)],
-            layers_attr="transformer_blocks",
-            blocks_to_swap=1,
-        )
+        s = _make_strategy(m)
         assert s.cache_bytes > 0
 
-    def test_rejects_duplicate_lora_names(self) -> None:
-        m = _make_bf16_model()
-        loras = [_make_lora("dup", 4, 16, seed=0), _make_lora("dup", 4, 16, seed=1)]
-        with pytest.raises(ValueError, match="unique"):
-            MergedLoRAStrategy(
-                m, torch.device("cpu"),
-                loras=loras,
-                layers_attr="transformer_blocks",
-                blocks_to_swap=1,
-            )
-
     def test_rejects_empty_layers_attr(self) -> None:
-        # transformer_blocks=[] would resolve to an empty list.
         m = _make_bf16_model(num_blocks=0)
         with pytest.raises(ValueError, match="empty ModuleList"):
-            MergedLoRAStrategy(
-                m, torch.device("cpu"),
-                loras=[],
-                layers_attr="transformer_blocks",
-                blocks_to_swap=0,
-            )
+            _make_strategy(m, blocks_to_swap=0)
 
-    def test_rejects_out_of_range_block_idx(self) -> None:
-        m = _make_bf16_model(num_blocks=4, dim=16)
-        # LoRA targets a block index that doesn't exist.
-        bad = LoRABundle(
-            name="oob",
-            blocks={
-                99: {"attn.weight": LoRALayerFactors(
-                    A=torch.randn(4, 16), B=torch.randn(16, 4), scaling=1.0,
-                )},
-            },
-        )
-        with pytest.raises(ValueError, match="block_idx=99 out of range"):
-            MergedLoRAStrategy(
-                m, torch.device("cpu"),
-                loras=[bad],
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
+
+# ---------------------------------------------------------------------------
+# set_loras validation
+# ---------------------------------------------------------------------------
+
+
+class TestSetLorasValidation:
+    def test_unpaired_a_factor(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        sd = {"transformer_blocks.0.attn.lora_A.weight": torch.randn(4, 16)}
+        with pytest.raises(ValueError, match="Unpaired"):
+            s.set_loras([LoRA(state_dict=sd)])
+
+    def test_unpaired_b_factor(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        sd = {"transformer_blocks.0.attn.lora_B.weight": torch.randn(16, 4)}
+        with pytest.raises(ValueError, match="Unpaired"):
+            s.set_loras([LoRA(state_dict=sd)])
 
     def test_rejects_non_floating_factor_dtype(self) -> None:
-        m = _make_bf16_model(num_blocks=4, dim=16)
-        bad = LoRABundle(
-            name="int_factors",
-            blocks={
-                0: {"attn.weight": LoRALayerFactors(
-                    A=torch.zeros(4, 16, dtype=torch.int32),
-                    B=torch.zeros(16, 4, dtype=torch.int32),
-                    scaling=1.0,
-                )},
-            },
-        )
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        sd = {
+            "transformer_blocks.0.attn.lora_A.weight": torch.zeros(4, 16, dtype=torch.int32),
+            "transformer_blocks.0.attn.lora_B.weight": torch.zeros(16, 4, dtype=torch.int32),
+        }
         with pytest.raises(ValueError, match="floating-point"):
-            MergedLoRAStrategy(
-                m, torch.device("cpu"),
-                loras=[bad],
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
-
-    def test_rejects_non_2d_factor_shape(self) -> None:
-        m = _make_bf16_model(num_blocks=4, dim=16)
-        bad = LoRABundle(
-            name="bad_shape",
-            blocks={
-                0: {"attn.weight": LoRALayerFactors(
-                    A=torch.randn(4),                # 1D, not 2D
-                    B=torch.randn(16, 4),
-                    scaling=1.0,
-                )},
-            },
-        )
-        with pytest.raises(ValueError, match="factor shape mismatch"):
-            MergedLoRAStrategy(
-                m, torch.device("cpu"),
-                loras=[bad],
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
+            s.set_loras([LoRA(state_dict=sd)])
 
     def test_rejects_rank_mismatch(self) -> None:
-        m = _make_bf16_model(num_blocks=4, dim=16)
-        bad = LoRABundle(
-            name="rank_mismatch",
-            blocks={
-                0: {"attn.weight": LoRALayerFactors(
-                    A=torch.randn(4, 16),    # rank=4
-                    B=torch.randn(16, 8),    # rank=8 — mismatch
-                    scaling=1.0,
-                )},
-            },
-        )
-        with pytest.raises(ValueError, match="factor shape mismatch"):
-            MergedLoRAStrategy(
-                m, torch.device("cpu"),
-                loras=[bad],
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
-
-    def test_rejects_unknown_qual_name(self) -> None:
-        m = _make_bf16_model(num_blocks=4, dim=16)
-        bad = LoRABundle(
-            name="typo",
-            blocks={
-                0: {"attn.typo_weight": LoRALayerFactors(
-                    A=torch.randn(4, 16), B=torch.randn(16, 4), scaling=1.0,
-                )},
-            },
-        )
-        with pytest.raises(ValueError, match="not a frozen param"):
-            MergedLoRAStrategy(
-                m, torch.device("cpu"),
-                loras=[bad],
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        sd = {
+            "transformer_blocks.0.attn.lora_A.weight": torch.randn(4, 16),
+            "transformer_blocks.0.attn.lora_B.weight": torch.randn(16, 8),
+        }
+        with pytest.raises(ValueError, match="shape mismatch"):
+            s.set_loras([LoRA(state_dict=sd)])
 
     def test_rejects_target_shape_mismatch(self) -> None:
-        m = _make_bf16_model(num_blocks=4, dim=16)
-        # Target weight is (16, 16) but B @ A produces (8, 16)
-        bad = LoRABundle(
-            name="shape_mismatch",
-            blocks={
-                0: {"attn.weight": LoRALayerFactors(
-                    A=torch.randn(4, 16),
-                    B=torch.randn(8, 4),         # out_dim=8, target out=16
-                    scaling=1.0,
-                )},
-            },
-        )
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        sd = {
+            "transformer_blocks.0.attn.lora_A.weight": torch.randn(4, 16),
+            "transformer_blocks.0.attn.lora_B.weight": torch.randn(8, 4),
+        }
         with pytest.raises(ValueError, match="shape mismatch"):
-            MergedLoRAStrategy(
-                m, torch.device("cpu"),
-                loras=[bad],
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
+            s.set_loras([LoRA(state_dict=sd)])
 
-    def test_duplicate_lora_names_lists_dups(self) -> None:
+    def test_rejects_non_2d_factor(self) -> None:
         m = _make_bf16_model()
-        loras = [
-            _make_lora("dup", 4, 16, seed=0),
-            _make_lora("dup", 4, 16, seed=1),
-            _make_lora("solo", 4, 16, seed=2),
-        ]
-        with pytest.raises(ValueError, match="appears more than once"):
-            MergedLoRAStrategy(
-                m, torch.device("cpu"),
-                loras=loras,
-                layers_attr="transformer_blocks", blocks_to_swap=1,
-            )
+        s = _make_strategy(m)
+        sd = {
+            "transformer_blocks.0.attn.lora_A.weight": torch.randn(4),
+            "transformer_blocks.0.attn.lora_B.weight": torch.randn(16, 4),
+        }
+        with pytest.raises(ValueError, match="shape mismatch"):
+            s.set_loras([LoRA(state_dict=sd)])
 
-    def test_accepts_factors_already_on_gpu(self) -> None:
-        # If the user constructs factors on GPU (e.g., from a model on
-        # GPU), the strategy should .cpu() them before pinning rather
-        # than failing.
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-        m = _make_bf16_model(num_blocks=4, dim=16)
-        gpu_factors = LoRABundle(
-            name="from_gpu",
-            blocks={
-                0: {"attn.weight": LoRALayerFactors(
-                    A=torch.randn(4, 16, device="cuda"),
-                    B=torch.randn(16, 4, device="cuda"),
-                    scaling=1.0,
-                )},
-            },
-        )
-        s = MergedLoRAStrategy(
-            m, torch.device("cuda"),
-            loras=[gpu_factors],
-            layers_attr="transformer_blocks", blocks_to_swap=1,
-        )
-        assert "from_gpu" in s.available
-
-
-# ---------------------------------------------------------------------------
-# Active set management
-# ---------------------------------------------------------------------------
-
-
-class TestActiveSet:
-    def test_set_active_rejects_unknown_name(self) -> None:
+    def test_skips_non_block_targets(self) -> None:
         m = _make_bf16_model()
-        s = MergedLoRAStrategy(
-            m, torch.device("cpu"),
-            loras=[_make_lora("a", 4, 16)],
-            layers_attr="transformer_blocks", blocks_to_swap=1,
-        )
-        with pytest.raises(ValueError, match="Unknown LoRA names"):
-            s.set_active(["unknown"])
+        s = _make_strategy(m)
+        sd = {
+            "embed.lora_A.weight": torch.randn(4, 16),
+            "embed.lora_B.weight": torch.randn(16, 4),
+        }
+        s.set_loras([LoRA(state_dict=sd)])
+        assert s._lora_factor_bytes == 0
 
-    def test_set_active_rejects_duplicates(self) -> None:
+    def test_key_transform_strips_prefix(self) -> None:
         m = _make_bf16_model()
-        s = MergedLoRAStrategy(
-            m, torch.device("cpu"),
-            loras=[_make_lora("a", 4, 16), _make_lora("b", 4, 16)],
-            layers_attr="transformer_blocks", blocks_to_swap=1,
-        )
-        with pytest.raises(ValueError, match="Duplicate LoRA names"):
-            s.set_active(["a", "b", "a"])
+        s = _make_strategy(m)
+        lora = _make_lora(4, 16, prefix="diffusion_model.")
+        s.set_loras([lora])
+        assert s._lora_factor_bytes > 0
 
-    def test_set_active_preserves_order(self) -> None:
+    def test_key_transform_none_requires_exact_keys(self) -> None:
         m = _make_bf16_model()
-        s = MergedLoRAStrategy(
-            m, torch.device("cpu"),
-            loras=[_make_lora("a", 4, 16), _make_lora("b", 4, 16),
-                   _make_lora("c", 4, 16)],
-            layers_attr="transformer_blocks", blocks_to_swap=1,
-        )
-        s.set_active(["c", "a", "b"])
-        assert s.active == ("c", "a", "b")
+        s = _make_strategy(m, key_transform=None)
+        lora = _make_lora(4, 16)
+        s.set_loras([lora])
+        assert s._lora_factor_bytes > 0
+
+    def test_key_transform_none_skips_prefixed_keys(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m, key_transform=None)
+        lora = _make_lora(4, 16, prefix="diffusion_model.")
+        s.set_loras([lora])
+        assert s._lora_factor_bytes == 0
 
     @CUDA
-    def test_set_active_raises_while_active(self) -> None:
+    def test_set_loras_raises_while_active(self) -> None:
         m = _make_bf16_model()
-        s = MergedLoRAStrategy(
-            m, torch.device("cuda"),
-            loras=[_make_lora("a", 4, 16), _make_lora("b", 4, 16)],
-            layers_attr="transformer_blocks", blocks_to_swap=1,
-        )
-        s.set_active(["a"])
+        s = _make_strategy(m, device="cuda")
+        s.set_loras([_make_lora(4, 16)])
         s.activate()
         try:
             with pytest.raises(RuntimeError, match="inactive"):
-                s.set_active(["b"])
+                s.set_loras([])
         finally:
             s.deactivate()
+
+    def test_set_loras_clears_previous(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        s.set_loras([_make_lora(4, 16, rank=4)])
+        bytes_first = s._lora_factor_bytes
+        assert bytes_first > 0
+        s.set_loras([_make_lora(4, 16, rank=8)])
+        bytes_second = s._lora_factor_bytes
+        assert bytes_second > bytes_first
+        s.set_loras([])
+        assert s._lora_factor_bytes == 0
 
 
 # ---------------------------------------------------------------------------
@@ -359,15 +260,10 @@ class TestLifecycle:
     @CUDA
     def test_activate_runs_components(self) -> None:
         m = _make_bf16_model()
-        s = MergedLoRAStrategy(
-            m, torch.device("cuda"),
-            loras=[_make_lora("a", 4, 16)],
-            layers_attr="transformer_blocks", blocks_to_swap=1,
-        )
-        s.set_active(["a"])
+        s = _make_strategy(m, device="cuda")
+        s.set_loras([_make_lora(4, 16)])
         try:
             s.activate()
-            # Non-block params (embed, head) on GPU via PinnedWeights component.
             assert m.embed.weight.is_cuda
             assert m.head.weight.is_cuda
         finally:
@@ -376,99 +272,30 @@ class TestLifecycle:
     @CUDA
     def test_deactivate_returns_to_pinned(self) -> None:
         m = _make_bf16_model()
-        s = MergedLoRAStrategy(
-            m, torch.device("cuda"),
-            loras=[_make_lora("a", 4, 16)],
-            layers_attr="transformer_blocks", blocks_to_swap=1,
-        )
-        s.set_active(["a"])
+        s = _make_strategy(m, device="cuda")
+        s.set_loras([_make_lora(4, 16)])
         s.activate()
         s.deactivate()
-        # Non-block params back on pinned CPU.
         assert m.embed.weight.is_pinned()
         assert m.head.weight.is_pinned()
 
     @CUDA
-    def test_reactivation_with_different_active_set(self) -> None:
-        # Switching LoRA combos by deactivate → set_active → activate.
+    def test_reactivation_with_different_loras(self) -> None:
         m = _make_bf16_model()
-        s = MergedLoRAStrategy(
-            m, torch.device("cuda"),
-            loras=[_make_lora("a", 4, 16, seed=1),
-                   _make_lora("b", 4, 16, seed=2)],
-            layers_attr="transformer_blocks", blocks_to_swap=1,
-        )
-        s.set_active(["a"])
+        s = _make_strategy(m, device="cuda")
+        s.set_loras([_make_lora(4, 16, seed=1)])
         s.activate()
         s.deactivate()
-        s.set_active(["b"])
+        s.set_loras([_make_lora(4, 16, seed=2)])
         s.activate()
         s.deactivate()
-        # Final state: pinned, no GPU residency.
         assert m.embed.weight.is_pinned()
 
-
-# ---------------------------------------------------------------------------
-# Forward correctness — does the merge actually produce the right weights?
-# ---------------------------------------------------------------------------
-
-
-class TestMergeCorrectness:
     @CUDA
-    def test_merged_weights_match_manual_baseline(self) -> None:
-        # Capture base weights before construction (PinnedWeights and
-        # BlockStreamer both clone-and-pin in __init__, so the model's
-        # original tensor objects get replaced — we need a snapshot).
-        m = _make_bf16_model(num_blocks=4, dim=16)
-        captured_base = {
-            i: m.transformer_blocks[i].attn.weight.detach().clone()
-            for i in range(4)
-        }
-
-        loras = [
-            _make_lora("a", num_blocks=4, dim=16, scaling=0.5, seed=10),
-            _make_lora("b", num_blocks=4, dim=16, scaling=0.25, seed=20),
-        ]
-        s = MergedLoRAStrategy(
-            m, torch.device("cuda"),
-            loras=loras,
-            layers_attr="transformer_blocks", blocks_to_swap=1,
-        )
-        s.set_active(["a", "b"])
-        s.activate()
-        try:
-            # Drive a forward to trigger prefetches across all blocks.
-            x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
-            for blk in m.transformer_blocks:
-                x = blk(x)
-            torch.cuda.synchronize()
-            # Each block's attn.weight should now equal base + sum(LoRA deltas).
-            for i in range(4):
-                expected = _expected_merged_weight(
-                    captured_base[i], loras, i, "attn.weight",
-                ).to("cuda")
-                actual = m.transformer_blocks[i].attn.weight.detach()
-                # bf16 has limited precision; addmm rounds. Tolerate
-                # a few units in the last place.
-                assert torch.allclose(actual, expected, rtol=0.01, atol=0.01), (
-                    f"block {i} merged weight mismatch:\n"
-                    f"  expected: {expected.flatten()[:4]}\n"
-                    f"  actual:   {actual.flatten()[:4]}"
-                )
-        finally:
-            s.deactivate()
-
-    @CUDA
-    def test_empty_active_set_runs_base_only(self) -> None:
-        # set_active([]) means no LoRAs merged — forward sees pure base.
-        m = _make_bf16_model(num_blocks=4, dim=16)
+    def test_activate_with_no_loras_runs_base_only(self) -> None:
+        m = _make_bf16_model()
         captured = m.transformer_blocks[0].attn.weight.detach().clone()
-        s = MergedLoRAStrategy(
-            m, torch.device("cuda"),
-            loras=[_make_lora("a", 4, 16)],
-            layers_attr="transformer_blocks", blocks_to_swap=1,
-        )
-        s.set_active([])
+        s = _make_strategy(m, device="cuda")
         s.activate()
         try:
             x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
@@ -478,65 +305,124 @@ class TestMergeCorrectness:
             actual = m.transformer_blocks[0].attn.weight.detach()
             assert torch.allclose(
                 actual, captured.to("cuda"), rtol=0.0, atol=0.0,
-            ), "active=[] must leave base weights unmodified"
+            ), "no LoRAs must leave base weights unmodified"
         finally:
             s.deactivate()
 
 
 # ---------------------------------------------------------------------------
-# Cache budget reporting
+# Forward correctness
+# ---------------------------------------------------------------------------
+
+
+class TestMergeCorrectness:
+    @CUDA
+    def test_merged_weights_match_manual_baseline(self) -> None:
+        m = _make_bf16_model(num_blocks=4, dim=16)
+        captured_base = {
+            i: m.transformer_blocks[i].attn.weight.detach().clone()
+            for i in range(4)
+        }
+
+        loras = [
+            _make_lora(num_blocks=4, dim=16, strength=0.5, seed=10),
+            _make_lora(num_blocks=4, dim=16, strength=0.25, seed=20),
+        ]
+        s = _make_strategy(m, device="cuda")
+        s.set_loras(loras)
+        s.activate()
+        try:
+            x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+            for blk in m.transformer_blocks:
+                x = blk(x)
+            torch.cuda.synchronize()
+            for i in range(4):
+                expected = _expected_merged_weight(
+                    captured_base[i], loras, i, "attn.weight",
+                ).to("cuda")
+                actual = m.transformer_blocks[i].attn.weight.detach()
+                assert torch.allclose(actual, expected, rtol=0.01, atol=0.01), (
+                    f"block {i} merged weight mismatch:\n"
+                    f"  expected: {expected.flatten()[:4]}\n"
+                    f"  actual:   {actual.flatten()[:4]}"
+                )
+        finally:
+            s.deactivate()
+
+    @CUDA
+    def test_prefixed_lora_keys_merge_correctly(self) -> None:
+        """LoRAs with ``diffusion_model.`` prefix (ComfyUI format) should
+        merge identically to unprefixed keys via the default key_transform."""
+        m = _make_bf16_model(num_blocks=4, dim=16)
+        captured_base = {
+            i: m.transformer_blocks[i].attn.weight.detach().clone()
+            for i in range(4)
+        }
+
+        lora = _make_lora(4, 16, strength=0.7, seed=42, prefix="diffusion_model.")
+        s = _make_strategy(m, device="cuda")
+        s.set_loras([lora])
+        s.activate()
+        try:
+            x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+            for blk in m.transformer_blocks:
+                x = blk(x)
+            torch.cuda.synchronize()
+            from ltx_core.memory.merged_lora import _default_key_transform
+            for i in range(4):
+                expected = _expected_merged_weight(
+                    captured_base[i], [lora], i, "attn.weight",
+                    key_transform=_default_key_transform,
+                ).to("cuda")
+                actual = m.transformer_blocks[i].attn.weight.detach()
+                assert torch.allclose(actual, expected, rtol=0.01, atol=0.01)
+        finally:
+            s.deactivate()
+
+
+# ---------------------------------------------------------------------------
+# Cleanup invariants
 # ---------------------------------------------------------------------------
 
 
 class TestDeactivateCleanupInvariants:
-    """Architectural invariant: factor cleanup must run regardless of
-    whether component deactivates raise. ExitStack handles ordering
-    and exception chaining; we just assert the post-condition."""
-
     @CUDA
-    def test_factor_cleanup_runs_even_when_streamer_deactivate_raises(
+    def test_cleanup_runs_even_when_streamer_deactivate_raises(
         self, monkeypatch,
     ) -> None:
-        m = _make_bf16_model(num_blocks=4, dim=16)
-        s = MergedLoRAStrategy(
-            m, torch.device("cuda"),
-            loras=[_make_lora("a", 4, 16)],
-            layers_attr="transformer_blocks", blocks_to_swap=1,
-        )
-        s.set_active(["a"])
+        m = _make_bf16_model()
+        s = _make_strategy(m, device="cuda")
+        s.set_loras([_make_lora(4, 16)])
 
-        # Patch BEFORE activate — the bound method captured by
-        # stack.callback at activate time is what runs at close().
         def streamer_boom() -> None:
             raise RuntimeError("streamer cleanup failed")
 
         monkeypatch.setattr(s._streamer, "deactivate", streamer_boom)
         s.activate()
 
-        # ExitStack runs the failing cleanup, chains the exception,
-        # and continues — factor cleanup still runs.
         with pytest.raises(RuntimeError):
             s.deactivate()
-        # Merge plan cleared (the architectural invariant: GPU factor
-        # tensors no longer referenced; PyTorch refcount frees them).
-        assert s._merge_plan == {}
+
+
+# ---------------------------------------------------------------------------
+# Cache budget
+# ---------------------------------------------------------------------------
 
 
 class TestCacheBytes:
     def test_factors_count_toward_cache_bytes(self) -> None:
-        m = _make_bf16_model(num_blocks=4, dim=16)
-        s_no_lora = MergedLoRAStrategy(
-            m, torch.device("cpu"),
-            loras=[],
-            layers_attr="transformer_blocks", blocks_to_swap=1,
-        )
-        baseline = s_no_lora.cache_bytes
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        baseline = s.cache_bytes
 
-        m2 = _make_bf16_model(num_blocks=4, dim=16)
-        s_with_lora = MergedLoRAStrategy(
-            m2, torch.device("cpu"),
-            loras=[_make_lora("a", num_blocks=4, dim=16, rank=4)],
-            layers_attr="transformer_blocks", blocks_to_swap=1,
-        )
-        # Pinned host now also stores the LoRA factors.
-        assert s_with_lora.cache_bytes > baseline
+        s.set_loras([_make_lora(num_blocks=4, dim=16, rank=4)])
+        assert s.cache_bytes > baseline
+
+    def test_cache_bytes_resets_on_clear(self) -> None:
+        m = _make_bf16_model()
+        s = _make_strategy(m)
+        baseline = s.cache_bytes
+        s.set_loras([_make_lora(4, 16)])
+        assert s.cache_bytes > baseline
+        s.set_loras([])
+        assert s.cache_bytes == baseline
