@@ -68,26 +68,50 @@ def apply_loras(
     return StateDict(sd, model_sd.device, model_sd.size, model_sd.dtype)
 
 
+def concat_lora_factors(
+    factors: list[tuple[torch.Tensor, torch.Tensor, float]],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Concatenate N LoRA (A, B, strength) triples into a single factor pair.
+
+    Returns ``(A_cat, B_cat)`` such that ``B_cat @ A_cat`` equals the sum of
+    ``strength_i * B_i @ A_i`` for all inputs (within floating-point tolerance).
+    Mixed ranks across LoRAs are handled naturally by the concatenation.
+
+    Returns ``None`` when *factors* is empty.
+    """
+    if not factors:
+        return None
+    as_list: list[torch.Tensor] = []
+    bs_list: list[torch.Tensor] = []
+    for a, b, strength in factors:
+        as_list.append(a.to(device=device, dtype=dtype))
+        bs_list.append(b.to(device=device, dtype=dtype) * strength)
+    if len(as_list) == 1:
+        return as_list[0], bs_list[0]
+    return torch.cat(as_list, dim=0), torch.cat(bs_list, dim=1)
+
+
 def _prepare_deltas(
     lora_sd_and_strengths: list[LoraStateDictWithStrength], key: str, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor | None:
-    deltas = []
     prefix = key[: -len(".weight")]
     key_a = f"{prefix}.lora_A.weight"
     key_b = f"{prefix}.lora_B.weight"
+    factors: list[tuple[torch.Tensor, torch.Tensor, float]] = []
     for lsd, coef in lora_sd_and_strengths:
         if key_a not in lsd.sd or key_b not in lsd.sd:
             continue
-        a = lsd.sd[key_a].to(device=device)
-        b = lsd.sd[key_b].to(device=device)
-        product = torch.matmul(b * coef, a)
-        del a, b
-        deltas.append(product.to(dtype=dtype))
-    if len(deltas) == 0:
+        factors.append((lsd.sd[key_a], lsd.sd[key_b], coef))
+    if not factors:
         return None
-    elif len(deltas) == 1:
-        return deltas[0]
-    return torch.sum(torch.stack(deltas, dim=0), dim=0)
+    # Matmul in factors' native dtype to preserve precision (e.g. fp32
+    # LoRA factors fusing into bf16 weights), then cast the product.
+    native_dtype = factors[0][0].dtype
+    pair = concat_lora_factors(factors, native_dtype, device)
+    a_cat, b_cat = pair  # type: ignore[misc]
+    return torch.matmul(b_cat, a_cat).to(dtype=dtype)
 
 
 def _fuse_delta_with_scaled_fp8(

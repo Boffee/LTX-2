@@ -11,7 +11,7 @@ runs on the prefetch CUDA stream after each block's bytes are
 DMA'd in:
 
     pinned bf16 base       --DMA-->  pool slot
-    GPU LoRA factors       --addmm_--> slot.weights += scale * (B @ A)
+    GPU LoRA factors       --addmm_--> slot.weights += B_cat @ A_cat
 
 CUDA orders the merge after the DMA automatically (same stream).
 The "free unmerge" property: when a block is evicted and re-loaded,
@@ -41,6 +41,8 @@ from typing import Any
 
 import torch
 from torch import nn
+
+from ltx_core.loader.fuse_loras import concat_lora_factors
 
 from .block_compose import _has_non_block_pinnable_content, _resolve_attr
 from .block_streamer import BlockStreamer
@@ -92,9 +94,9 @@ class LoRABundle:
     blocks: dict[int, dict[str, LoRALayerFactors]]
 
 
-# Per-block flat merge list: (qual, B_gpu, A_gpu, scaling) tuples
-# ready for a single in-place addmm_ call.
-_MergePlan = dict[int, list[tuple[str, torch.Tensor, torch.Tensor, float]]]
+# Per-block pre-concatenated merge list: (qual, B_cat, A_cat) tuples
+# ready for a single in-place addmm_ per target weight.
+_MergePlan = dict[int, list[tuple[str, torch.Tensor, torch.Tensor]]]
 
 
 # ---------------------------------------------------------------------------
@@ -355,19 +357,31 @@ class MergedLoRAStrategy:
         return pinned
 
     def _build_merge_plan(self, active: tuple[str, ...]) -> _MergePlan:
-        """Copy active LoRAs' factors to GPU and build a per-block
-        merge list ready for the prefetch-time addmm_."""
-        plan: _MergePlan = {}
+        """Pre-concatenate active LoRA factors on GPU per (block, target).
+
+        For N active LoRAs targeting the same weight, this produces a
+        single ``(A_cat, B_cat)`` pair so the prefetch callback does one
+        ``addmm_`` per target instead of N.
+        """
+        # Collect per-(block, qual) factor triples from all active LoRAs.
+        raw: dict[int, dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]]] = {}
         for name in active:
             for block_idx, layer_factors in self._pinned[name].items():
-                bucket = plan.setdefault(block_idx, [])
+                block_raw = raw.setdefault(block_idx, {})
                 for qual, f in layer_factors.items():
-                    bucket.append((
-                        qual,
-                        f.B.to(self._device, non_blocking=True),
-                        f.A.to(self._device, non_blocking=True),
-                        f.scaling,
-                    ))
+                    block_raw.setdefault(qual, []).append((f.A, f.B, f.scaling))
+
+        base_dtype = next(self._model.parameters()).dtype
+        plan: _MergePlan = {}
+        for block_idx, qual_factors in raw.items():
+            bucket: list[tuple[str, torch.Tensor, torch.Tensor]] = []
+            for qual, factors in qual_factors.items():
+                pair = concat_lora_factors(factors, base_dtype, self._device)
+                if pair is not None:
+                    a_cat, b_cat = pair
+                    bucket.append((qual, b_cat, a_cat))
+            plan[block_idx] = bucket
+
         if self._device.type == "cuda":
             torch.cuda.synchronize(self._device)
         return plan
@@ -375,5 +389,5 @@ class MergedLoRAStrategy:
     def _apply_active_loras(self, slot: Any, block_idx: int) -> None:  # noqa: ANN401
         """post_load callback: merge active LoRAs for this block via
         in-place addmm_ on the prefetch stream."""
-        for qual, b_gpu, a_gpu, scaling in self._merge_plan.get(block_idx, ()):
-            slot.get_param(qual).data.addmm_(b_gpu, a_gpu, beta=1.0, alpha=scaling)
+        for qual, b_cat, a_cat in self._merge_plan.get(block_idx, ()):
+            slot.get_param(qual).data.addmm_(b_cat, a_cat)
