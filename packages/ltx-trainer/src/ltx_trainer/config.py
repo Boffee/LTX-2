@@ -16,11 +16,10 @@ class ConfigBaseModel(BaseModel):
 class BaseLoraConfig(ConfigBaseModel):
     """A pre-trained LoRA to merge into the base transformer weights.
 
-    Loaded once at startup, scaled by `strength`, and merged in place
-    via `target += strength * scaling * (B @ A)` per target layer. The
-    file is consumed -- the strategy holds no reference to it after the
-    merge runs. This is the right shape for fixed-strength distillation
-    LoRAs (the strength stays constant for the whole training run).
+    Loaded once at startup and merged in place via
+    ``target += strength * (B @ A)`` per target layer, matching the LTX
+    inference fuse path (no alpha/rank scaling). The file is consumed --
+    the trainer holds no reference to it after the merge runs.
     """
 
     path: str | Path = Field(
@@ -30,7 +29,7 @@ class BaseLoraConfig(ConfigBaseModel):
 
     strength: float = Field(
         default=1.0,
-        description="Multiplier applied to the LoRA's per-layer scaling (alpha/rank). "
+        description="Multiplier applied to each LoRA delta (B @ A). "
         "1.0 reproduces the LoRA's nominal effect; 0.6 applies it at 60% strength.",
         ge=0.0,
     )
