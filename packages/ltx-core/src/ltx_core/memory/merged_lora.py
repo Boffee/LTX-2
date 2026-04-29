@@ -1,57 +1,37 @@
-"""Merged-LoRA strategy for stacked-LoRA inference.
+"""LoRA types and per-weight merge transform.
 
-For 3+ stacked LoRAs on a bf16/fp16 base, the PEFT-style routed
-forward pays a per-LoRA cost on every step. This strategy takes
-ComfyUI's path: merge LoRA deltas into the base weights at prefetch
-time, run forward as a single matmul per layer regardless of K.
+:class:`LoRA` holds a flat safetensors state dict with a strength
+multiplier.  :class:`LoRATransform` holds pre-concatenated (A, B)
+factor matrices in pinned CPU memory and applies the merge via
+in-place ``addmm_`` after DMA.
 
-Built on the existing :class:`BlockStreamer` + :class:`PinnedWeights`
-infrastructure. The novel piece is a ``post_load`` callback that
-runs on the prefetch CUDA stream after each block's bytes are
-DMA'd in:
-
-    pinned bf16 base       --DMA-->  pool slot
-    pinned LoRA factors    --DMA-->  GPU temporaries
-    GPU temporaries        --addmm_--> slot.weights += B_cat @ A_cat
-
-CUDA orders the merge after the DMA automatically (same stream).
-The "free unmerge" property: when a block is evicted and re-loaded,
-``slot.copy_from`` overwrites GPU bytes with pristine pinned base
-bytes, so the next merge starts from clean base. No subtract-and-
-restore, no drift.
-
-Constraints
------------
-- Base must be bf16 or fp16. ``addmm_`` requires arithmetic-capable
-  target dtype; fp8 and quanto are unsupported in v1.
-- LoRA set is fixed during the active window. Switch combos via
-  deactivate -> set_loras -> activate.
+:class:`~ltx_core.memory.BlockOffloader` is the consumer-facing API:
+its ``set_loras`` method pairs factors from :class:`LoRA` state dicts,
+creates one :class:`LoRATransform` per matched weight, and attaches
+it to the corresponding :class:`~ltx_core.memory.PinnedParamBuffer`.
+The transform fires automatically when the buffer copies to GPU.
 """
 
 from __future__ import annotations
 
-import contextlib
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from types import TracebackType
-from typing import Any
 
 import torch
-from torch import nn
-
-from .block_compose import _has_non_block_pinnable_content, _resolve_attr
-from .block_streamer import BlockStreamer
-from .pinned_weights import PinnedWeights
-from .strategy import SlotOwnership
 
 __all__ = [
+    "FactorList",
+    "KeyTransformT",
     "LoRA",
-    "MergedLoRAStrategy",
+    "LoRATransform",
+    "concat_lora_factors",
+    "default_key_transform",
+    "pair_and_validate",
 ]
 
 
 # ---------------------------------------------------------------------------
-# Public LoRA type
+# Public types
 # ---------------------------------------------------------------------------
 
 
@@ -62,7 +42,7 @@ class LoRA:
     ``state_dict`` uses the same keys returned by
     ``safetensors.torch.load_file()`` — e.g.
     ``"diffusion_model.transformer_blocks.0.attn.lora_A.weight"``.
-    The strategy handles prefix stripping and A/B pairing internally.
+    The consumer handles prefix stripping and A/B pairing internally.
 
     ``strength`` is the only user-facing multiplier (no alpha/rank
     scaling). 1.0 reproduces the LoRA's full effect.
@@ -72,19 +52,42 @@ class LoRA:
     strength: float = 1.0
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+class LoRATransform:
+    """Per-weight LoRA factors applied after DMA to GPU.
+
+    Stores concatenated (A, B) factor matrices in pinned CPU memory.
+    Consumers call :meth:`apply` with the GPU tensor to merge in-place
+    via ``addmm_``.  Multiple stacked LoRAs are pre-concatenated into
+    a single (A_cat, B_cat) pair so the merge is always one ``addmm_``.
+    """
+
+    __slots__ = ("_a_cat", "_b_cat")
+
+    def __init__(self, a_cat: torch.Tensor, b_cat: torch.Tensor) -> None:
+        self._a_cat = a_cat.contiguous().pin_memory()
+        self._b_cat = b_cat.contiguous().pin_memory()
+
+    def apply(self, gpu_data: torch.Tensor) -> None:
+        b = self._b_cat.to(device=gpu_data.device, non_blocking=True)
+        a = self._a_cat.to(device=gpu_data.device, non_blocking=True)
+        gpu_data.addmm_(b, a)
+
+    @property
+    def nbytes(self) -> int:
+        return self._a_cat.nbytes + self._b_cat.nbytes
 
 
-def _default_key_transform(key: str) -> str:
+def default_key_transform(key: str) -> str:
     """Strip the common ``diffusion_model.`` prefix from ComfyUI LoRA keys."""
     prefix = "diffusion_model."
     return key[len(prefix) :] if key.startswith(prefix) else key
 
 
-def _concat_lora_factors(
-    factors: list[tuple[torch.Tensor, torch.Tensor, float]],
+FactorList = list[tuple[torch.Tensor, torch.Tensor, float]]
+
+
+def concat_lora_factors(
+    factors: FactorList,
     dtype: torch.dtype,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -106,320 +109,77 @@ def _concat_lora_factors(
     return torch.cat(as_list, dim=0), torch.cat(bs_list, dim=1)
 
 
-_FactorList = list[tuple[torch.Tensor, torch.Tensor, float]]
-_ConcatFactors = list[tuple[str, torch.Tensor, torch.Tensor]]
+def pair_and_validate(
+    loras: Sequence[LoRA],
+    reverse_index: dict[str, tuple[int, ...]],
+    key_transform: KeyTransformT,
+) -> dict[str, FactorList]:
+    """Pair lora_A/lora_B keys, validate shapes, return per-target factors.
 
+    ``reverse_index`` maps model param qualified names to their expected
+    shape.  ``key_transform`` is applied to LoRA state-dict base keys
+    before lookup.
 
-# ---------------------------------------------------------------------------
-# MergedLoRAStrategy
-# ---------------------------------------------------------------------------
-
-
-class MergedLoRAStrategy:
-    """Merges stacked LoRAs into block weights at prefetch time.
-
-    See module docstring for architecture. bf16/fp16 base only;
-    raises at construction otherwise.
-
-    LoRAs are set post-construction via :meth:`set_loras`, which
-    accepts flat safetensors state dicts. The strategy handles A/B
-    pairing, key matching, block decomposition, and CPU pinning
-    internally.
+    Returns ``{target_qualname: [(A, B, strength), ...]}`` for matched
+    targets.
     """
+    raw: dict[str, FactorList] = {}
 
-    def __init__(
-        self,
-        model: nn.Module,
-        target_device: torch.device,
-        *,
-        layers_attr: str,
-        blocks_to_swap: int,
-        prefetch_count: int = 2,
-        key_transform: Callable[[str], str] | None = _default_key_transform,
-    ) -> None:
-        self._validate_base_dtype(model)
+    for lora in loras:
+        a_tensors: dict[str, torch.Tensor] = {}
+        b_tensors: dict[str, torch.Tensor] = {}
+        for key, tensor in lora.state_dict.items():
+            if key.endswith(".lora_A.weight"):
+                base_key = key[: -len(".lora_A.weight")]
+                a_tensors[base_key] = tensor
+            elif key.endswith(".lora_B.weight"):
+                base_key = key[: -len(".lora_B.weight")]
+                b_tensors[base_key] = tensor
 
-        self._model = model
-        self._device = target_device
-        self._key_transform = key_transform
-
-        blocks = list(_resolve_attr(model, layers_attr))
-        if not blocks:
+        a_only = set(a_tensors) - set(b_tensors)
+        b_only = set(b_tensors) - set(a_tensors)
+        if a_only or b_only:
             raise ValueError(
-                f"layers_attr={layers_attr!r} resolved to an empty ModuleList"
+                f"Unpaired LoRA factors: A-only={sorted(a_only)}, "
+                f"B-only={sorted(b_only)}. Each target needs both "
+                f".lora_A.weight and .lora_B.weight."
             )
 
-        self._reverse_index = self._build_reverse_index(
-            layers_attr, blocks,
-        )
-        self._non_block_params = self._build_non_block_index(
-            layers_attr, model,
-        )
+        for base_key, a in a_tensors.items():
+            b = b_tensors[base_key]
+            target_key = f"{base_key}.weight"
+            if key_transform is not None:
+                target_key = key_transform(target_key)
 
-        self._block_factors: dict[int, _ConcatFactors] = {}
-        self._non_block_factors: _ConcatFactors = []
-        self._lora_factor_bytes: int = 0
-        self._teardown: contextlib.ExitStack | None = None
-
-        self._streamer = BlockStreamer(
-            blocks=blocks,
-            target_device=target_device,
-            blocks_to_swap=blocks_to_swap,
-            prefetch_count=prefetch_count,
-            name=f"BlockStreamer[{layers_attr}]",
-            post_load=self._merge_block_loras,
-        )
-        skip: set[SlotOwnership] = set(self._streamer.slot_filter)
-        self._non_block: PinnedWeights | None = None
-        if _has_non_block_pinnable_content(model, skip):
-            self._non_block = PinnedWeights(
-                model, target_device, skip_slots=skip,
-            )
-
-    # ------------------------------------------------------------------ API
-
-    def set_loras(self, loras: Sequence[LoRA]) -> None:
-        """Replace all LoRAs. Must be called while deactivated.
-
-        Processes flat state dicts: applies ``key_transform``, pairs
-        A/B factors, matches to model parameters, concatenates per
-        (block, target), and pins on CPU. The resulting merge plan is
-        used by the next :meth:`activate` call.
-
-        Pass an empty sequence to clear all LoRAs (base-only forward).
-        """
-        if self._teardown is not None:
-            raise RuntimeError(
-                "MergedLoRAStrategy.set_loras() requires the strategy "
-                "to be inactive. Call deactivate() first."
-            )
-        self._block_factors.clear()
-        self._non_block_factors.clear()
-        self._lora_factor_bytes = 0
-
-        if not loras:
-            return
-
-        base_dtype = next(self._model.parameters()).dtype
-        raw = self._pair_and_validate(loras, base_dtype)
-        self._block_factors, self._non_block_factors, self._lora_factor_bytes = (
-            self._build_factors(raw, base_dtype)
-        )
-
-    # ----------------------------------------------- ModelStrategy interface
-
-    @property
-    def model(self) -> nn.Module:
-        return self._model
-
-    @property
-    def cache_bytes(self) -> int:
-        total = self._streamer.cache_bytes
-        if self._non_block is not None:
-            total += self._non_block.cache_bytes
-        total += self._lora_factor_bytes
-        return total
-
-    def activate(self) -> None:
-        with contextlib.ExitStack() as stack:
-            if self._non_block is not None:
-                stack.callback(self._non_block.deactivate)
-                self._non_block.activate()
-                self._merge_non_block_loras()
-            stack.callback(self._streamer.deactivate)
-            self._streamer.activate()
-            if self._device.type == "cuda":
-                torch.cuda.synchronize(self._device)
-            self._teardown = stack.pop_all()
-
-    def deactivate(self) -> None:
-        stack = self._teardown
-        self._teardown = None
-        if stack is not None:
-            stack.close()
-
-    def __enter__(self) -> nn.Module:
-        self.activate()
-        return self.model
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.deactivate()
-
-    # ----------------------------------------------------------- Internals
-
-    @staticmethod
-    def _validate_base_dtype(model: nn.Module) -> None:
-        bad: list[tuple[str, torch.dtype]] = []
-        for name, p in model.named_parameters():
-            if p.dtype not in (torch.bfloat16, torch.float16):
-                bad.append((name, p.dtype))
-                if len(bad) > 3:
-                    break
-        if bad:
-            raise ValueError(
-                f"MergedLoRAStrategy requires bf16/fp16 base; found "
-                f"{bad}. fp8 and quanto are unsupported in v1 (in-place "
-                f"merge requires arithmetic-capable target dtype). For "
-                f"fp8 base, use PEFT routed mode."
-            )
-
-    @staticmethod
-    def _build_reverse_index(
-        layers_attr: str,
-        blocks: list[nn.Module],
-    ) -> dict[str, tuple[int, str, tuple[int, ...]]]:
-        """Map ``full_qualname -> (block_idx, in_block_qual, shape)``
-        for frozen parameters inside the block list."""
-        index: dict[str, tuple[int, str, tuple[int, ...]]] = {}
-        for block_idx, block in enumerate(blocks):
-            for qual, p in block.named_parameters():
-                if not p.requires_grad:
-                    full = f"{layers_attr}.{block_idx}.{qual}"
-                    index[full] = (block_idx, qual, tuple(p.shape))
-        return index
-
-    @staticmethod
-    def _build_non_block_index(
-        layers_attr: str,
-        model: nn.Module,
-    ) -> dict[str, tuple[int, ...]]:
-        """Map ``full_qualname -> shape`` for frozen parameters outside
-        the block list."""
-        block_prefix = f"{layers_attr}."
-        index: dict[str, tuple[int, ...]] = {}
-        for qual, p in model.named_parameters():
-            if not p.requires_grad and not qual.startswith(block_prefix):
-                index[qual] = tuple(p.shape)
-        return index
-
-    def _pair_and_validate(
-        self,
-        loras: Sequence[LoRA],
-        base_dtype: torch.dtype,
-    ) -> dict[str, _FactorList]:
-        """Pair lora_A/lora_B keys, validate shapes, return per-target factors.
-
-        Returns ``{target_qualname: [(A, B, strength), ...]}`` for all
-        targets that match either the block or non-block index.
-        """
-        transform = self._key_transform
-        raw: dict[str, _FactorList] = {}
-
-        for lora in loras:
-            a_tensors: dict[str, torch.Tensor] = {}
-            b_tensors: dict[str, torch.Tensor] = {}
-            for key, tensor in lora.state_dict.items():
-                if key.endswith(".lora_A.weight"):
-                    base_key = key[: -len(".lora_A.weight")]
-                    a_tensors[base_key] = tensor
-                elif key.endswith(".lora_B.weight"):
-                    base_key = key[: -len(".lora_B.weight")]
-                    b_tensors[base_key] = tensor
-
-            a_only = set(a_tensors) - set(b_tensors)
-            b_only = set(b_tensors) - set(a_tensors)
-            if a_only or b_only:
-                raise ValueError(
-                    f"Unpaired LoRA factors: A-only={sorted(a_only)}, "
-                    f"B-only={sorted(b_only)}. Each target needs both "
-                    f".lora_A.weight and .lora_B.weight."
-                )
-
-            for base_key in a_tensors:
-                a = a_tensors[base_key]
-                b = b_tensors[base_key]
-                target_key = f"{base_key}.weight"
-                if transform is not None:
-                    target_key = transform(target_key)
-
-                block_entry = self._reverse_index.get(target_key)
-                nb_shape = self._non_block_params.get(target_key)
-                if block_entry is not None:
-                    expected_shape = block_entry[2]
-                elif nb_shape is not None:
-                    expected_shape = nb_shape
-                else:
-                    continue
-
-                if not a.is_floating_point() or not b.is_floating_point():
-                    raise ValueError(
-                        f"LoRA factors for {target_key!r}: must be "
-                        f"floating-point; got A.dtype={a.dtype}, "
-                        f"B.dtype={b.dtype}."
-                    )
-                if (
-                    a.dim() != 2
-                    or b.dim() != 2
-                    or a.shape[0] != b.shape[1]
-                    or expected_shape != (b.shape[0], a.shape[1])
-                ):
-                    raise ValueError(
-                        f"LoRA factor shape mismatch for {target_key!r}: "
-                        f"A.shape={tuple(a.shape)}, B.shape={tuple(b.shape)}, "
-                        f"target shape {expected_shape}. Expected "
-                        f"A=(rank, in_dim), B=(out_dim, rank), "
-                        f"B@A.shape == target."
-                    )
-
-                raw.setdefault(target_key, []).append(
-                    (a, b, lora.strength)
-                )
-
-        return raw
-
-    def _build_factors(
-        self,
-        raw: dict[str, _FactorList],
-        base_dtype: torch.dtype,
-    ) -> tuple[dict[int, _ConcatFactors], _ConcatFactors, int]:
-        """Concat all factors once, then split into block (pinned) and
-        non-block (cloned)."""
-        block: dict[int, _ConcatFactors] = {}
-        non_block: _ConcatFactors = []
-        total_bytes = 0
-
-        for target_key, factors in raw.items():
-            pair = _concat_lora_factors(factors, base_dtype, torch.device("cpu"))
-            if pair is None:
+            expected_shape = reverse_index.get(target_key)
+            if expected_shape is None:
                 continue
-            a_cat, b_cat = pair
 
-            block_entry = self._reverse_index.get(target_key)
-            if block_entry is not None:
-                a_cat = a_cat.contiguous().pin_memory()
-                b_cat = b_cat.contiguous().pin_memory()
-                block_idx, in_block_qual, _ = block_entry
-                block.setdefault(block_idx, []).append(
-                    (in_block_qual, b_cat, a_cat)
+            if not a.is_floating_point() or not b.is_floating_point():
+                raise ValueError(
+                    f"LoRA factors for {target_key!r}: must be "
+                    f"floating-point; got A.dtype={a.dtype}, "
+                    f"B.dtype={b.dtype}."
                 )
-            else:
-                a_cat = a_cat.clone().contiguous()
-                b_cat = b_cat.clone().contiguous()
-                non_block.append((target_key, b_cat, a_cat))
+            if (
+                a.dim() != 2
+                or b.dim() != 2
+                or a.shape[0] != b.shape[1]
+                or expected_shape != (b.shape[0], a.shape[1])
+            ):
+                raise ValueError(
+                    f"LoRA factor shape mismatch for {target_key!r}: "
+                    f"A.shape={tuple(a.shape)}, B.shape={tuple(b.shape)}, "
+                    f"target shape {expected_shape}. Expected "
+                    f"A=(rank, in_dim), B=(out_dim, rank), "
+                    f"B@A.shape == target."
+                )
 
-            total_bytes += a_cat.numel() * a_cat.element_size()
-            total_bytes += b_cat.numel() * b_cat.element_size()
+            raw.setdefault(target_key, []).append(
+                (a, b, lora.strength)
+            )
 
-        return block, non_block, total_bytes
+    return raw
 
-    def _merge_non_block_loras(self) -> None:
-        """Merge LoRA deltas into non-block params after PinnedWeights.activate()."""
-        params = dict(self._model.named_parameters())
-        for qual, b_cat, a_cat in self._non_block_factors:
-            p = params[qual]
-            b_gpu = b_cat.to(device=p.device, dtype=p.dtype)
-            a_gpu = a_cat.to(device=p.device, dtype=p.dtype)
-            p.data.addmm_(b_gpu, a_gpu)
 
-    def _merge_block_loras(self, slot: Any, block_idx: int) -> None:  # noqa: ANN401
-        """post_load callback: DMA this block's factors from pinned CPU
-        to GPU and merge via in-place addmm_ on the prefetch stream."""
-        for qual, b_pinned, a_pinned in self._block_factors.get(block_idx, ()):
-            b_gpu = b_pinned.to(device=self._device, non_blocking=True)
-            a_gpu = a_pinned.to(device=self._device, non_blocking=True)
-            slot.get_param(qual).data.addmm_(b_gpu, a_gpu)
+KeyTransformT = Callable[[str], str] | None

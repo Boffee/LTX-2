@@ -1,8 +1,8 @@
-"""Tests for ``ltx_core.memory.merged_lora.MergedLoRAStrategy``.
+"""Tests for LoRA merge via ``BlockOffloader.set_loras()``.
 
-Covers construction validation, set_loras validation, lifecycle
-(activate/deactivate), LoRA switching, and forward-output correctness
-against a manually-merged baseline.
+Covers set_loras validation, lifecycle (activate/deactivate), LoRA
+switching, and forward-output correctness against a manually-merged
+baseline.
 
 Most lifecycle tests run on CPU (the merge math is device-agnostic);
 CUDA-only tests gate on availability.
@@ -15,8 +15,8 @@ import torch
 from torch import nn
 
 from ltx_core.memory import (
+    BlockOffloader,
     LoRA,
-    MergedLoRAStrategy,
 )
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -105,7 +105,7 @@ def _expected_merged_weight(
 
 def _make_strategy(model, device="cpu", blocks_to_swap=1, **kwargs):
     """Shorthand for constructing the strategy with sensible defaults."""
-    return MergedLoRAStrategy(
+    return BlockOffloader(
         model, torch.device(device),
         layers_attr="transformer_blocks",
         blocks_to_swap=blocks_to_swap,
@@ -119,10 +119,11 @@ def _make_strategy(model, device="cpu", blocks_to_swap=1, **kwargs):
 
 
 class TestConstructionValidation:
-    def test_rejects_fp32_base(self) -> None:
+    def test_rejects_fp32_lora_target(self) -> None:
         m = _make_bf16_model().to(torch.float32)
-        with pytest.raises(ValueError, match="bf16/fp16 base"):
-            _make_strategy(m)
+        s = _make_strategy(m)
+        with pytest.raises(ValueError, match="bf16/fp16"):
+            s.set_loras([_make_lora(4, 16)])
 
     def test_accepts_fp16_base(self) -> None:
         m = _make_bf16_model().to(torch.float16)
@@ -131,7 +132,7 @@ class TestConstructionValidation:
 
     def test_rejects_empty_layers_attr(self) -> None:
         m = _make_bf16_model(num_blocks=0)
-        with pytest.raises(ValueError, match="empty ModuleList"):
+        with pytest.raises(ValueError, match="resolved to empty list"):
             _make_strategy(m, blocks_to_swap=0)
 
 
@@ -368,11 +369,11 @@ class TestMergeCorrectness:
             for blk in m.transformer_blocks:
                 x = blk(x)
             torch.cuda.synchronize()
-            from ltx_core.memory.merged_lora import _default_key_transform
+            from ltx_core.memory.merged_lora import default_key_transform
             for i in range(4):
                 expected = _expected_merged_weight(
                     captured_base[i], [lora], i, "attn.weight",
-                    key_transform=_default_key_transform,
+                    key_transform=default_key_transform,
                 ).to("cuda")
                 actual = m.transformer_blocks[i].attn.weight.detach()
                 assert torch.allclose(actual, expected, rtol=0.01, atol=0.01)
@@ -425,7 +426,7 @@ class TestDeactivateCleanupInvariants:
         def streamer_boom() -> None:
             raise RuntimeError("streamer cleanup failed")
 
-        monkeypatch.setattr(s._streamer, "deactivate", streamer_boom)
+        monkeypatch.setattr(s._streamers[0], "deactivate", streamer_boom)
         s.activate()
 
         with pytest.raises(RuntimeError):

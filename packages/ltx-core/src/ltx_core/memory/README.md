@@ -15,7 +15,9 @@ into its own package when a second consumer appears.
 | `strategy.py` | `ModelStrategy` — the plug-in contract every strategy implements; `SlotOwnership` skip-filter type |
 | `pinned_weights.py` | `PinnedWeights` — whole-model bulk pinned-CPU↔GPU strategy |
 | `block_streamer.py` | `BlockStreamer` — sharp per-block-list streaming primitive (component) |
-| `block_compose.py` | `BlockStreamingStrategy` (composite), `TrainableWeights` (component), `make_block_offloader` (factory) |
+| `block_offloader.py` | `BlockOffloader` — unified composite: block streaming + non-block pinning + trainable params + optional LoRA merge |
+| `block_compose.py` | `TrainableWeights` (component), `detect_streaming_region_ties` (validation) |
+| `merged_lora.py` | `LoRA`, `LoRATransform` — per-weight LoRA merge transform + factor pairing/validation |
 | `pinned_buffer.py` | `PinnedParamBuffer` — per-tensor pinning primitive (handles quanto) |
 | `model_cache.py` | `ModelCache` — LRU pool over strategies with active-set leases |
 | `pipeline_install.py` | Optional one-line monkey-patch installer (see [Integrations](#integrations)) |
@@ -47,7 +49,7 @@ This library gives you:
 | Situation | Use |
 |---|---|
 | Model fits on GPU when active; want fast eviction between calls | **`PinnedWeights`** — bulk DMA, ~200 ms for 12 GB at PCIe Gen5 x16 |
-| Model too big for GPU even when active | **`make_block_offloader`** — streams transformer blocks via forward hooks |
+| Model too big for GPU even when active | **`BlockOffloader`** — streams transformer blocks via forward hooks |
 | Multiple models swap in/out across a script | Wrap each in a strategy, hand to **`ModelCache`** |
 
 ## Quick start: PinnedWeights
@@ -86,26 +88,60 @@ and a CUDA-stream-based async prefetcher.
 
 ```python
 import torch
-from ltx_core.memory import make_block_offloader
+from ltx_core.memory import BlockOffloader
 
 # Constructor pins everything; cache_bytes is final immediately.
-strategy = make_block_offloader(
+offloader = BlockOffloader(
     model,
     target_device=torch.device("cuda"),
     layers_attr="transformer_blocks",  # path to the nn.ModuleList
-    blocks_to_swap=24,                  # offload N blocks; rest GPU-resident
+    blocks_to_swap=24,                 # offload N blocks; rest GPU-resident
     prefetch_count=2,
 )
 
-with strategy as gpu_model:
+with offloader as gpu_model:
     output = gpu_model(input_tensor)
 
-del strategy, model  # drop refs to free pinned host memory
+del offloader, model  # drop refs to free pinned host memory
 ```
 
 Trainable parameters (e.g. LoRA adapters) move to GPU on activate
 and back to CPU on deactivate via the bundled `TrainableWeights`
 component — backward through them is unaffected by the offload.
+
+### LoRA merge
+
+`BlockOffloader` supports optional per-weight LoRA merging via
+`set_loras()`. LoRA factors are attached as transforms on
+`PinnedParamBuffer` objects and applied automatically after DMA —
+both block-streamed and non-block weights get merged for free.
+
+```python
+from ltx_core.memory import BlockOffloader, LoRA
+from safetensors.torch import load_file
+
+offloader = BlockOffloader(
+    model,
+    target_device=torch.device("cuda"),
+    layers_attr="transformer_blocks",
+    blocks_to_swap=24,
+)
+
+# Attach LoRAs (must be called while deactivated)
+offloader.set_loras([
+    LoRA(state_dict=load_file("lora_a.safetensors"), strength=0.8),
+    LoRA(state_dict=load_file("lora_b.safetensors"), strength=0.5),
+])
+
+with offloader as gpu_model:
+    output = gpu_model(input_tensor)
+
+# Switch to different LoRAs or clear (base-only)
+offloader.set_loras([])
+```
+
+Block reload from pristine pinned CPU storage automatically clears
+the previous merge — no explicit unmerge step needed.
 
 ### Heterogeneous block lists
 
@@ -116,7 +152,7 @@ streaming group with its own slot pool — no per-load `cudaMalloc`
 fallback:
 
 ```python
-strategy = make_block_offloader(
+offloader = BlockOffloader(
     model,
     target_device=torch.device("cuda"),
     layers_attr=["transformer_blocks", "single_transformer_blocks"],
@@ -124,10 +160,6 @@ strategy = make_block_offloader(
     prefetch_count=[2, 4],
 )
 ```
-
-For bespoke compositions (custom components, mixed strategies),
-construct the `BlockStreamer`s, `PinnedWeights`, and `TrainableWeights`
-yourself and hand them to `BlockStreamingStrategy` directly.
 
 ## Quick start: ModelCache
 
@@ -190,7 +222,7 @@ with cache.use(spec) as vae:  # registers if missing, then uses
             ┌───────────────────┴────────────────────┐
             │                                        │
    ┌────────▼─────────┐                ┌─────────────▼──────────────┐
-   │  PinnedWeights   │                │   BlockStreamingStrategy   │
+   │  PinnedWeights   │                │      BlockOffloader        │
    │  whole-model DMA │                │   (composes components)    │
    └────────┬─────────┘                └─────────────┬──────────────┘
             │                                        │
@@ -198,16 +230,18 @@ with cache.use(spec) as vae:  # registers if missing, then uses
             │             │  components (ordered):              │
             │             │  • PinnedWeights (non-block,        │
             │             │    skip_slots = streamers' slots)   │
-            │             │  • TrainableWeights                   │
+            │             │  • TrainableWeights                 │
             │             │  • N × BlockStreamer                │
-            │             │   built by make_block_offloader()   │
+            │             │                                     │
+            │             │  optional LoRA:                     │
+            │             │  • LoRATransform on PinnedParamBuf  │
             │             └──────────────────────────┬──────────┘
             │                                        │
             └────────────────────┬───────────────────┘
                                  ▼
                        ┌──────────────────┐
                        │ PinnedParamBuffer│  per-tensor pinned-CPU storage
-                       │  (quanto-aware)  │  shared primitive
+                       │  (quanto-aware)  │  + optional LoRA transform
                        └──────────────────┘
 ```
 
@@ -285,7 +319,7 @@ Both strategies handle the standard `tie_weights()` pattern (one
 `Parameter` referenced under multiple names) plus the rarer case of
 distinct quanto wrappers around shared inner `_data` storage.
 
-`make_block_offloader` rejects (at construction) tied weights that
+`BlockOffloader` rejects (at construction) tied weights that
 span streamed regions — block↔block, block↔non-block, or mixed
 trainable/frozen across regions. Slot-local block streaming can't
 preserve cross-region tying. Use whole-model `PinnedWeights` for
@@ -332,5 +366,3 @@ snap.stats.peak_cache_bytes  # high-water mark
 imports from `ltx_core.memory.model_cache` (not re-exported at the
 package level — they're observability types, not the typical
 acquire/use path).
-
-

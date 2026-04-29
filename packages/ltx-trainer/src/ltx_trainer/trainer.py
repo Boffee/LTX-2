@@ -30,8 +30,6 @@ from torch.optim.lr_scheduler import (
 from torch.utils.data import DataLoader
 from torchvision.transforms import functional as F  # noqa: N812
 
-from ltx_core.loader.fuse_loras import fuse_lora_weights
-from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.config import BaseLoraConfig, LtxTrainerConfig
@@ -46,7 +44,7 @@ from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
-from ltx_core.memory import BlockStreamingStrategy, make_block_offloader
+from ltx_core.memory import BlockOffloader
 from ltx_trainer.training_strategies import get_training_strategy
 from ltx_trainer.utils import open_image_as_srgb, save_image
 from ltx_trainer.validation_sampler import CachedPromptEmbeddings, GenerationConfig, ValidationSampler
@@ -495,8 +493,9 @@ class LtxvTrainer:
         # BEFORE quantization (addmm_ does not support quanto/fp8
         # tensors) and BEFORE PEFT wrapping. The new trainable LoRA
         # then trains on top of the merged base.
+        self._base_lora_pairs: list[tuple[torch.nn.Parameter, torch.Tensor, torch.Tensor]] = []
         if self._config.model.base_lora is not None:
-            self._merge_base_lora(self._transformer, self._config.model.base_lora)
+            self._base_lora_pairs = self._merge_base_lora(self._transformer, self._config.model.base_lora)
 
         if self._config.acceleration.quantization is not None:
             if self._config.model.training_mode == "full":
@@ -534,8 +533,10 @@ class LtxvTrainer:
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
 
     @staticmethod
-    def _merge_base_lora(transformer: torch.nn.Module, cfg: BaseLoraConfig) -> None:
-        """Merge a pre-trained LoRA into the transformer via ``fuse_lora_weights``."""
+    def _merge_base_lora(
+        transformer: torch.nn.Module, cfg: BaseLoraConfig,
+    ) -> list[tuple[torch.nn.Parameter, torch.Tensor, torch.Tensor]]:
+        """Merge a pre-trained LoRA and return (param, B, A) pairs for later delta adjustment."""
         lora_sd_raw = load_file(str(cfg.path))
         prefix = "diffusion_model."
         lora_sd = {
@@ -544,22 +545,26 @@ class LtxvTrainer:
         }
 
         params = dict(transformer.named_parameters())
-        model_state = StateDict(
-            sd={k: p.data for k, p in params.items()},
-            device=next(transformer.parameters()).device,
-            size=0,
-            dtype=set(),
-        )
-        lora_state = StateDict(sd=lora_sd, device=torch.device("cpu"), size=0, dtype=set())
+        cpu = torch.device("cpu")
+        pairs: list[tuple[torch.nn.Parameter, torch.Tensor, torch.Tensor]] = []
 
         logger.info(f"Merging base LoRA from {cfg.path} (strength={cfg.strength})")
         merged = 0
-        for key, fused_tensor in fuse_lora_weights(
-            model_state, [LoraStateDictWithStrength(lora_state, cfg.strength)],
-        ):
-            params[key].data.copy_(fused_tensor)
+        for key, p in params.items():
+            if not key.endswith(".weight"):
+                continue
+            base_key = key[: -len(".weight")]
+            a_key = f"{base_key}.lora_A.weight"
+            b_key = f"{base_key}.lora_B.weight"
+            if a_key not in lora_sd or b_key not in lora_sd:
+                continue
+            a = lora_sd[a_key].to(device=cpu, dtype=p.dtype)
+            b = lora_sd[b_key].to(device=cpu, dtype=p.dtype)
+            p.data.addmm_(b, a, alpha=cfg.strength)
+            pairs.append((p, b, a))
             merged += 1
         logger.info(f"Merged {merged} LoRA targets")
+        return pairs
 
     def _init_timestep_sampler(self) -> None:
         """Initialize the timestep sampler based on the config."""
@@ -742,7 +747,7 @@ class LtxvTrainer:
         # Embedding connectors are already on GPU from _load_text_encoder_and_cache_embeddings
 
         # Set up block offloading (must happen before accelerator.prepare while weights are on CPU)
-        self._block_offloader: BlockStreamingStrategy | None = None
+        self._block_offloader: BlockOffloader | None = None
         blocks_to_swap = self._config.acceleration.blocks_to_swap
         if blocks_to_swap is not None and blocks_to_swap > 0:
             if self._accelerator.distributed_type == DistributedType.FSDP or self._accelerator.num_processes > 1:
@@ -758,7 +763,7 @@ class LtxvTrainer:
                 if hasattr(self._transformer, "get_base_model")
                 else self._transformer
             )
-            self._block_offloader = make_block_offloader(
+            self._block_offloader = BlockOffloader(
                 base_transformer,
                 target_device=self._accelerator.device,
                 layers_attr="transformer_blocks",
@@ -998,6 +1003,13 @@ class LtxvTrainer:
                 "Monitor training stability and consider disabling quantization if issues arise."
             )
 
+    def _apply_base_lora_delta(self, delta_strength: float) -> None:
+        """Add delta_strength * B @ A to every base-LoRA target parameter."""
+        for p, b, a in self._base_lora_pairs:
+            b_dev = b.to(device=p.device, dtype=p.dtype)
+            a_dev = a.to(device=p.device, dtype=p.dtype)
+            p.data.addmm_(b_dev, a_dev, alpha=delta_strength)
+
     # Note: Use @torch.no_grad() instead of @torch.inference_mode() to avoid FSDP inplace update errors after validation
     @torch.no_grad()
     @free_gpu_memory_context(after=True)
@@ -1012,16 +1024,29 @@ class LtxvTrainer:
         self._optimizer.zero_grad(set_to_none=True)
         free_gpu_memory()
 
+        # Temporarily boost base LoRA to validation strength if configured
+        base_lora_cfg = self._config.model.base_lora
+        delta = 0.0
+        if base_lora_cfg and base_lora_cfg.validation_strength is not None and self._base_lora_pairs:
+            delta = base_lora_cfg.validation_strength - base_lora_cfg.strength
+        if delta:
+            self._apply_base_lora_delta(delta)
+
         # Keep the offloader active during validation — its forward-pre hooks
         # swap blocks in/out the same way during inference as during training,
         # so the full model never needs to sit on GPU at once. The validation
         # sampler is told to skip its own transformer.to(device) call below.
         offload_active = self._block_offloader is not None
 
-        return self._run_validation_sampling(
+        result = self._run_validation_sampling(
             progress, use_images, use_reference_videos, generate_audio, inference_steps,
             offload_active=offload_active,
         )
+
+        if delta:
+            self._apply_base_lora_delta(-delta)
+
+        return result
 
     def _run_validation_sampling(
         self,
@@ -1082,12 +1107,8 @@ class LtxvTrainer:
                 else None
             )
 
-            # If training uses discrete-sigmas sampling (distillation
-            # mode), validation should match the inference sigmas the
-            # model was trained against. Append 0.0 as the terminal
-            # value for Euler termination.
-            validation_sigmas: list[float] | None = None
-            if self._config.flow_matching.timestep_sampling_mode == "discrete_sigmas":
+            validation_sigmas: list[float] | None = self._config.validation.sigmas
+            if validation_sigmas is None and self._config.flow_matching.timestep_sampling_mode == "discrete_sigmas":
                 training_sigmas = list(
                     self._config.flow_matching.timestep_sampling_params.get("sigmas", [])
                 )

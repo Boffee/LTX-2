@@ -42,7 +42,7 @@ def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
 
     Used by :class:`~ltx_core.memory.PinnedWeights` (for handle-level
     dedup of tied frozen params) and
-    :func:`~ltx_core.memory.make_block_offloader` (for cross-region
+    :func:`~ltx_core.memory.BlockOffloader` (for cross-region
     tied-weight detection across blocks and non-block modules).
 
     Dispatches to the matching adapter so each tensor type contributes
@@ -71,13 +71,14 @@ class PinnedParamBuffer:
     Parameter identity. Trainable params should be routed elsewhere.
     """
 
-    __slots__ = ("adapter", "cpu_param", "name", "pinned_state")
+    __slots__ = ("adapter", "cpu_param", "name", "pinned_state", "transform")
 
     def __init__(self, name: str, param: nn.Parameter) -> None:
         self.name = name
         self.adapter: type[TensorAdapter] = select_adapter(param.data)
         self.pinned_state = self.adapter.clone_pin(param.data)
         self.cpu_param: nn.Parameter = self.adapter.cpu_param(self.pinned_state)
+        self.transform: Any = None
 
     def allocate_gpu_storage(self, device: torch.device) -> Any:
         """Allocate empty GPU storage mirroring this buffer's layout.
@@ -104,7 +105,10 @@ class PinnedParamBuffer:
         slot construction and :meth:`copy_to_gpu` on each load."""
         gpu_state = self.allocate_gpu_storage(device)
         self.copy_to_gpu(gpu_state, non_blocking=non_blocking)
-        return self.make_gpu_param(gpu_state)
+        gpu_param = self.make_gpu_param(gpu_state)
+        if self.transform is not None:
+            self.transform.apply(gpu_param.data)
+        return gpu_param
 
     @property
     def cache_bytes(self) -> int:

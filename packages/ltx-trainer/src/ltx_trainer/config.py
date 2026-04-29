@@ -27,6 +27,13 @@ class BaseLoraConfig(ConfigBaseModel):
         description="Path to the LoRA safetensors file.",
     )
 
+    validation_strength: float | None = Field(
+        default=None,
+        description="Separate merge strength used during validation inference. "
+        "When set, the delta (validation_strength - strength) is applied before "
+        "each validation run and undone after. If None, uses the training strength.",
+    )
+
     strength: float = Field(
         default=1.0,
         description="Multiplier applied to each LoRA delta (B @ A). "
@@ -404,6 +411,13 @@ class ValidationConfig(ConfigBaseModel):
         description="Whether to generate audio in validation samples. "
         "Independent of training strategy setting - you can generate audio "
         "in validation even when not training the audio branch.",
+    )
+
+    sigmas: list[float] | None = Field(
+        default=None,
+        description="Explicit sigma schedule for validation inference. "
+        "When set, overrides the automatic schedule derived from flow_matching.sigmas. "
+        "Must include the terminal 0.0 (e.g. [1.0, 0.975, 0.725, 0.421875, 0.0]).",
     )
 
     skip_initial_validation: bool = Field(

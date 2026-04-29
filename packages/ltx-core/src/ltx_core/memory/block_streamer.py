@@ -14,10 +14,10 @@ This is the sharp, low-level primitive. It does NOT manage:
 - Trainable parameter movement — caller handles a separate
   :class:`~ltx_core.memory.block_compose.TrainableWeights`.
 - Cross-region tied-weight detection — that's a composer concern
-  (see :func:`make_block_offloader` /
-  :class:`~ltx_core.memory.block_compose.BlockStreamingStrategy`).
+  (see :func:`BlockOffloader` /
+  :class:`~ltx_core.memory.block_compose.BlockOffloader`).
 
-Most users want :func:`make_block_offloader` (the blessed safe
+Most users want :func:`BlockOffloader` (the blessed safe
 API). Reach for :class:`BlockStreamer` directly only when you need
 bespoke composition (e.g., multiple block lists like Flux's
 ``transformer_blocks`` + ``single_transformer_blocks``).
@@ -29,7 +29,7 @@ import functools
 import logging
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from types import TracebackType
 from typing import Any
@@ -96,6 +96,8 @@ class _GpuSlot:
     def copy_from(self, bufs: list[PinnedParamBuffer], non_blocking: bool = False) -> None:
         for buf in bufs:
             buf.copy_to_gpu(self._gpu_states[buf.name], non_blocking=non_blocking)
+            if buf.transform is not None:
+                buf.transform.apply(self._gpu_params[buf.name].data)
 
     def get_param(self, name: str) -> nn.Parameter:
         return self._gpu_params[name]
@@ -162,7 +164,6 @@ class _BlockPinnedStore:
         layers: Sequence[nn.Module],
         *,
         skip_slots: set[SlotOwnership] | None = None,
-        post_load: Callable[[Any, int], None] | None = None,
     ) -> None:
         self._layers = list(layers)
         self._param_bufs: list[list[PinnedParamBuffer]] = []
@@ -174,13 +175,6 @@ class _BlockPinnedStore:
             list[tuple[torch.Tensor, nn.Module, str, torch.Tensor]]
         ] = []
         self._slots_applied = False
-        # Optional callback invoked on the prefetch stream after the
-        # pool slot's bytes are DMA'd in. Receives (slot, block_idx);
-        # the slot exposes ``get_param(qual_name) -> nn.Parameter``
-        # over its GPU-resident tensors. Used by composers that need
-        # to mutate freshly-loaded weights (e.g., LoRA merge) before
-        # the slot is handed off to the main compute stream.
-        self._post_load = post_load
         skip: set[SlotOwnership] = skip_slots or set()
         # Slot-ownership filter built during the same walk: identifies
         # every (parent_module, leaf, kind) slot the streamer will own.
@@ -213,7 +207,7 @@ class _BlockPinnedStore:
                         f"BlockStreamer cannot manage trainable slot {s.name!r}: "
                         "streaming swaps slot Parameters with frozen pool "
                         "wrappers, breaking optimizer identity. Use "
-                        "make_block_offloader (which partitions trainables "
+                        "BlockOffloader (which partitions trainables "
                         "into TrainableWeights automatically), or pass the "
                         "slot in skip_slots and route it to a separate "
                         "trainable mover."
@@ -341,12 +335,6 @@ class _BlockPinnedStore:
         self._pool.wait_if_needed(slot_id, stream)
         slot = self._pool.slot(slot_id)
         slot.copy_from(self._param_bufs[idx], non_blocking=non_blocking)
-        # Post-load hook on the prefetch stream — runs after the slot's
-        # bytes are DMA'd in, before the main stream waits on the
-        # readiness event. CUDA orders the hook's ops after copy_from
-        # automatically because both run on the same (current) stream.
-        if self._post_load is not None:
-            self._post_load(slot, idx)
 
         for qual_name, submod, local_name in self._param_locs[idx]:
             submod._parameters[local_name] = slot.get_param(qual_name)
@@ -354,12 +342,6 @@ class _BlockPinnedStore:
             mod_buf.data = cpu_clone.to(self._device, non_blocking=non_blocking)
 
     def _load_alloc(self, idx: int, device: torch.device, non_blocking: bool) -> None:
-        if self._post_load is not None:
-            raise NotImplementedError(
-                "post_load callback is only supported in the pooled path "
-                "(strict_homogeneous=True). The no-pool fallback exposes no "
-                "stable slot object for the callback to operate on."
-            )
         for buf, (_qn, submod, local_name) in zip(
             self._param_bufs[idx], self._param_locs[idx], strict=True,
         ):
@@ -451,12 +433,12 @@ class BlockStreamer:
     are the composer's responsibility.
 
     A :class:`BlockStreamer` is a *component* meant to be composed
-    inside a :class:`~ltx_core.memory.block_compose.BlockStreamingStrategy`.
+    inside a :class:`~ltx_core.memory.block_compose.BlockOffloader`.
     It deliberately does NOT implement
     :class:`~ltx_core.memory.strategy.ModelStrategy` (its
     :meth:`activate` returns ``None`` because it doesn't own the
     model). For top-level use, build a strategy via
-    :func:`~ltx_core.memory.block_compose.make_block_offloader`.
+    :func:`~ltx_core.memory.block_compose.BlockOffloader`.
 
     Lifecycle is uniform with :class:`PinnedWeights`: ``__init__``
     pins (so ``cache_bytes`` is final at construction time, ready
@@ -498,8 +480,8 @@ class BlockStreamer:
         When False, falls back to per-load ``cudaMalloc`` allocation
         — slow but works for heterogeneous configurations. Use
         multiple :class:`BlockStreamer`s (one per homogeneous group)
-        with :func:`make_block_offloader` /
-        :class:`BlockStreamingStrategy` to get the pool benefit on
+        with :func:`BlockOffloader` /
+        :class:`BlockOffloader` to get the pool benefit on
         heterogeneous models like Flux.
     skip_slots:
         Optional set of :class:`SlotOwnership` tuples identifying
@@ -511,17 +493,6 @@ class BlockStreamer:
         ``skip_slots`` triggers a contract-guard ValueError at
         construction; this is intentional, fail-loud over silent
         freezing of the param.
-    post_load:
-        Optional callback invoked on the prefetch stream after a
-        block's bytes are DMA'd into a pool slot, before the main
-        compute stream waits on the readiness event. Signature:
-        ``(slot, block_idx) -> None``, where ``slot.get_param(qual_name)``
-        returns the freshly-loaded GPU :class:`nn.Parameter`. Used by
-        composers that need to mutate the freshly-loaded weights —
-        e.g., LoRA merge via ``param.data.addmm_(B, A, alpha=scale)``.
-        CUDA orders the hook's ops after the DMA automatically because
-        both run on the current (prefetch) stream. Pooled path only;
-        raises if used with ``strict_homogeneous=False``.
     """
 
     def __init__(
@@ -534,7 +505,6 @@ class BlockStreamer:
         name: str | None = None,
         strict_homogeneous: bool = True,
         skip_slots: set[SlotOwnership] | None = None,
-        post_load: Callable[[Any, int], None] | None = None,
     ) -> None:
         self._blocks: list[nn.Module] = list(blocks)
         self._target_device = target_device
@@ -557,7 +527,7 @@ class BlockStreamer:
         for block in self._blocks:
             block.to("cpu")
         store = _BlockPinnedStore(
-            self._blocks, skip_slots=skip_slots, post_load=post_load,
+            self._blocks, skip_slots=skip_slots,
         )
         if strict_homogeneous and not store.is_homogeneous():
             raise ValueError(
@@ -566,7 +536,7 @@ class BlockStreamer:
                 "Either pass strict_homogeneous=False to opt into the "
                 "slower per-load allocation fallback, or split into "
                 "multiple BlockStreamers — one per homogeneous group — "
-                "and compose with make_block_offloader()."
+                "and compose with BlockOffloader()."
             )
         store.apply_slot_mutations()
         self._store: _BlockPinnedStore | None = store
@@ -599,6 +569,16 @@ class BlockStreamer:
         relative to the streamer."""
         assert self._store is not None
         return self._store.slot_filter
+
+    @property
+    def param_bufs_per_block(self) -> list[list[PinnedParamBuffer]]:
+        """Per-block lists of :class:`PinnedParamBuffer` objects.
+
+        Used by :class:`~ltx_core.memory.BlockOffloader` to build a
+        reverse index from parameter qualified names to their buffers.
+        """
+        assert self._store is not None
+        return self._store._param_bufs
 
     @property
     def name(self) -> str:

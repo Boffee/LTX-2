@@ -3,7 +3,7 @@
 Two related Protocols form the contract:
 
 - :class:`ModelStrategyComponent` — pure lifecycle. A piece composable
-  inside a top-level strategy (see :class:`BlockStreamingStrategy`).
+  inside a top-level strategy (see :class:`BlockOffloader`).
   Just ``cache_bytes`` + ``activate()`` + ``deactivate()``. Components
   don't expose a model because their parent composite owns it.
 
@@ -15,7 +15,7 @@ Two related Protocols form the contract:
 
 Top-level implementations in this package:
 :class:`~ltx_core.memory.PinnedWeights` (whole-model bulk DMA between
-pinned CPU and GPU) and :class:`BlockStreamingStrategy` (composite of
+pinned CPU and GPU) and :class:`BlockOffloader` (composite of
 streamers + pinning + trainable handling). Future strategies (disk-mmap,
 NVMe-paged, multi-GPU shard) just satisfy :class:`ModelStrategy`.
 
