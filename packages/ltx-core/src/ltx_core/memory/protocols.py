@@ -19,7 +19,7 @@ pinned CPU and GPU) and :class:`BlockOffloader` (composite of
 streamers + pinning + trainable handling). Future strategies (disk-mmap,
 NVMe-paged, multi-GPU shard) just satisfy :class:`ModelStrategy`.
 
-Component implementations: :class:`~ltx_core.memory.BlockStreamer`,
+Component implementations: :class:`~ltx_core.memory.StreamedWeights`,
 :class:`~ltx_core.memory.TrainableWeights`. (And :class:`PinnedWeights`
 also satisfies the component shape — composites use it inline.)
 

@@ -32,7 +32,7 @@ from .pinned_buffer import PinnedParamBuffer, storage_key
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotOwnership
 from .slots import iter_buffer_slots, iter_param_slots
-from .streamed_weights import BlockStreamer
+from .streamed_weights import StreamedWeights
 from .trainable_weights import TrainableWeights
 
 logger = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ class BlockOffloader:
 
     Composes :class:`PinnedWeights` (non-block frozen params),
     :class:`TrainableWeights` (LoRA / adapter params), and one or more
-    :class:`BlockStreamer`\\ s internally. LoRA transforms are set via
+    :class:`StreamedWeights`\\ s internally. LoRA transforms are set via
     :meth:`set_loras` and attach to individual
     :class:`PinnedParamBuffer` objects so the merge fires automatically
     during DMA — no separate merge strategy needed.
@@ -70,7 +70,7 @@ class BlockOffloader:
     prefetch_count:
         Per-group prefetch depth. Same broadcasting as *blocks_to_swap*.
     strict_homogeneous:
-        Forwarded to each :class:`BlockStreamer`. When True (default),
+        Forwarded to each :class:`StreamedWeights`. When True (default),
         non-homogeneous groups raise at construction. Pass False for
         the per-load-allocation fallback.
     key_transform:
@@ -117,15 +117,15 @@ class BlockOffloader:
             s.slot for s in iter_param_slots(model) if s.param.requires_grad
         }
 
-        streamers: list[BlockStreamer] = []
+        streamers: list[StreamedWeights] = []
         for i, blocks in enumerate(block_groups):
             streamers.append(
-                BlockStreamer(
+                StreamedWeights(
                     blocks=blocks,
                     target_device=target_device,
                     blocks_to_swap=swap_list[i],
                     prefetch_count=pf_list[i],
-                    name=f"BlockStreamer[{layer_paths[i]}]",
+                    name=f"StreamedWeights[{layer_paths[i]}]",
                     strict_homogeneous=strict_homogeneous,
                     skip_slots=trainable_slots,
                 )
@@ -253,7 +253,7 @@ class BlockOffloader:
 
     @staticmethod
     def _build_reverse_index(
-        streamers: list[BlockStreamer],
+        streamers: list[StreamedWeights],
         layer_paths: list[str],
         non_block: PinnedWeights | None,
     ) -> dict[str, PinnedParamBuffer]:

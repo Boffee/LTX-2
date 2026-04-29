@@ -8,7 +8,7 @@ Two complementary offload strategies:
   Hooks-based, prefetches upcoming blocks on a secondary CUDA stream,
   supports gradient checkpointing through autograd backward. Composes
   :class:`PinnedWeights` + :class:`TrainableWeights` +
-  :class:`BlockStreamer` internally.
+  :class:`StreamedWeights` internally.
 
 - :class:`PinnedWeights` — whole-model pinned-CPU bulk cache. Use for
   models that fit on GPU when active but should be evicted between
@@ -34,7 +34,7 @@ everything to GPU; ``deactivate()`` returns to pinned CPU.
   1. A non-block :class:`PinnedWeights` with a :class:`SlotOwnership`
      skip filter for everything outside the block list.
   2. A :class:`TrainableWeights` for LoRA / adapter weights.
-  3. One :class:`BlockStreamer` per ``layers_attr`` path.
+  3. One :class:`StreamedWeights` per ``layers_attr`` path.
 
 Optional LoRA merging is handled by attaching
 :class:`~ltx_core.memory.LoRATransform` objects to individual
@@ -72,13 +72,13 @@ from .model_cache import (
 )
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategy, ModelStrategyComponent, SlotOwnership
-from .streamed_weights import BlockStreamer
+from .streamed_weights import StreamedWeights
 from .trainable_weights import TrainableWeights
 
 __all__ = [
     "ActivationError",
     "BlockOffloader",
-    "BlockStreamer",
+    "StreamedWeights",
     "DuplicateModelKeyError",
     "LoRA",
     "LoRATransform",

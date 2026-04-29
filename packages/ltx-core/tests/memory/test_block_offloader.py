@@ -1,7 +1,7 @@
 """Tests for the block-streaming machinery in ``ltx_core.memory``.
 
 Covers ``BlockOffloader`` (the public composite),
-``BlockStreamer`` (the per-block-list primitive),
+``StreamedWeights`` (the per-block-list primitive),
 ``TrainableWeights`` (the trainable-param component),
 and the cross-region tied-weight detector.
 
@@ -19,7 +19,7 @@ from torch import nn
 
 from ltx_core.memory import (
     BlockOffloader,
-    BlockStreamer,
+    StreamedWeights,
     ModelStrategy,
     PinnedWeights,
     SlotOwnership,
@@ -235,7 +235,7 @@ class TestCleanup:
 
     @CUDA
     def test_drop_strategy_without_deactivate_does_not_cycle(self) -> None:
-        # Regression: BlockStreamer's forward-pre-hook closure used to
+        # Regression: StreamedWeights's forward-pre-hook closure used to
         # capture `self`, creating a refcount cycle:
         #     layer → _forward_pre_hooks → closure → streamer →
         #     _blocks → layer
@@ -486,7 +486,7 @@ class TestActivateFailurePoison:
             m, torch.device("cuda"),
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
-        streamer: BlockStreamer = strategy._components[-1]
+        streamer: StreamedWeights = strategy._components[-1]
         original_register_hooks = streamer._register_hooks
 
         def broken_register_hooks(*args, **kwargs):
@@ -566,7 +566,7 @@ class TestPrefetchFailureOnDeactivate:
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         strategy.activate()
-        streamer: BlockStreamer = strategy._components[-1]
+        streamer: StreamedWeights = strategy._components[-1]
         # Inject a pre-failed Future so deactivate's drain loop hits it.
         bad_future: Future[None] = Future()
         bad_future.set_exception(RuntimeError("simulated prefetch failure"))
@@ -626,7 +626,7 @@ class TestConstructedStateIsInactive:
             layers_attr="transformer_blocks", blocks_to_swap=2,
         )
         try:
-            # No PinnedWeights component, just TrainableWeights + BlockStreamer.
+            # No PinnedWeights component, just TrainableWeights + StreamedWeights.
             non_block_components = [
                 c for c in strategy._components if isinstance(c, PinnedWeights)
             ]
@@ -1053,7 +1053,7 @@ class TestStrictHomogeneousFailure:
         original_pinned = [b.weight.is_pinned() for b in m.blocks]
 
         with pytest.raises(ValueError, match="not homogeneous"):
-            BlockStreamer(
+            StreamedWeights(
                 blocks=list(m.blocks),
                 target_device=torch.device("cpu"),
                 blocks_to_swap=1,
@@ -1108,7 +1108,7 @@ class TestMultiComponentCleanup:
     @CUDA
     def test_trainable_move_failure_still_runs_other_deactivates(self) -> None:
         # ExitStack continues unwinding callbacks even when one raises.
-        # If TrainableWeights's deactivate raises, BlockStreamer (earlier
+        # If TrainableWeights's deactivate raises, StreamedWeights (earlier
         # in unwind order) and non_block PinnedWeights (later in unwind)
         # still get their deactivate called.
         from unittest.mock import patch
@@ -1194,9 +1194,9 @@ class TestSlotOwnershipFilter:
     so PinnedWeights's skip check still matches even after a streamer
     has swapped the Parameter object at that slot."""
 
-    def test_block_streamer_slot_filter_is_slot_ownership_set(self) -> None:
+    def test_streamed_weights_slot_filter_is_slot_ownership_set(self) -> None:
         m = _make_block_model()
-        streamer = BlockStreamer(
+        streamer = StreamedWeights(
             blocks=list(m.transformer_blocks),
             target_device=torch.device("cpu"),
             blocks_to_swap=2,
@@ -1219,7 +1219,7 @@ class TestSlotOwnershipFilter:
         m = _make_block_model()
         # Build the streamer first — this swaps block slots to pinned
         # cpu_params (different Python objects than the originals).
-        streamer = BlockStreamer(
+        streamer = StreamedWeights(
             blocks=list(m.transformer_blocks),
             target_device=torch.device("cpu"),
             blocks_to_swap=2,
@@ -1297,8 +1297,8 @@ class TestDetectStreamingRegionTies:
 # ---------------------------------------------------------------------------
 
 
-class TestBlockStreamerContractGuard:
-    """BlockStreamer is frozen-only by mechanism (slot replacement
+class TestStreamedWeightsContractGuard:
+    """StreamedWeights is frozen-only by mechanism (slot replacement
     breaks Parameter identity). Direct callers must partition trainables
     via skip_slots; the composer does this automatically."""
 
@@ -1308,7 +1308,7 @@ class TestBlockStreamerContractGuard:
         # param.
         block = nn.Linear(4, 4, bias=False)  # default requires_grad=True
         with pytest.raises(ValueError, match="cannot manage trainable slot"):
-            BlockStreamer(
+            StreamedWeights(
                 blocks=[block, nn.Linear(4, 4, bias=False)],
                 target_device=torch.device("cpu"),
                 blocks_to_swap=1,
@@ -1321,7 +1321,7 @@ class TestBlockStreamerContractGuard:
 
         block_0 = nn.Linear(4, 4, bias=False)  # trainable
         block_1 = nn.Linear(4, 4, bias=False)  # trainable
-        # Snapshot trainable slots before BlockStreamer construction.
+        # Snapshot trainable slots before StreamedWeights construction.
         trainable_slots = {
             s.slot for s in iter_param_slots(block_0) if s.param.requires_grad
         } | {
@@ -1329,7 +1329,7 @@ class TestBlockStreamerContractGuard:
         }
         # No frozen content remains, so the streamer's pinning walk
         # produces empty buffers but no contract violation.
-        streamer = BlockStreamer(
+        streamer = StreamedWeights(
             blocks=[block_0, block_1],
             target_device=torch.device("cpu"),
             blocks_to_swap=1,
@@ -1470,7 +1470,7 @@ class TestMixedGradTieDetection:
 class TestLoRAInBlockRouting:
     """LoRA-shaped models: blocks contain frozen base layers plus
     trainable adapter layers. The composer must route the base to
-    BlockStreamer and the adapters to TrainableWeights; neither
+    StreamedWeights and the adapters to TrainableWeights; neither
     strategy's contract guard should fire on a well-formed LoRA model.
     """
 
@@ -1505,10 +1505,10 @@ class TestLoRAInBlockRouting:
             assert any(
                 isinstance(c, TrainableWeights) for c in strat._components
             )
-            # Each BlockStreamer's slot_filter only contains frozen
+            # Each StreamedWeights's slot_filter only contains frozen
             # base.weight slots; lora_a/lora_b are skipped.
             streamers = [
-                c for c in strat._components if isinstance(c, BlockStreamer)
+                c for c in strat._components if isinstance(c, StreamedWeights)
             ]
             assert len(streamers) == 1
             streamer = streamers[0]
@@ -1561,7 +1561,7 @@ class TestLoRAInBlockRouting:
                 c for c in strat._components if isinstance(c, PinnedWeights)
             )
             # PinnedWeights manages frozen_head.weight only — block content
-            # routed to BlockStreamer, trainable_bias to TrainableWeights.
+            # routed to StreamedWeights, trainable_bias to TrainableWeights.
             managed_slot_ids = {
                 (id(parent), leaf)
                 for _buf, locs in pinned.slots

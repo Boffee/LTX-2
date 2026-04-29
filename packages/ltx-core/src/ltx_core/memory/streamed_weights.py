@@ -1,6 +1,6 @@
 """Block-streaming primitive for memory-efficient training and inference.
 
-A :class:`BlockStreamer` manages a single homogeneous block list:
+A :class:`StreamedWeights` manages a single homogeneous block list:
 pins the frozen weights to CPU at construction time, streams them
 to GPU on demand via forward-pre hooks, and uses a pre-allocated
 GPU slot pool plus a background prefetcher to overlap DMA with
@@ -18,7 +18,7 @@ This is the sharp, low-level primitive. It does NOT manage:
   :class:`~ltx_core.memory.block_offloader.BlockOffloader`).
 
 Most users want :func:`BlockOffloader` (the blessed safe
-API). Reach for :class:`BlockStreamer` directly only when you need
+API). Reach for :class:`StreamedWeights` directly only when you need
 bespoke composition (e.g., multiple block lists like Flux's
 ``transformer_blocks`` + ``single_transformer_blocks``).
 """
@@ -204,7 +204,7 @@ class _BlockPinnedStore:
                 # hook). Fail loudly here rather than silently freezing.
                 if s.param.requires_grad:
                     raise ValueError(
-                        f"BlockStreamer cannot manage trainable slot {s.name!r}: "
+                        f"StreamedWeights cannot manage trainable slot {s.name!r}: "
                         "streaming swaps slot Parameters with frozen pool "
                         "wrappers, breaking optimizer identity. Use "
                         "BlockOffloader (which partitions trainables "
@@ -418,11 +418,11 @@ class _BlockTracker:
 
 
 # ---------------------------------------------------------------------------
-# BlockStreamer — public block-streaming primitive
+# StreamedWeights — public block-streaming primitive
 # ---------------------------------------------------------------------------
 
 
-class BlockStreamer:
+class StreamedWeights:
     """Streams a single block list between pinned CPU and GPU.
 
     The sharp, low-level streaming primitive. Manages frozen weights
@@ -432,7 +432,7 @@ class BlockStreamer:
     parent modules, sibling modules, or trainable parameters — those
     are the composer's responsibility.
 
-    A :class:`BlockStreamer` is a *component* meant to be composed
+    A :class:`StreamedWeights` is a *component* meant to be composed
     inside a :class:`~ltx_core.memory.block_offloader.BlockOffloader`.
     It deliberately does NOT implement
     :class:`~ltx_core.memory.strategy.ModelStrategy` (its
@@ -479,7 +479,7 @@ class BlockStreamer:
         mutation, so failure leaves the user's model untouched.
         When False, falls back to per-load ``cudaMalloc`` allocation
         — slow but works for heterogeneous configurations. Use
-        multiple :class:`BlockStreamer`s (one per homogeneous group)
+        multiple :class:`StreamedWeights`s (one per homogeneous group)
         with :func:`BlockOffloader` /
         :class:`BlockOffloader` to get the pool benefit on
         heterogeneous models like Flux.
@@ -510,7 +510,7 @@ class BlockStreamer:
         self._target_device = target_device
         self._blocks_to_swap = blocks_to_swap
         self._prefetch_count = prefetch_count
-        self._name = name or f"BlockStreamer({len(self._blocks)} blocks)"
+        self._name = name or f"StreamedWeights({len(self._blocks)} blocks)"
 
         if blocks_to_swap >= len(self._blocks):
             raise ValueError(
@@ -535,7 +535,7 @@ class BlockStreamer:
                 "param names/shapes/dtypes/quanto specs across blocks). "
                 "Either pass strict_homogeneous=False to opt into the "
                 "slower per-load allocation fallback, or split into "
-                "multiple BlockStreamers — one per homogeneous group — "
+                "multiple StreamedWeights instances — one per homogeneous group — "
                 "and compose with BlockOffloader()."
             )
         store.apply_slot_mutations()
@@ -803,5 +803,5 @@ class BlockStreamer:
 
 
 __all__ = [
-    "BlockStreamer",
+    "StreamedWeights",
 ]

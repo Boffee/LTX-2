@@ -164,9 +164,9 @@ def _verify_offloader(trainer, blocks_to_swap: int) -> None:
     assert strategy is not None, "Offloader should be active"
 
     # The new API: strategy has _components; the last component is the
-    # BlockStreamer (PinnedWeights and TrainableWeights come first).
-    from ltx_core.memory import BlockStreamer
-    streamers = [c for c in strategy._components if isinstance(c, BlockStreamer)]
+    # StreamedWeights (PinnedWeights and TrainableWeights come first).
+    from ltx_core.memory import StreamedWeights
+    streamers = [c for c in strategy._components if isinstance(c, StreamedWeights)]
     assert len(streamers) == 1, f"Expected 1 streamer, got {len(streamers)}"
     streamer = streamers[0]
 

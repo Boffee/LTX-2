@@ -118,7 +118,7 @@ class PinnedParamBuffer:
     @property
     def homogeneity_key(self) -> Hashable:
         """Identity tuple for layout homogeneity checks. Used by
-        :class:`BlockStreamer` to verify all blocks share the same
+        :class:`StreamedWeights` to verify all blocks share the same
         layout before allocating a single GPU pool slot.
 
         Includes the adapter class so distinct adapters can never
