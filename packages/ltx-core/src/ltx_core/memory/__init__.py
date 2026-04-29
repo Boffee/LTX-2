@@ -58,11 +58,7 @@ Compatibility
 - **Single-thread / sequential.** No internal locking.
 """
 
-from .block_offloader import (
-    BlockOffloader,
-    TrainableWeights,
-    detect_streaming_region_ties,
-)
+from .block_offloader import BlockOffloader, detect_streaming_region_ties
 from .block_streamer import BlockStreamer
 from .lora import LoRA, LoRATransform
 from .model_cache import (
@@ -77,6 +73,7 @@ from .model_cache import (
 )
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategy, ModelStrategyComponent, SlotOwnership
+from .trainable_weights import TrainableWeights
 
 __all__ = [
     "ActivationError",

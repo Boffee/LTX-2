@@ -1122,8 +1122,8 @@ class TestMultiComponentCleanup:
             strategy.activate()
             assert m.embed.weight.is_cuda  # type: ignore[union-attr]
 
-            with patch(
-                "ltx_core.memory.block_offloader._move_trainable",
+            with patch.object(
+                TrainableWeights, "_move",
                 side_effect=RuntimeError("simulated trainable move failure"),
             ), pytest.raises(RuntimeError, match="simulated trainable move failure"):
                 strategy.deactivate()

@@ -12,7 +12,7 @@ This is the sharp, low-level primitive. It does NOT manage:
   modules) — caller composes :class:`PinnedWeights` with the
   streamer's :attr:`slot_filter` for that.
 - Trainable parameter movement — caller handles a separate
-  :class:`~ltx_core.memory.block_offloader.TrainableWeights`.
+  :class:`~ltx_core.memory.trainable_weights.TrainableWeights`.
 - Cross-region tied-weight detection — that's a composer concern
   (see :func:`BlockOffloader` /
   :class:`~ltx_core.memory.block_offloader.BlockOffloader`).

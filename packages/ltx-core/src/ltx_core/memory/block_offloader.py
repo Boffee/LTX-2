@@ -4,9 +4,8 @@ Composes block streaming, non-block pinning, trainable parameter
 movement, and optional per-weight LoRA transforms into a single
 :class:`BlockOffloader` class.
 
-Also provides :class:`TrainableWeights` (identity-preserving mover
-for trainable params) and :func:`detect_streaming_region_ties`
-(construction-time validation), both used internally by
+Also provides :func:`detect_streaming_region_ties`
+(construction-time validation), used internally by
 :class:`BlockOffloader` and exported for direct use / testing.
 """
 
@@ -34,12 +33,12 @@ from .pinned_buffer import PinnedParamBuffer, storage_key
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotOwnership
 from .slots import iter_buffer_slots, iter_param_slots
+from .trainable_weights import TrainableWeights
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "BlockOffloader",
-    "TrainableWeights",
     "detect_streaming_region_ties",
 ]
 
@@ -312,74 +311,6 @@ def _has_pinnable_content(
     ) or any(
         s.slot not in skip_slots for s in iter_buffer_slots(model)
     )
-
-
-# ---------------------------------------------------------------------------
-# TrainableWeights — lifecycle handler for trainable params
-# ---------------------------------------------------------------------------
-
-
-class TrainableWeights:
-    """Strategy component for the model's trainable parameters.
-
-    The trainable counterpart to :class:`PinnedWeights`. Both components
-    bring their managed params to the target device on
-    :meth:`activate` and return them to CPU on :meth:`deactivate`,
-    but the mechanisms are mirror images:
-
-    - :class:`PinnedWeights` owns pinned-CPU clones, slot-replaces the
-      Parameter wrapper at every transition. Frozen-only — slot
-      replacement orphans optimizer state.
-    - :class:`TrainableWeights` owns nothing (``cache_bytes=0``); the
-      user's Parameter objects stay alive in their slots, and only
-      ``p.data`` storage moves via ``p.data = p.data.to(device)``.
-      Identity-preserving — optimizer state survives.
-
-    Walks ``model.parameters()`` each transition (deduped by Parameter
-    identity), so the standard ``tie_weights()`` pattern (one Parameter
-    aliased at multiple slots) is handled correctly. Distinct-Parameter
-    tied storage is rejected upstream by
-    :func:`detect_streaming_region_ties` because moving each Parameter
-    independently would untie the alias on GPU.
-    """
-
-    def __init__(self, model: nn.Module, target_device: torch.device) -> None:
-        self._model = model
-        self._target_device = target_device
-
-    @property
-    def cache_bytes(self) -> int:
-        return 0
-
-    @property
-    def name(self) -> str:
-        return "TrainableWeights"
-
-    def activate(self) -> None:
-        _move_trainable(self._model, self._target_device)
-
-    def deactivate(self) -> None:
-        _move_trainable(self._model, torch.device("cpu"))
-
-    def __enter__(self) -> None:
-        self.activate()
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> None:
-        self.deactivate()
-
-
-def _move_trainable(model: nn.Module, device: torch.device) -> None:
-    for p in model.parameters():
-        if p.requires_grad:
-            if p.data.device != device:
-                p.data = p.data.to(device)
-            if p.grad is not None and p.grad.device != device:
-                p.grad = p.grad.to(device)
 
 
 # ---------------------------------------------------------------------------
