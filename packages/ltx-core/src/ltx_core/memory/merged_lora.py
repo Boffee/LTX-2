@@ -106,9 +106,8 @@ def _concat_lora_factors(
     return torch.cat(as_list, dim=0), torch.cat(bs_list, dim=1)
 
 
-# Per-block pre-concatenated merge list: (qual, B_cat_pinned, A_cat_pinned)
-# tuples ready for per-prefetch DMA + addmm_.
-_MergePlan = dict[int, list[tuple[str, torch.Tensor, torch.Tensor]]]
+_FactorList = list[tuple[torch.Tensor, torch.Tensor, float]]
+_ConcatFactors = list[tuple[str, torch.Tensor, torch.Tensor]]
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +152,12 @@ class MergedLoRAStrategy:
         self._reverse_index = self._build_reverse_index(
             layers_attr, blocks,
         )
+        self._non_block_params = self._build_non_block_index(
+            layers_attr, model,
+        )
 
-        self._merge_plan: _MergePlan = {}
+        self._block_factors: dict[int, _ConcatFactors] = {}
+        self._non_block_factors: _ConcatFactors = []
         self._lora_factor_bytes: int = 0
         self._teardown: contextlib.ExitStack | None = None
 
@@ -164,7 +167,7 @@ class MergedLoRAStrategy:
             blocks_to_swap=blocks_to_swap,
             prefetch_count=prefetch_count,
             name=f"BlockStreamer[{layers_attr}]",
-            post_load=self._apply_active_loras,
+            post_load=self._merge_block_loras,
         )
         skip: set[SlotOwnership] = set(self._streamer.slot_filter)
         self._non_block: PinnedWeights | None = None
@@ -190,16 +193,17 @@ class MergedLoRAStrategy:
                 "MergedLoRAStrategy.set_loras() requires the strategy "
                 "to be inactive. Call deactivate() first."
             )
-        self._merge_plan.clear()
+        self._block_factors.clear()
+        self._non_block_factors.clear()
         self._lora_factor_bytes = 0
 
         if not loras:
             return
 
         base_dtype = next(self._model.parameters()).dtype
-        raw = self._pair_and_assign(loras, base_dtype)
-        self._merge_plan, self._lora_factor_bytes = self._concat_and_pin(
-            raw, base_dtype,
+        raw = self._pair_and_validate(loras, base_dtype)
+        self._block_factors, self._non_block_factors, self._lora_factor_bytes = (
+            self._build_factors(raw, base_dtype)
         )
 
     # ----------------------------------------------- ModelStrategy interface
@@ -221,6 +225,7 @@ class MergedLoRAStrategy:
             if self._non_block is not None:
                 stack.callback(self._non_block.deactivate)
                 self._non_block.activate()
+                self._merge_non_block_loras()
             stack.callback(self._streamer.deactivate)
             self._streamer.activate()
             if self._device.type == "cuda":
@@ -278,18 +283,32 @@ class MergedLoRAStrategy:
                     index[full] = (block_idx, qual, tuple(p.shape))
         return index
 
-    def _pair_and_assign(
+    @staticmethod
+    def _build_non_block_index(
+        layers_attr: str,
+        model: nn.Module,
+    ) -> dict[str, tuple[int, ...]]:
+        """Map ``full_qualname -> shape`` for frozen parameters outside
+        the block list."""
+        block_prefix = f"{layers_attr}."
+        index: dict[str, tuple[int, ...]] = {}
+        for qual, p in model.named_parameters():
+            if not p.requires_grad and not qual.startswith(block_prefix):
+                index[qual] = tuple(p.shape)
+        return index
+
+    def _pair_and_validate(
         self,
         loras: Sequence[LoRA],
         base_dtype: torch.dtype,
-    ) -> dict[int, dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]]]:
-        """Pair lora_A/lora_B keys, match to model params via reverse index.
+    ) -> dict[str, _FactorList]:
+        """Pair lora_A/lora_B keys, validate shapes, return per-target factors.
 
-        Returns ``raw[block_idx][in_block_qual] -> [(A, B, strength), ...]``
-        ready for concatenation.
+        Returns ``{target_qualname: [(A, B, strength), ...]}`` for all
+        targets that match either the block or non-block index.
         """
         transform = self._key_transform
-        raw: dict[int, dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]]] = {}
+        raw: dict[str, _FactorList] = {}
 
         for lora in loras:
             a_tensors: dict[str, torch.Tensor] = {}
@@ -318,11 +337,14 @@ class MergedLoRAStrategy:
                 if transform is not None:
                     target_key = transform(target_key)
 
-                entry = self._reverse_index.get(target_key)
-                if entry is None:
-                    continue  # non-block target, skip silently
-
-                block_idx, in_block_qual, expected_shape = entry
+                block_entry = self._reverse_index.get(target_key)
+                nb_shape = self._non_block_params.get(target_key)
+                if block_entry is not None:
+                    expected_shape = block_entry[2]
+                elif nb_shape is not None:
+                    expected_shape = nb_shape
+                else:
+                    continue
 
                 if not a.is_floating_point() or not b.is_floating_point():
                     raise ValueError(
@@ -344,41 +366,60 @@ class MergedLoRAStrategy:
                         f"B@A.shape == target."
                     )
 
-                block_raw = raw.setdefault(block_idx, {})
-                block_raw.setdefault(in_block_qual, []).append(
+                raw.setdefault(target_key, []).append(
                     (a, b, lora.strength)
                 )
 
         return raw
 
-    def _concat_and_pin(
+    def _build_factors(
         self,
-        raw: dict[int, dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]]],
+        raw: dict[str, _FactorList],
         base_dtype: torch.dtype,
-    ) -> tuple[_MergePlan, int]:
-        """Concatenate factors per (block, target) and pin on CPU."""
-        plan: _MergePlan = {}
+    ) -> tuple[dict[int, _ConcatFactors], _ConcatFactors, int]:
+        """Concat all factors once, then split into block (pinned) and
+        non-block (cloned)."""
+        block: dict[int, _ConcatFactors] = {}
+        non_block: _ConcatFactors = []
         total_bytes = 0
 
-        for block_idx, qual_factors in raw.items():
-            bucket: list[tuple[str, torch.Tensor, torch.Tensor]] = []
-            for qual, factors in qual_factors.items():
-                pair = _concat_lora_factors(factors, base_dtype, torch.device("cpu"))
-                if pair is not None:
-                    a_cat, b_cat = pair
-                    a_pinned = a_cat.contiguous().pin_memory()
-                    b_pinned = b_cat.contiguous().pin_memory()
-                    total_bytes += a_pinned.numel() * a_pinned.element_size()
-                    total_bytes += b_pinned.numel() * b_pinned.element_size()
-                    bucket.append((qual, b_pinned, a_pinned))
-            plan[block_idx] = bucket
+        for target_key, factors in raw.items():
+            pair = _concat_lora_factors(factors, base_dtype, torch.device("cpu"))
+            if pair is None:
+                continue
+            a_cat, b_cat = pair
 
-        return plan, total_bytes
+            block_entry = self._reverse_index.get(target_key)
+            if block_entry is not None:
+                a_cat = a_cat.contiguous().pin_memory()
+                b_cat = b_cat.contiguous().pin_memory()
+                block_idx, in_block_qual, _ = block_entry
+                block.setdefault(block_idx, []).append(
+                    (in_block_qual, b_cat, a_cat)
+                )
+            else:
+                a_cat = a_cat.clone().contiguous()
+                b_cat = b_cat.clone().contiguous()
+                non_block.append((target_key, b_cat, a_cat))
 
-    def _apply_active_loras(self, slot: Any, block_idx: int) -> None:  # noqa: ANN401
+            total_bytes += a_cat.numel() * a_cat.element_size()
+            total_bytes += b_cat.numel() * b_cat.element_size()
+
+        return block, non_block, total_bytes
+
+    def _merge_non_block_loras(self) -> None:
+        """Merge LoRA deltas into non-block params after PinnedWeights.activate()."""
+        params = dict(self._model.named_parameters())
+        for qual, b_cat, a_cat in self._non_block_factors:
+            p = params[qual]
+            b_gpu = b_cat.to(device=p.device, dtype=p.dtype)
+            a_gpu = a_cat.to(device=p.device, dtype=p.dtype)
+            p.data.addmm_(b_gpu, a_gpu)
+
+    def _merge_block_loras(self, slot: Any, block_idx: int) -> None:  # noqa: ANN401
         """post_load callback: DMA this block's factors from pinned CPU
         to GPU and merge via in-place addmm_ on the prefetch stream."""
-        for qual, b_pinned, a_pinned in self._merge_plan.get(block_idx, ()):
+        for qual, b_pinned, a_pinned in self._block_factors.get(block_idx, ()):
             b_gpu = b_pinned.to(device=self._device, non_blocking=True)
             a_gpu = a_pinned.to(device=self._device, non_blocking=True)
             slot.get_param(qual).data.addmm_(b_gpu, a_gpu)

@@ -195,7 +195,7 @@ class TestSetLorasValidation:
         with pytest.raises(ValueError, match="shape mismatch"):
             s.set_loras([LoRA(state_dict=sd)])
 
-    def test_skips_non_block_targets(self) -> None:
+    def test_non_block_targets_counted_in_bytes(self) -> None:
         m = _make_bf16_model()
         s = _make_strategy(m)
         sd = {
@@ -203,7 +203,7 @@ class TestSetLorasValidation:
             "embed.lora_B.weight": torch.randn(16, 4),
         }
         s.set_loras([LoRA(state_dict=sd)])
-        assert s._lora_factor_bytes == 0
+        assert s._lora_factor_bytes > 0
 
     def test_key_transform_strips_prefix(self) -> None:
         m = _make_bf16_model()
@@ -376,6 +376,34 @@ class TestMergeCorrectness:
                 ).to("cuda")
                 actual = m.transformer_blocks[i].attn.weight.detach()
                 assert torch.allclose(actual, expected, rtol=0.01, atol=0.01)
+        finally:
+            s.deactivate()
+
+    @CUDA
+    def test_non_block_lora_merges_correctly(self) -> None:
+        """LoRA targeting embed (non-block) should be merged at activate."""
+        m = _make_bf16_model(num_blocks=4, dim=16)
+        captured_embed = m.embed.weight.detach().clone()
+
+        g = torch.Generator().manual_seed(99)
+        sd = {
+            "embed.lora_A.weight": torch.randn(4, 16, generator=g, dtype=torch.float32),
+            "embed.lora_B.weight": torch.randn(16, 4, generator=g, dtype=torch.float32),
+        }
+        lora = LoRA(state_dict=sd, strength=0.5)
+        s = _make_strategy(m, device="cuda")
+        s.set_loras([lora])
+        s.activate()
+        try:
+            a = sd["embed.lora_A.weight"].to(torch.bfloat16)
+            b = sd["embed.lora_B.weight"].to(torch.bfloat16)
+            expected = (captured_embed + 0.5 * (b @ a)).to("cuda")
+            actual = m.embed.weight.detach()
+            assert torch.allclose(actual, expected, rtol=0.01, atol=0.01), (
+                f"non-block merge mismatch:\n"
+                f"  expected: {expected.flatten()[:4]}\n"
+                f"  actual:   {actual.flatten()[:4]}"
+            )
         finally:
             s.deactivate()
 
