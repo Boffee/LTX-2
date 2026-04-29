@@ -25,6 +25,7 @@ bespoke composition (e.g., multiple block lists like Flux's
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 import weakref
@@ -55,12 +56,10 @@ def _release_cuda_cache_on_drop(is_cuda: bool) -> None:
     # imply per-device scoping that PyTorch doesn't actually provide.
     if not is_cuda:
         return
-    try:
+    # Finalizers can run at interpreter shutdown when CUDA is already torn
+    # down, so suppress teardown-time noise.
+    with contextlib.suppress(Exception):
         torch.cuda.empty_cache()
-    except Exception:
-        # Finalizers can run at interpreter shutdown when CUDA is
-        # already torn down — swallow rather than spam tracebacks.
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +223,8 @@ class _BlockPinnedStore:
             buf_records: list[tuple[torch.Tensor, nn.Module, str, torch.Tensor]] = []
             seen_buffer_ids: set[int] = set()
             for s in iter_buffer_slots(layer):
+                if s.slot in skip:
+                    continue
                 slot_filter.add(s.slot)
                 if id(s.buffer) in seen_buffer_ids:
                     continue
@@ -435,7 +436,7 @@ class StreamedWeights:
     A :class:`StreamedWeights` is a *component* meant to be composed
     inside a :class:`~ltx_core.memory.block_offloader.BlockOffloader`.
     It deliberately does NOT implement
-    :class:`~ltx_core.memory.strategy.ModelStrategy` (its
+    :class:`~ltx_core.memory.protocols.ModelStrategy` (its
     :meth:`activate` returns ``None`` because it doesn't own the
     model). For top-level use, build a strategy via
     :func:`~ltx_core.memory.block_offloader.BlockOffloader`.

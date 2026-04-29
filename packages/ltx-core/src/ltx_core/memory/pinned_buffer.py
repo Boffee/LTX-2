@@ -80,19 +80,19 @@ class PinnedParamBuffer:
         self.cpu_param: nn.Parameter = self.adapter.cpu_param(self.pinned_state)
         self.transform: Any = None
 
-    def allocate_gpu_storage(self, device: torch.device) -> Any:
+    def allocate_gpu_storage(self, device: torch.device) -> object:
         """Allocate empty GPU storage mirroring this buffer's layout.
         Returns an opaque adapter-specific handle; pass it back to
         :meth:`make_gpu_param` and :meth:`copy_to_gpu`."""
         return self.adapter.alloc_gpu(self.pinned_state, device)
 
-    def make_gpu_param(self, gpu_state: Any) -> nn.Parameter:
+    def make_gpu_param(self, gpu_state: object) -> nn.Parameter:
         """Build the GPU-side :class:`nn.Parameter` for this buffer.
         Adapter receives the paired pinned state so structured tensor
         types (quanto) can reconstruct their wrappers."""
         return self.adapter.gpu_param(self.pinned_state, gpu_state)
 
-    def copy_to_gpu(self, gpu_state: Any, *, non_blocking: bool = False) -> None:
+    def copy_to_gpu(self, gpu_state: object, *, non_blocking: bool = False) -> None:
         """Bulk DMA pinned host bytes into pre-allocated GPU storage."""
         self.adapter.copy_to_gpu(self.pinned_state, gpu_state, non_blocking=non_blocking)
 

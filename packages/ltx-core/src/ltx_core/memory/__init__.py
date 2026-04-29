@@ -78,7 +78,6 @@ from .trainable_weights import TrainableWeights
 __all__ = [
     "ActivationError",
     "BlockOffloader",
-    "StreamedWeights",
     "DuplicateModelKeyError",
     "LoRA",
     "LoRATransform",
@@ -92,6 +91,7 @@ __all__ = [
     "ModelTooLargeError",
     "PinnedWeights",
     "SlotOwnership",
+    "StreamedWeights",
     "TrainableWeights",
     "detect_streaming_region_ties",
 ]

@@ -19,13 +19,14 @@ from torch import nn
 
 from ltx_core.memory import (
     BlockOffloader,
-    StreamedWeights,
     ModelStrategy,
     PinnedWeights,
     SlotOwnership,
+    StreamedWeights,
     TrainableWeights,
 )
 from ltx_core.memory.block_offloader import detect_streaming_region_ties
+from ltx_core.memory.slots import iter_buffer_slots
 from ltx_core.memory.streamed_weights import _BlockPinnedStore
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1337,6 +1338,30 @@ class TestStreamedWeightsContractGuard:
         )
         assert streamer.slot_filter.isdisjoint(trainable_slots)
 
+    def test_direct_skipped_buffers_are_not_pinned_or_owned(self) -> None:
+        class BufferBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(4, 4), requires_grad=False)
+                self.register_buffer("table", torch.randn(8))
+
+        blocks = [BufferBlock(), BufferBlock()]
+        buffer_slots = {
+            s.slot for block in blocks for s in iter_buffer_slots(block)
+        }
+        buffer_ptrs = [block.table.data_ptr() for block in blocks]
+
+        streamer = StreamedWeights(
+            blocks=blocks,
+            target_device=torch.device("cpu"),
+            blocks_to_swap=1,
+            skip_slots=buffer_slots,
+        )
+
+        assert streamer.slot_filter.isdisjoint(buffer_slots)
+        assert [block.table.data_ptr() for block in blocks] == buffer_ptrs
+        assert all(not block.table.is_pinned() for block in blocks)
+
 
 class TestMixedGradTieDetection:
     """detect_streaming_region_ties must catch mixed-grad ties anywhere
@@ -1403,6 +1428,41 @@ class TestMixedGradTieDetection:
                 m, torch.device("cpu"),
                 layers_attr="transformer_blocks", blocks_to_swap=1,
             )
+
+    def test_all_trainable_same_parameter_tie_constructs(self) -> None:
+        shared = nn.Parameter(torch.randn(4, 4), requires_grad=True)
+
+        class TiedTrainableBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.base = nn.Linear(4, 4, bias=False)
+                self.base.weight.requires_grad = False
+                self.a = shared
+                self.b = shared
+
+        class FrozenBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.base = nn.Linear(4, 4, bias=False)
+                self.base.weight.requires_grad = False
+
+        class M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [TiedTrainableBlock(), FrozenBlock()]
+                )
+
+        m = M()
+
+        strategy = BlockOffloader(
+            m, torch.device("cpu"),
+            layers_attr="transformer_blocks", blocks_to_swap=1,
+        )
+
+        assert m.transformer_blocks[0]._parameters["a"] is shared
+        assert m.transformer_blocks[0]._parameters["b"] is shared
+        strategy.deactivate()
 
     def test_mixed_grad_cross_region_reports_grad_cause(self) -> None:
         # When a tie is BOTH cross-region AND mixed-grad, the user
@@ -1578,5 +1638,3 @@ class TestLoRAInBlockRouting:
                     )
         finally:
             strat.deactivate()
-
-

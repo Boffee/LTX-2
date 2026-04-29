@@ -223,6 +223,19 @@ class TestTiedWeightDedup:
         finally:
             pw.deactivate()
 
+    def test_zero_sized_same_parameter_under_two_names_dedupes(self) -> None:
+        p = nn.Parameter(torch.empty(0), requires_grad=False)
+        m = nn.Module()
+        m.a = p
+        m.b = p
+
+        pw = PinnedWeights(m, torch.device("cpu"))
+        try:
+            assert len(pw._slots) == 1
+            assert m._parameters["a"] is m._parameters["b"]
+        finally:
+            pw.deactivate()
+
     def test_cache_bytes_counts_tied_once(self) -> None:
         m, _, _ = self._make_tied_model()
         pw = PinnedWeights(m, torch.device("cpu"))
@@ -315,6 +328,27 @@ class TestSharedSubmoduleAlias:
             assert pinned.is_pinned()
             assert len(locs) == 2
             # Both module slots reference the SAME pinned tensor.
+            assert m.a.buf is pinned
+            assert m.b.buf is pinned
+        finally:
+            pw.deactivate()
+
+    def test_zero_sized_aliased_buffer(self) -> None:
+        shared_buf = torch.empty(0)
+
+        class Inner(nn.Module):
+            def __init__(self, b: torch.Tensor):
+                super().__init__()
+                self.register_buffer("buf", b)
+                self.weight = nn.Parameter(torch.randn(2), requires_grad=False)
+
+        m = nn.Module()
+        m.a = Inner(shared_buf)
+        m.b = Inner(shared_buf)
+        pw = PinnedWeights(m, torch.device("cpu"))
+        try:
+            assert len(pw._buffer_slots) == 1
+            pinned, _locs = pw._buffer_slots[0]
             assert m.a.buf is pinned
             assert m.b.buf is pinned
         finally:

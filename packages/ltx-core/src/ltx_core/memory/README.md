@@ -12,15 +12,16 @@ into its own package when a second consumer appears.
 
 | Module | Role |
 |---|---|
-| `strategy.py` | `ModelStrategy` — the plug-in contract every strategy implements; `SlotOwnership` skip-filter type |
+| `protocols.py` | `ModelStrategy` / `ModelStrategyComponent` plug-in contracts; `SlotOwnership` skip-filter type |
 | `pinned_weights.py` | `PinnedWeights` — whole-model bulk pinned-CPU↔GPU strategy |
-| `block_streamer.py` | `BlockStreamer` — sharp per-block-list streaming primitive (component) |
+| `streamed_weights.py` | `StreamedWeights` — sharp per-block-list streaming primitive (component) |
 | `block_offloader.py` | `BlockOffloader` — unified composite: block streaming + non-block pinning + trainable params + optional LoRA merge |
-| `block_compose.py` | `TrainableWeights` (component), `detect_streaming_region_ties` (validation) |
-| `merged_lora.py` | `LoRA`, `LoRATransform` — per-weight LoRA merge transform + factor pairing/validation |
+| `trainable_weights.py` | `TrainableWeights` — identity-preserving trainable parameter mover |
+| `lora.py` | `LoRA`, `LoRATransform` — per-weight LoRA merge transform + factor pairing/validation |
 | `pinned_buffer.py` | `PinnedParamBuffer` — per-tensor pinning primitive (handles quanto) |
+| `tensor_adapters.py`, `quanto_adapter.py` | Tensor-type adapter registry and optional optimum-quanto support |
 | `model_cache.py` | `ModelCache` — LRU pool over strategies with active-set leases |
-| `pipeline_install.py` | Optional one-line monkey-patch installer (see [Integrations](#integrations)) |
+| `pipeline_install.py` | LTX-specific integration shim; keep outside the generic core surface when publishing independently |
 
 ## Why use this
 
@@ -115,6 +116,10 @@ component — backward through them is unaffected by the offload.
 `set_loras()`. LoRA factors are attached as transforms on
 `PinnedParamBuffer` objects and applied automatically after DMA —
 both block-streamed and non-block weights get merged for free.
+`set_loras()` first clears the currently attached transforms, then
+validates and builds the replacement stack. If the replacement raises,
+the offloader is left in base-only mode; this avoids briefly holding
+both old and new pinned LoRA factors in host memory.
 
 ```python
 from ltx_core.memory import BlockOffloader, LoRA
@@ -231,7 +236,7 @@ with cache.use(spec) as vae:  # registers if missing, then uses
             │             │  • PinnedWeights (non-block,        │
             │             │    skip_slots = streamers' slots)   │
             │             │  • TrainableWeights                 │
-            │             │  • N × BlockStreamer                │
+            │             │  • N × StreamedWeights              │
             │             │                                     │
             │             │  optional LoRA:                     │
             │             │  • LoRATransform on PinnedParamBuf  │
@@ -270,7 +275,7 @@ class MyStrategy:
 
 A narrower `ModelStrategyComponent` Protocol (just `cache_bytes` +
 `activate` + `deactivate`, no `model`) describes pieces composable
-inside a top-level strategy — `BlockStreamer`, `TrainableWeights`,
+inside a top-level strategy — `StreamedWeights`, `TrainableWeights`,
 and a `PinnedWeights` used as a non-block sibling all satisfy it.
 
 ## Strategy lifecycle
@@ -300,7 +305,7 @@ don't guard against caller misuse.
 
 - **`torch.compile` is not supported** for managed modules. Both
   strategies swap parameter slots (`module._parameters[leaf] = new_param`)
-  on every activate/deactivate, and `BlockStreamer` registers
+  on every activate/deactivate, and `StreamedWeights` registers
   forward-pre hooks that mutate slots on every block call. Both
   invalidate the tensor-identity assumptions `torch.compile` makes
   about its trace.

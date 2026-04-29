@@ -1,3 +1,4 @@
+# ruff: noqa: ANN401, PLC0415, PLW0603
 """Monkey-patch installer for routing ltx_pipelines block construction
 through a :class:`ModelCache`.
 
@@ -274,9 +275,10 @@ def uninstall_model_cache() -> None:
     for key in succeeded:
         _INSTALLED_KEYS.discard(key)
     # Prune _BLOCK_KEYS to drop succeeded entries too.
-    for token, keys in list(_BLOCK_KEYS.items()):
-        keys -= set(succeeded)
-        if not keys:
+    succeeded_set = set(succeeded)
+    for token, tracked_keys in list(_BLOCK_KEYS.items()):
+        tracked_keys.difference_update(succeeded_set)
+        if not tracked_keys:
             del _BLOCK_KEYS[token]
 
     if busy:
@@ -532,7 +534,7 @@ def _patched_text_encoder_ctx(
 
 
 __all__ = [
+    "UninstallBusyError",
     "install_model_cache",
     "uninstall_model_cache",
-    "UninstallBusyError",
 ]

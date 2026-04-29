@@ -63,7 +63,7 @@ from torch import nn
 
 from .pinned_buffer import PinnedParamBuffer, storage_key
 from .protocols import SlotOwnership
-from .slots import iter_buffer_slots, iter_param_slots
+from .slots import BufferSlot, ParamSlot, iter_buffer_slots, iter_param_slots
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,20 @@ def _set_buffer(module: nn.Module, name: str, value: torch.Tensor, persistent: b
     ``module``, preserving the original ``persistent`` flag so
     ``state_dict()`` behavior survives the swap."""
     module.register_buffer(name, value, persistent=persistent)
+
+
+def _dedupe_param_locs(
+    members: list[tuple[str, nn.Parameter, nn.Module, str]]
+) -> list[tuple[nn.Module, str]]:
+    seen_locs: set[tuple[int, str]] = set()
+    locs: list[tuple[nn.Module, str]] = []
+    for _, _, parent, leaf in members:
+        key = (id(parent), leaf)
+        if key in seen_locs:
+            continue
+        seen_locs.add(key)
+        locs.append((parent, leaf))
+    return locs
 
 
 class PinnedWeights:
@@ -147,101 +161,12 @@ class PinnedWeights:
         # remember the build-time device dance.
         model.to("cpu")
 
-        # Tied-weight aware pinning. We walk both named_modules and
-        # named_parameters with remove_duplicate=False so:
-        #   - shared submodule aliases (m.a is m.b) get visited at every
-        #     alias rather than just one canonical name
-        #   - the standard tie_weights() pattern (one Parameter under
-        #     multiple names) shows up at every name
-        # We then group by storage identity. All-frozen groups become
-        # one PinnedParamBuffer whose slot-location list is deduped by
-        # (id(parent), leaf) so we don't double-write into shared
-        # submodules.
-        #
-        # Trainable filtering and mixed-grad tie detection are NOT
-        # done here. They're the composer's job (BlockOffloader
-        # +detect_streaming_region_ties) — PinnedWeights' job is pure
-        # mechanism: pin and slot-replace what the caller hands it.
-        # A trainable slot that escapes into this walk is a caller
-        # bug; the contract guard below catches it.
-        # storage_key -> list of (name, param, parent_module, leaf)
-        groups: dict[tuple[Any, ...], list[tuple[str, nn.Parameter, nn.Module, str]]] = {}
-        for s in iter_param_slots(model):
-            if s.slot in self._skip_slots:
-                continue  # composer (e.g. BlockOffloader) owns this slot
-            # Contract guard: slot replacement installs a fresh
-            # requires_grad=False Parameter wrapper, orphaning the
-            # user's pre-wrap Parameter and any optimizer state keyed
-            # by it. Fail loudly rather than silently freeze.
-            if s.param.requires_grad:
-                raise ValueError(
-                    f"PinnedWeights cannot manage trainable slot {s.name!r}: "
-                    "slot replacement installs a frozen Parameter wrapper, "
-                    "orphaning any optimizer state keyed by the user's "
-                    "pre-wrap Parameter. Use BlockOffloader (which "
-                    "partitions trainables into TrainableWeights and validates "
-                    "tied storage upstream), or pass the slot in skip_slots "
-                    "and validate ties yourself — splitting a tied group "
-                    "between skip_slots and PinnedWeights silently breaks "
-                    "the alias on GPU."
-                )
-            if s.param.numel() == 0:
-                # Zero-sized tensors all share data_ptr()==0; key by id(p)
-                # to keep them in independent groups rather than spuriously
-                # collapsing them.
-                skey = ("__empty__", id(s.param), s.name)
-            else:
-                skey = storage_key(s.param.data)
-            groups.setdefault(skey, []).append((s.name, s.param, s.parent, s.leaf))
-
-        # Per unique buffer: (PinnedParamBuffer, list of (parent, leaf)).
-        self._slots: list[tuple[PinnedParamBuffer, list[tuple[nn.Module, str]]]] = []
-        for members in groups.values():
-            first_name, first_p = members[0][0], members[0][1]
-            buf = PinnedParamBuffer(first_name, first_p)
-            seen_locs: set[tuple[int, str]] = set()
-            locs: list[tuple[nn.Module, str]] = []
-            for _, _, parent, leaf in members:
-                key = (id(parent), leaf)
-                if key in seen_locs:
-                    continue
-                seen_locs.add(key)
-                locs.append((parent, leaf))
-            self._slots.append((buf, locs))
-
-        # Buffer pinning — Phase 1: build templates only, NO slot
-        # mutation. Same alias-aware grouping as parameters: shared
-        # buffer instances visible at multiple (parent, leaf) paths
-        # get one pinned clone shared across all locations, with each
-        # location's persistent flag preserved independently (the
-        # shared buffer might be persistent in one parent and
-        # non-persistent in another).
-        # Per unique buffer: (pinned_tensor, list of (parent, leaf, persistent))
-        self._buffer_slots: list[
-            tuple[torch.Tensor, list[tuple[nn.Module, str, bool]]]
-        ] = []
-        if include_buffers:
-            buf_groups: dict[
-                tuple[Any, ...],
-                tuple[torch.Tensor, list[tuple[nn.Module, str, bool]]],
-            ] = {}
-            for s in iter_buffer_slots(model):
-                if s.slot in self._skip_slots:
-                    continue  # composer owns this buffer
-                persistent = s.leaf not in s.parent._non_persistent_buffers_set
-                if s.buffer.numel() == 0:
-                    skey = ("__empty_buf__", id(s.buffer), s.name)
-                else:
-                    skey = storage_key(s.buffer)
-                existing = buf_groups.get(skey)
-                if existing is None:
-                    pinned = s.buffer.detach().clone(memory_format=torch.contiguous_format).pin_memory()
-                    buf_groups[skey] = (pinned, [(s.parent, s.leaf, persistent)])
-                else:
-                    seen_locs = {(id(p), leaf) for p, leaf, _ in existing[1]}
-                    if (id(s.parent), s.leaf) not in seen_locs:
-                        existing[1].append((s.parent, s.leaf, persistent))
-            self._buffer_slots = list(buf_groups.values())
+        # Phase 1: build all pinned templates without mutating slots. A
+        # collection failure leaves the user's model untouched.
+        self._slots = self._collect_param_slots(model)
+        self._buffer_slots = (
+            self._collect_buffer_slots(model) if include_buffers else []
+        )
 
         # Phase 2: apply ALL slot mutations together, AFTER all
         # pinning succeeded. This makes __init__ strong-exception-safe
@@ -271,6 +196,84 @@ class PinnedWeights:
                 "flows use ltx_core.memory.BlockOffloader instead, or "
                 "leave the model unwrapped."
             )
+
+    def _collect_param_slots(
+        self, model: nn.Module
+    ) -> list[tuple[PinnedParamBuffer, list[tuple[nn.Module, str]]]]:
+        # Tied-weight aware pinning. We walk with remove_duplicate=False so
+        # shared submodule aliases and standard tie_weights() aliases both
+        # show up, then group by storage identity.
+        groups: dict[tuple[Any, ...], list[tuple[str, nn.Parameter, nn.Module, str]]] = {}
+        for s in iter_param_slots(model):
+            if s.slot in self._skip_slots:
+                continue
+            self._validate_frozen_slot(s)
+            groups.setdefault(self._param_storage_key(s), []).append(
+                (s.name, s.param, s.parent, s.leaf)
+            )
+
+        slots: list[tuple[PinnedParamBuffer, list[tuple[nn.Module, str]]]] = []
+        for members in groups.values():
+            first_name, first_p = members[0][0], members[0][1]
+            buf = PinnedParamBuffer(first_name, first_p)
+            locs = _dedupe_param_locs(members)
+            slots.append((buf, locs))
+        return slots
+
+    def _collect_buffer_slots(
+        self, model: nn.Module
+    ) -> list[tuple[torch.Tensor, list[tuple[nn.Module, str, bool]]]]:
+        buf_groups: dict[
+            tuple[Any, ...],
+            tuple[torch.Tensor, list[tuple[nn.Module, str, bool]]],
+        ] = {}
+        for s in iter_buffer_slots(model):
+            if s.slot in self._skip_slots:
+                continue
+            persistent = s.leaf not in s.parent._non_persistent_buffers_set
+            skey = self._buffer_storage_key(s)
+            existing = buf_groups.get(skey)
+            if existing is None:
+                pinned = s.buffer.detach().clone(memory_format=torch.contiguous_format).pin_memory()
+                buf_groups[skey] = (pinned, [(s.parent, s.leaf, persistent)])
+            else:
+                seen_locs = {(id(p), leaf) for p, leaf, _ in existing[1]}
+                if (id(s.parent), s.leaf) not in seen_locs:
+                    existing[1].append((s.parent, s.leaf, persistent))
+        return list(buf_groups.values())
+
+    @staticmethod
+    def _validate_frozen_slot(s: ParamSlot) -> None:
+        # Slot replacement installs a fresh requires_grad=False Parameter
+        # wrapper, orphaning optimizer state keyed by the user's original
+        # Parameter. Fail loudly rather than silently freezing a trainable.
+        if not s.param.requires_grad:
+            return
+        raise ValueError(
+            f"PinnedWeights cannot manage trainable slot {s.name!r}: "
+            "slot replacement installs a frozen Parameter wrapper, "
+            "orphaning any optimizer state keyed by the user's "
+            "pre-wrap Parameter. Use BlockOffloader (which "
+            "partitions trainables into TrainableWeights and validates "
+            "tied storage upstream), or pass the slot in skip_slots "
+            "and validate ties yourself — splitting a tied group "
+            "between skip_slots and PinnedWeights silently breaks "
+            "the alias on GPU."
+        )
+
+    @staticmethod
+    def _param_storage_key(s: ParamSlot) -> tuple[Any, ...]:
+        if s.param.numel() == 0:
+            # Zero-sized tensors all share data_ptr()==0; key by object
+            # identity so aliases of the same Parameter still dedupe.
+            return ("__empty__", id(s.param))
+        return storage_key(s.param.data)
+
+    @staticmethod
+    def _buffer_storage_key(s: BufferSlot) -> tuple[Any, ...]:
+        if s.buffer.numel() == 0:
+            return ("__empty_buf__", id(s.buffer))
+        return storage_key(s.buffer)
 
     # ------------------------------------------------------------------
     # ModelStrategy protocol

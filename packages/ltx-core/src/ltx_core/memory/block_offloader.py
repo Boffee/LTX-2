@@ -171,6 +171,10 @@ class BlockOffloader:
         :class:`PinnedParamBuffer`.
 
         Pass an empty sequence to clear all LoRAs (base-only forward).
+        Replacement is destructive: existing LoRA transforms are cleared
+        before the new stack is validated and built, so a validation error
+        leaves the offloader in base-only mode. This avoids briefly
+        holding old and new pinned LoRA factors at the same time.
         """
         if self._teardown_stack is not None:
             raise RuntimeError(
@@ -205,7 +209,8 @@ class BlockOffloader:
             if pair is None:
                 continue
             a_cat, b_cat = pair
-            pending[target_key] = LoRATransform(a_cat, b_cat)
+            transform = LoRATransform(a_cat, b_cat)
+            pending[target_key] = transform
 
         for target_key, transform in pending.items():
             self._reverse_index[target_key].transform = transform
@@ -385,6 +390,7 @@ def detect_streaming_region_ties(  # noqa: PLR0912
                     "storage alias on GPU. Untie the parameters or use "
                     "tie_weights() to share a single Parameter object."
                 )
+            continue
         if len(regions) > 1:
             raise ValueError(
                 f"Block streaming does not support tied parameters across "
