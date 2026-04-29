@@ -369,7 +369,7 @@ class TestMergeCorrectness:
             for blk in m.transformer_blocks:
                 x = blk(x)
             torch.cuda.synchronize()
-            from ltx_core.memory.merged_lora import default_key_transform
+            from ltx_core.memory.lora import default_key_transform
             for i in range(4):
                 expected = _expected_merged_weight(
                     captured_base[i], [lora], i, "attn.weight",

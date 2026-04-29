@@ -21,7 +21,7 @@ from ltx_core.memory import (
     ModelSpec,
     ModelTooLargeError,
 )
-from ltx_core.memory.strategy import ModelStrategy
+from ltx_core.memory.protocols import ModelStrategy
 
 
 # ---------------------------------------------------------------------------

@@ -12,10 +12,10 @@ This is the sharp, low-level primitive. It does NOT manage:
   modules) — caller composes :class:`PinnedWeights` with the
   streamer's :attr:`slot_filter` for that.
 - Trainable parameter movement — caller handles a separate
-  :class:`~ltx_core.memory.block_compose.TrainableWeights`.
+  :class:`~ltx_core.memory.block_offloader.TrainableWeights`.
 - Cross-region tied-weight detection — that's a composer concern
   (see :func:`BlockOffloader` /
-  :class:`~ltx_core.memory.block_compose.BlockOffloader`).
+  :class:`~ltx_core.memory.block_offloader.BlockOffloader`).
 
 Most users want :func:`BlockOffloader` (the blessed safe
 API). Reach for :class:`BlockStreamer` directly only when you need
@@ -38,8 +38,8 @@ import torch
 from torch import nn
 
 from .pinned_buffer import PinnedParamBuffer
-from .slot_graph import iter_buffer_slots, iter_param_slots
-from .strategy import SlotOwnership
+from .protocols import SlotOwnership
+from .slots import iter_buffer_slots, iter_param_slots
 
 logger = logging.getLogger(__name__)
 
@@ -433,12 +433,12 @@ class BlockStreamer:
     are the composer's responsibility.
 
     A :class:`BlockStreamer` is a *component* meant to be composed
-    inside a :class:`~ltx_core.memory.block_compose.BlockOffloader`.
+    inside a :class:`~ltx_core.memory.block_offloader.BlockOffloader`.
     It deliberately does NOT implement
     :class:`~ltx_core.memory.strategy.ModelStrategy` (its
     :meth:`activate` returns ``None`` because it doesn't own the
     model). For top-level use, build a strategy via
-    :func:`~ltx_core.memory.block_compose.BlockOffloader`.
+    :func:`~ltx_core.memory.block_offloader.BlockOffloader`.
 
     Lifecycle is uniform with :class:`PinnedWeights`: ``__init__``
     pins (so ``cache_bytes`` is final at construction time, ready

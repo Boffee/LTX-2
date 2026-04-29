@@ -92,7 +92,7 @@ from torch import nn
 from ltx_core.memory.block_offloader import BlockOffloader
 from ltx_core.memory.model_cache import ModelCache, ModelInUseError, ModelSpec
 from ltx_core.memory.pinned_weights import PinnedWeights
-from ltx_core.memory.strategy import ModelStrategy
+from ltx_core.memory.protocols import ModelStrategy
 
 logger = logging.getLogger(__name__)
 

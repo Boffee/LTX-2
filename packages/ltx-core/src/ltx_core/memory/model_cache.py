@@ -49,7 +49,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from .strategy import ModelStrategy
+from .protocols import ModelStrategy
 
 logger = logging.getLogger(__name__)
 

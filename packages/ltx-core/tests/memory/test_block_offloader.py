@@ -25,7 +25,7 @@ from ltx_core.memory import (
     SlotOwnership,
     TrainableWeights,
 )
-from ltx_core.memory.block_compose import detect_streaming_region_ties
+from ltx_core.memory.block_offloader import detect_streaming_region_ties
 from ltx_core.memory.block_streamer import _BlockPinnedStore
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -1123,7 +1123,7 @@ class TestMultiComponentCleanup:
             assert m.embed.weight.is_cuda  # type: ignore[union-attr]
 
             with patch(
-                "ltx_core.memory.block_compose._move_trainable",
+                "ltx_core.memory.block_offloader._move_trainable",
                 side_effect=RuntimeError("simulated trainable move failure"),
             ), pytest.raises(RuntimeError, match="simulated trainable move failure"):
                 strategy.deactivate()
@@ -1317,7 +1317,7 @@ class TestBlockStreamerContractGuard:
     def test_direct_skipped_trainable_constructs(self) -> None:
         # With the trainable slot in skip_slots, construction succeeds
         # and the slot is excluded from slot_filter.
-        from ltx_core.memory.slot_graph import iter_param_slots
+        from ltx_core.memory.slots import iter_param_slots
 
         block_0 = nn.Linear(4, 4, bias=False)  # trainable
         block_1 = nn.Linear(4, 4, bias=False)  # trainable
@@ -1514,7 +1514,7 @@ class TestLoRAInBlockRouting:
             streamer = streamers[0]
             # Walk the model and confirm: lora slot ownerships are NOT in
             # streamer's slot_filter; base.weight slot ownerships ARE.
-            from ltx_core.memory.slot_graph import iter_param_slots
+            from ltx_core.memory.slots import iter_param_slots
             for s in iter_param_slots(m):
                 if s.param.requires_grad:
                     assert s.slot not in streamer.slot_filter, (
@@ -1534,7 +1534,7 @@ class TestLoRAInBlockRouting:
         # = block_slots ∪ trainable_slots. Verify by checking that no
         # trainable param slot appears in PinnedWeights' managed slots
         # and no block-internal slot does either.
-        from ltx_core.memory.slot_graph import iter_param_slots
+        from ltx_core.memory.slots import iter_param_slots
 
         class M(nn.Module):
             def __init__(self):

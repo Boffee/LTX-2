@@ -12,7 +12,7 @@ streaming, no forward hooks, no LRU. The whole model goes to GPU on
 :meth:`PinnedWeights.deactivate` by repointing each module's parameter
 slot back at a Parameter that wraps pinned CPU storage.
 
-Implements :class:`~ltx_core.memory.strategy.ModelStrategy` so it plugs
+Implements :class:`~ltx_core.memory.protocols.ModelStrategy` so it plugs
 into a model cache directly.
 
 Cross-cutting compatibility caveats (``torch.compile`` incompatibility,
@@ -62,8 +62,8 @@ import torch
 from torch import nn
 
 from .pinned_buffer import PinnedParamBuffer, storage_key
-from .slot_graph import iter_buffer_slots, iter_param_slots
-from .strategy import SlotOwnership
+from .protocols import SlotOwnership
+from .slots import iter_buffer_slots, iter_param_slots
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ def _set_buffer(module: nn.Module, name: str, value: torch.Tensor, persistent: b
 class PinnedWeights:
     """Whole-model pinned-CPU weight cache with bulk GPU transfer.
 
-    Implements :class:`~ltx_core.memory.strategy.ModelStrategy`.
+    Implements :class:`~ltx_core.memory.protocols.ModelStrategy`.
 
     On construction, every frozen parameter slot is replaced with a
     Parameter wrapping pinned CPU storage (handling quanto decomposition

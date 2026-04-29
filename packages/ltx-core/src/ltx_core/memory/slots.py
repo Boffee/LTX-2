@@ -3,11 +3,11 @@ model and producing :class:`SlotOwnership` identities.
 
 A "slot" is a ``(parent_module, leaf_name, kind)`` triple identifying
 where a parameter or buffer lives in a module tree (see
-:class:`~ltx_core.memory.strategy.SlotOwnership`). The streaming and
+:class:`~ltx_core.memory.protocols.SlotOwnership`). The streaming and
 pinning components in this package all need to walk a model and resolve
 each named parameter/buffer back to its slot. This module owns that walk
-so the four-way duplication across ``pinned_weights``, ``block_streamer``,
-and ``block_compose`` collapses to a single implementation.
+so the duplication across ``pinned_weights``, ``block_streamer``,
+and ``block_offloader`` collapses to a single implementation.
 
 The walk uses ``remove_duplicate=False`` throughout: a Parameter or
 buffer that's aliased under multiple names yields one row per alias.
@@ -24,7 +24,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from .strategy import SlotOwnership
+from .protocols import SlotOwnership
 
 __all__ = [
     "BufferSlot",
