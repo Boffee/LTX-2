@@ -26,7 +26,7 @@ from ltx_core.memory import (
     TrainableWeights,
 )
 from ltx_core.memory.block_offloader import detect_streaming_region_ties
-from ltx_core.memory.block_streamer import _BlockPinnedStore
+from ltx_core.memory.streamed_weights import _BlockPinnedStore
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 

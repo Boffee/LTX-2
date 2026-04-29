@@ -20,7 +20,6 @@ from typing import Any
 import torch
 from torch import nn
 
-from .block_streamer import BlockStreamer
 from .lora import (
     KeyTransformT,
     LoRA,
@@ -33,6 +32,7 @@ from .pinned_buffer import PinnedParamBuffer, storage_key
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotOwnership
 from .slots import iter_buffer_slots, iter_param_slots
+from .streamed_weights import BlockStreamer
 from .trainable_weights import TrainableWeights
 
 logger = logging.getLogger(__name__)

@@ -6,7 +6,7 @@ where a parameter or buffer lives in a module tree (see
 :class:`~ltx_core.memory.protocols.SlotOwnership`). The streaming and
 pinning components in this package all need to walk a model and resolve
 each named parameter/buffer back to its slot. This module owns that walk
-so the duplication across ``pinned_weights``, ``block_streamer``,
+so the duplication across ``pinned_weights``, ``streamed_weights``,
 and ``block_offloader`` collapses to a single implementation.
 
 The walk uses ``remove_duplicate=False`` throughout: a Parameter or

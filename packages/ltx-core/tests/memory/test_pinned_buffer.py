@@ -82,7 +82,7 @@ class TestPinnedParamBuffer:
         # must not churn that wrapper. Hooks repointing submod._parameters
         # at slot.get_param() observe a stable object across reloads — the
         # whole point of the pool-slot pattern over per-load allocation.
-        from ltx_core.memory.block_streamer import _GpuSlot
+        from ltx_core.memory.streamed_weights import _GpuSlot
 
         p1 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
         p2 = nn.Parameter(torch.randn(8, dtype=torch.bfloat16), requires_grad=False)
