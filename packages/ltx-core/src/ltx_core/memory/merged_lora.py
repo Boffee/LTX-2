@@ -42,8 +42,6 @@ from typing import Any
 import torch
 from torch import nn
 
-from ltx_core.loader.fuse_loras import concat_lora_factors
-
 from .block_compose import _has_non_block_pinnable_content, _resolve_attr
 from .block_streamer import BlockStreamer
 from .pinned_weights import PinnedWeights
@@ -92,6 +90,29 @@ class LoRABundle:
 
     name: str
     blocks: dict[int, dict[str, LoRALayerFactors]]
+
+
+def _concat_lora_factors(
+    factors: list[tuple[torch.Tensor, torch.Tensor, float]],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Concatenate N LoRA (A, B, strength) triples into a single factor pair.
+
+    Returns ``(A_cat, B_cat)`` such that ``B_cat @ A_cat`` equals the sum of
+    ``strength_i * B_i @ A_i`` for all inputs (within floating-point tolerance).
+    Mixed ranks across LoRAs are handled naturally by the concatenation.
+    """
+    if not factors:
+        return None
+    as_list: list[torch.Tensor] = []
+    bs_list: list[torch.Tensor] = []
+    for a, b, strength in factors:
+        as_list.append(a.to(device=device, dtype=dtype))
+        bs_list.append(b.to(device=device, dtype=dtype) * strength)
+    if len(as_list) == 1:
+        return as_list[0], bs_list[0]
+    return torch.cat(as_list, dim=0), torch.cat(bs_list, dim=1)
 
 
 # Per-block pre-concatenated merge list: (qual, B_cat, A_cat) tuples
@@ -376,7 +397,7 @@ class MergedLoRAStrategy:
         for block_idx, qual_factors in raw.items():
             bucket: list[tuple[str, torch.Tensor, torch.Tensor]] = []
             for qual, factors in qual_factors.items():
-                pair = concat_lora_factors(factors, base_dtype, self._device)
+                pair = _concat_lora_factors(factors, base_dtype, self._device)
                 if pair is not None:
                     a_cat, b_cat = pair
                     bucket.append((qual, b_cat, a_cat))
