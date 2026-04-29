@@ -16,7 +16,7 @@ through :class:`PinnedParamBuffer`.
 
 Each adapter encapsulates the mechanics for one tensor type. The rest
 of the package (:class:`PinnedParamBuffer`, :class:`PinnedWeights`,
-:class:`BlockStreamer`) is type-agnostic and dispatches through
+:class:`StreamedWeights`) is type-agnostic and dispatches through
 :func:`select_adapter`.
 
 This module is internal to :mod:`ltx_core.memory`. Adapters are registered
@@ -128,7 +128,7 @@ class TensorAdapter(Protocol[PinnedStateT, GpuStateT]):
     def homogeneity_key(state: PinnedStateT) -> Hashable:
         """Identity used to test that a list of states is
         layout-homogeneous (same dtype/shape/stride/quant-metadata).
-        Required by :class:`BlockStreamer`'s GPU pool, which preallocates
+        Required by :class:`StreamedWeights`'s GPU pool, which preallocates
         slots assuming all blocks share the same layout. Returns any
         hashable value — typically a tuple of layout components."""
         ...
@@ -262,7 +262,7 @@ def select_adapter(t: torch.Tensor) -> type[TensorAdapter[Any, Any]]:
         f"No registered TensorAdapter for tensor type {type(t).__name__!r}. "
         f"Plain tensors are handled by RegularAdapter; tensor subclasses "
         f"need a dedicated adapter (see optimum.quanto integration in "
-        f"_quanto_adapter.py for an example)."
+        f"quanto_adapter.py for an example)."
     )
 
 

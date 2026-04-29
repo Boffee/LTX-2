@@ -1,13 +1,13 @@
 """Per-parameter pinned-CPU storage primitive.
 
 Internal to the ``ltx_core.memory`` subpackage. Shared by
-:class:`PinnedWeights` (whole-model bulk pin) and :class:`BlockStreamer`
+:class:`PinnedWeights` (whole-model bulk pin) and :class:`StreamedWeights`
 (per-block streaming). Both consumers reach this through the same
 abstraction so the addition of new tensor types only requires writing
 a new :class:`TensorAdapter`, not editing the consumers.
 
 Per-parameter mechanics live in the tensor adapter
-(:mod:`tensor_adapters` for plain tensors, :mod:`_quanto_adapter` for
+(:mod:`tensor_adapters` for plain tensors, :mod:`quanto_adapter` for
 quanto). :class:`PinnedParamBuffer` is a thin holder that pairs one
 :class:`nn.Parameter` with the adapter that handles its tensor type
 plus the pinned-host state that adapter produced.
@@ -22,11 +22,11 @@ from typing import Any
 import torch
 from torch import nn
 
-# Importing _quanto_adapter has the side effect of registering
+# Importing quanto_adapter has the side effect of registering
 # QuantoAdapter when optimum-quanto is installed, so it precedes the
 # RegularAdapter fallback in select_adapter. The import must come after
 # tensor_adapters defines register_adapter / select_adapter.
-from . import _quanto_adapter  # noqa: F401 (registration side effect)
+from . import quanto_adapter  # noqa: F401 (registration side effect)
 from .tensor_adapters import TensorAdapter, select_adapter
 
 logger = logging.getLogger(__name__)
