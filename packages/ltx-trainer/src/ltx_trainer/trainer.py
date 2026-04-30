@@ -218,6 +218,8 @@ class LtxvTrainer:
                         )
 
                     self._optimizer.step()
+                    if not getattr(self, "_prodigy_states_cast", True):
+                        self._cast_prodigy_states_to_bf16()
                     self._optimizer.zero_grad()
 
                     if self._lr_scheduler is not None:
@@ -854,6 +856,18 @@ class LtxvTrainer:
                 weight_decay=0.01,
                 safeguard_warmup=True,
                 use_bias_correction=True,
+                slice_p=11,
+            )
+            self._prodigy_states_cast = False
+        elif opt_cfg.optimizer_type == "prodigy_plus":
+            from prodigyplus import ProdigyPlusScheduleFree  # noqa: PLC0415
+
+            optimizer = ProdigyPlusScheduleFree(
+                param_groups,
+                lr=lr,
+                betas=(0.9, 0.99),
+                weight_decay=0.01,
+                use_bias_correction=True,
             )
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
@@ -862,6 +876,20 @@ class LtxvTrainer:
 
         # noinspection PyTypeChecker
         self._optimizer, self._lr_scheduler = self._accelerator.prepare(optimizer, lr_scheduler)
+
+    def _cast_prodigy_states_to_bf16(self) -> None:
+        """Cast Prodigy optimizer states from fp32 to bf16 after first step."""
+        optimizer = self._optimizer.optimizer if hasattr(self._optimizer, "optimizer") else self._optimizer
+        cast_keys = {"exp_avg", "exp_avg_sq", "s", "p0"}
+        n_cast = 0
+        for state in optimizer.state.values():
+            for key in cast_keys:
+                if key in state and isinstance(state[key], torch.Tensor) and state[key].dtype == torch.float32:
+                    state[key] = state[key].to(torch.bfloat16)
+                    n_cast += 1
+        if n_cast > 0:
+            self._prodigy_states_cast = True
+            logger.info(f"Cast {n_cast} Prodigy optimizer states to bf16")
 
     def _create_scheduler(self, optimizer: torch.optim.Optimizer) -> LRScheduler | None:
         """Create learning rate scheduler based on config."""
@@ -997,6 +1025,7 @@ class LtxvTrainer:
         base_lora_cfg = self._config.model.base_lora
         val_strength = base_lora_cfg.validation_strength if base_lora_cfg else None
         if val_strength is not None:
+            logger.info(f"Switching base LoRA strength to {val_strength} for validation")
             self._model_offloader.deactivate()
             self._model_offloader.set_loras([(self._base_lora, val_strength)])
             self._model_offloader.activate()

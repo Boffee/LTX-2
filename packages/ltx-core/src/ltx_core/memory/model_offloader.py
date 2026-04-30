@@ -170,11 +170,15 @@ class ModelOffloader:
 
         addmm_dtypes = (torch.bfloat16, torch.float16, torch.float32)
         per_target: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]] = {}
+        total_targets = 0
+        matched_targets = 0
         for lora, strength in loras:
             for target_key, (a, b) in lora.targets.items():
+                total_targets += 1
                 buf = self._reverse_index.get(target_key)
                 if buf is None:
                     continue
+                matched_targets += 1
                 expected = tuple(buf.cpu_param.shape)
                 if expected != (b.shape[0], a.shape[1]):
                     raise ValueError(
@@ -192,6 +196,17 @@ class ModelOffloader:
                 per_target.setdefault(target_key, []).append(
                     (a, b, strength)
                 )
+
+        if matched_targets < total_targets:
+            sample_lora = sorted(next(iter(loras))[0].targets)[:3]
+            sample_index = sorted(self._reverse_index)[:3]
+            logger.warning(
+                "set_loras matched %d/%d targets. "
+                "Sample LoRA keys: %s ... Sample index keys: %s ...",
+                matched_targets, total_targets, sample_lora, sample_index,
+            )
+        else:
+            logger.debug("set_loras matched %d/%d targets", matched_targets, total_targets)
 
         for target_key, refs in per_target.items():
             self._reverse_index[target_key].transform = LoRATransform(refs)
@@ -239,11 +254,11 @@ class ModelOffloader:
         layer_paths: list[str],
         non_block: PinnedWeights | None,
     ) -> dict[str, PinnedParamBuffer]:
-        """Map model param qualified names to their PinnedParamBuffer.
+        """Map canonical param names to their PinnedParamBuffer.
 
-        Block params are reconstructed as
-        ``"{layer_path}.{block_idx}.{buf.name}"``.
-        Non-block params use ``buf.name`` directly (already model-relative).
+        Keys are normalized to strip PEFT's ``.base_layer.`` segments
+        so that LoRA state-dict keys (which use the original model
+        names) match regardless of whether the model is PEFT-wrapped.
         """
         index: dict[str, PinnedParamBuffer] = {}
 
@@ -251,11 +266,11 @@ class ModelOffloader:
             for block_idx, block_bufs in enumerate(streamer.param_bufs_per_block):
                 for buf in block_bufs:
                     full_name = f"{layer_path}.{block_idx}.{buf.name}"
-                    index[full_name] = buf
+                    index[_canonical_key(full_name)] = buf
 
         if non_block is not None:
             for buf, _locs in non_block.slots:
-                index[buf.name] = buf
+                index[_canonical_key(buf.name)] = buf
 
         return index
 
@@ -263,6 +278,16 @@ class ModelOffloader:
 # ---------------------------------------------------------------------------
 # Module-private helpers (used only by ModelOffloader constructor)
 # ---------------------------------------------------------------------------
+
+def _canonical_key(name: str) -> str:
+    """Normalize a parameter name to its canonical (non-PEFT) form.
+
+    PEFT inserts ``.base_layer.`` into wrapped module paths
+    (e.g. ``to_q.base_layer.weight`` instead of ``to_q.weight``).
+    LoRA state dicts always use the original names, so the reverse
+    index must store canonical keys for matching to work.
+    """
+    return name.replace(".base_layer.", ".")
 
 
 def _resolve_layers_attr(module: nn.Module, dotted_path: str) -> nn.ModuleList:

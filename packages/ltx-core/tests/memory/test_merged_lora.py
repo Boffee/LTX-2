@@ -423,6 +423,59 @@ class TestMergeCorrectness:
         finally:
             s.deactivate()
 
+    @CUDA
+    def test_peft_wrapped_model_matches_all_targets(self) -> None:
+        """PEFT renames params with ``.base_layer.``; set_loras must still match."""
+
+        class PEFTBlock(nn.Module):
+            def __init__(self, dim: int) -> None:
+                super().__init__()
+                self.attn = nn.Module()
+                self.attn.base_layer = nn.Linear(dim, dim, bias=False)
+                self.ff = nn.Linear(dim, dim, bias=False)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return self.ff(self.attn.base_layer(x))
+
+        class M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.transformer_blocks = nn.ModuleList(
+                    [PEFTBlock(16) for _ in range(4)]
+                )
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for blk in self.transformer_blocks:
+                    x = blk(x)
+                return x
+
+        m = M().to(torch.bfloat16)
+        m.requires_grad_(False)
+
+        captured_base = {
+            i: m.transformer_blocks[i].attn.base_layer.weight.detach().clone()
+            for i in range(4)
+        }
+
+        lora = _make_lora(num_blocks=4, dim=16, seed=42)
+        s = _make_strategy(m, device="cuda")
+        s.set_loras([(lora, 0.7)])
+        s.activate()
+        try:
+            x = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda")
+            m(x)
+            torch.cuda.synchronize()
+            for i in range(4):
+                expected = _expected_merged_weight(
+                    captured_base[i], [(lora, 0.7)], i, "attn.weight",
+                ).to("cuda")
+                actual = m.transformer_blocks[i].attn.base_layer.weight.detach()
+                assert torch.allclose(actual, expected, rtol=0.01, atol=0.01), (
+                    f"block {i} PEFT-wrapped merge mismatch"
+                )
+        finally:
+            s.deactivate()
+
 
 # ---------------------------------------------------------------------------
 # Cleanup invariants

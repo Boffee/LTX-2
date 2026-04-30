@@ -17,7 +17,7 @@ from pathlib import Path
 from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
 from safetensors.torch import load_file
 
-from ltx_core.memory import ModelOffloader
+from ltx_core.memory import ModelOffloader, LoRA
 from ltx_trainer.model_loader import load_embeddings_processor, load_model, load_text_encoder
 from ltx_trainer.progress import StandaloneSamplingProgress
 from ltx_trainer.validation_sampler import (
@@ -63,32 +63,6 @@ LORA_TARGET_MODULES = [
 ]
 
 OUTPUT_DIR = Path("/home/brian/ltx-runs/ltx2_3_av_lora_448_distilled_r64/test_distilled_only")
-
-
-def merge_base_lora(transformer: torch.nn.Module, lora_path: str, strength: float) -> int:
-    lora_sd_raw = load_file(lora_path)
-    prefix = "diffusion_model."
-    lora_sd = {
-        (k[len(prefix):] if k.startswith(prefix) else k): v
-        for k, v in lora_sd_raw.items()
-    }
-
-    params = dict(transformer.named_parameters())
-    cpu = torch.device("cpu")
-    merged = 0
-    for key, p in params.items():
-        if not key.endswith(".weight"):
-            continue
-        base_key = key[:-len(".weight")]
-        a_key = f"{base_key}.lora_A.weight"
-        b_key = f"{base_key}.lora_B.weight"
-        if a_key not in lora_sd or b_key not in lora_sd:
-            continue
-        a = lora_sd[a_key].to(device=cpu, dtype=p.dtype)
-        b = lora_sd[b_key].to(device=cpu, dtype=p.dtype)
-        p.data.addmm_(b * strength, a)
-        merged += 1
-    return merged
 
 
 def load_trained_lora(transformer, lora_path: str):
@@ -157,11 +131,7 @@ def main() -> None:
         audio_context_negative=a_ctx_neg,
     )
 
-    # --- Phase 2: merge LoRA on CPU, then activate block offloading ---
-    print(f"Merging distilled LoRA (strength={BASE_LORA_STRENGTH})...")
-    merged = merge_base_lora(transformer, BASE_LORA_PATH, BASE_LORA_STRENGTH)
-    print(f"  Merged {merged} targets")
-
+    # --- Phase 2: set up LoRA + block offloading ---
     if trained_lora_path is not None:
         print(f"Loading trained LoRA from {trained_lora_path}...")
         transformer = load_trained_lora(transformer, trained_lora_path)
@@ -178,6 +148,13 @@ def main() -> None:
         layers_attr="transformer_blocks",
         blocks_to_swap=BLOCKS_TO_SWAP,
     )
+
+    print(f"Attaching distilled LoRA via set_loras (strength={BASE_LORA_STRENGTH})...")
+    lora_sd = load_file(BASE_LORA_PATH)
+    base_lora = LoRA(lora_sd)
+    print(f"  LoRA: {len(base_lora.targets)} targets, {base_lora.cache_bytes / 1e9:.2f} GB pinned")
+    offloader.set_loras([(base_lora, BASE_LORA_STRENGTH)])
+
     offloader.activate()
 
     # --- Phase 3: generate ---
