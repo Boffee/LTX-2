@@ -20,14 +20,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from .lora import (
-    KeyTransformT,
-    LoRA,
-    LoRATransform,
-    concat_lora_factors,
-    default_key_transform,
-    pair_and_validate,
-)
+from .lora import LoRA, LoRATransform
 from .pinned_buffer import PinnedParamBuffer, storage_key
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategyComponent, SlotOwnership
@@ -73,11 +66,6 @@ class BlockOffloader:
         Forwarded to each :class:`StreamedWeights`. When True (default),
         non-homogeneous groups raise at construction. Pass False for
         the per-load-allocation fallback.
-    key_transform:
-        Applied to LoRA state-dict base keys before matching against
-        model parameter names. Defaults to stripping the
-        ``diffusion_model.`` prefix common in ComfyUI LoRA files.
-        Pass ``None`` to disable.
     """
 
     def __init__(
@@ -89,7 +77,6 @@ class BlockOffloader:
         blocks_to_swap: int | Sequence[int],
         prefetch_count: int | Sequence[int] = 2,
         strict_homogeneous: bool = True,
-        key_transform: KeyTransformT = default_key_transform,
     ) -> None:
         layer_paths: list[str] = (
             [layers_attr] if isinstance(layers_attr, str) else list(layers_attr)
@@ -147,7 +134,6 @@ class BlockOffloader:
 
         self._model = model
         self._target_device = target_device
-        self._key_transform = key_transform
         self._layer_paths = layer_paths
         self._components = components
         self._streamers = streamers
@@ -157,24 +143,18 @@ class BlockOffloader:
         self._reverse_index = self._build_reverse_index(
             streamers, layer_paths, non_block,
         )
-        self._lora_factor_bytes: int = 0
 
     # ------------------------------------------------------------------ API
 
     def set_loras(self, loras: Sequence[LoRA]) -> None:
         """Replace all LoRAs. Must be called while deactivated.
 
-        Processes flat safetensors state dicts: applies
-        ``key_transform``, pairs A/B factors, matches to model
-        parameters via the reverse index, concatenates per target,
-        and attaches a :class:`LoRATransform` to each matched
-        :class:`PinnedParamBuffer`.
+        Matches each :class:`LoRA`'s pre-pinned factors against model
+        parameters via the reverse index and attaches a lightweight
+        :class:`LoRATransform` (references only, no pinning) to each
+        matched :class:`PinnedParamBuffer`.
 
         Pass an empty sequence to clear all LoRAs (base-only forward).
-        Replacement is destructive: existing LoRA transforms are cleared
-        before the new stack is validated and built, so a validation error
-        leaves the offloader in base-only mode. This avoids briefly
-        holding old and new pinned LoRA factors at the same time.
         """
         if self._teardown_stack is not None:
             raise RuntimeError(
@@ -183,38 +163,37 @@ class BlockOffloader:
             )
         for buf in self._reverse_index.values():
             buf.transform = None
-        self._lora_factor_bytes = 0
 
         if not loras:
             return
 
-        shape_index: dict[str, tuple[int, ...]] = {
-            name: tuple(buf.cpu_param.shape)
-            for name, buf in self._reverse_index.items()
-        }
-        raw = pair_and_validate(loras, shape_index, self._key_transform)
-
-        pending: dict[str, LoRATransform] = {}
-        for target_key, factors in raw.items():
-            buf = self._reverse_index[target_key]
-            if buf.cpu_param.dtype not in (torch.bfloat16, torch.float16):
-                raise ValueError(
-                    f"LoRA target {target_key!r} has dtype "
-                    f"{buf.cpu_param.dtype}; addmm_ merge requires "
-                    f"bf16/fp16. Use PEFT routed mode for quantized params."
+        addmm_dtypes = (torch.bfloat16, torch.float16, torch.float32)
+        per_target: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]] = {}
+        for lora in loras:
+            for target_key, (a, b) in lora.targets.items():
+                buf = self._reverse_index.get(target_key)
+                if buf is None:
+                    continue
+                expected = tuple(buf.cpu_param.shape)
+                if expected != (b.shape[0], a.shape[1]):
+                    raise ValueError(
+                        f"LoRA factor shape mismatch for {target_key!r}: "
+                        f"B@A produces ({b.shape[0]}, {a.shape[1]}), "
+                        f"target shape is {expected}."
+                    )
+                if buf.cpu_param.dtype not in addmm_dtypes:
+                    raise ValueError(
+                        f"LoRA target {target_key!r} has dtype "
+                        f"{buf.cpu_param.dtype}; addmm_ merge requires "
+                        f"bf16, fp16, or fp32. Use PEFT routed mode "
+                        f"for quantized params."
+                    )
+                per_target.setdefault(target_key, []).append(
+                    (a, b, lora.strength)
                 )
-            pair = concat_lora_factors(
-                factors, buf.cpu_param.dtype, torch.device("cpu"),
-            )
-            if pair is None:
-                continue
-            a_cat, b_cat = pair
-            transform = LoRATransform(a_cat, b_cat)
-            pending[target_key] = transform
 
-        for target_key, transform in pending.items():
-            self._reverse_index[target_key].transform = transform
-            self._lora_factor_bytes += transform.nbytes
+        for target_key, refs in per_target.items():
+            self._reverse_index[target_key].transform = LoRATransform(refs)
 
     # ------------------------------------------------- ModelStrategy interface
 
@@ -224,10 +203,7 @@ class BlockOffloader:
 
     @property
     def cache_bytes(self) -> int:
-        return (
-            sum(c.cache_bytes for c in self._components)
-            + self._lora_factor_bytes
-        )
+        return sum(c.cache_bytes for c in self._components)
 
     def activate(self) -> None:
         with contextlib.ExitStack() as stack:
