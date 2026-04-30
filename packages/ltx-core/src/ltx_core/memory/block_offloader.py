@@ -146,11 +146,12 @@ class BlockOffloader:
 
     # ------------------------------------------------------------------ API
 
-    def set_loras(self, loras: Sequence[LoRA]) -> None:
+    def set_loras(self, loras: Sequence[tuple[LoRA, float]]) -> None:
         """Replace all LoRAs. Must be called while deactivated.
 
-        Matches each :class:`LoRA`'s pre-pinned factors against model
-        parameters via the reverse index and attaches a lightweight
+        Each entry is a ``(lora, strength)`` tuple. Matches each
+        :class:`LoRA`'s pre-pinned factors against model parameters via
+        the reverse index and attaches a lightweight
         :class:`LoRATransform` (references only, no pinning) to each
         matched :class:`PinnedParamBuffer`.
 
@@ -169,7 +170,7 @@ class BlockOffloader:
 
         addmm_dtypes = (torch.bfloat16, torch.float16, torch.float32)
         per_target: dict[str, list[tuple[torch.Tensor, torch.Tensor, float]]] = {}
-        for lora in loras:
+        for lora, strength in loras:
             for target_key, (a, b) in lora.targets.items():
                 buf = self._reverse_index.get(target_key)
                 if buf is None:
@@ -189,7 +190,7 @@ class BlockOffloader:
                         f"for quantized params."
                     )
                 per_target.setdefault(target_key, []).append(
-                    (a, b, lora.strength)
+                    (a, b, strength)
                 )
 
         for target_key, refs in per_target.items():

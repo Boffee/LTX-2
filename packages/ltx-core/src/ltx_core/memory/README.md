@@ -134,8 +134,8 @@ offloader = BlockOffloader(
 
 # Attach LoRAs (must be called while deactivated)
 offloader.set_loras([
-    LoRA(state_dict=load_file("lora_a.safetensors"), strength=0.8),
-    LoRA(state_dict=load_file("lora_b.safetensors"), strength=0.5),
+    (LoRA(state_dict=load_file("lora_a.safetensors")), 0.8),
+    (LoRA(state_dict=load_file("lora_b.safetensors")), 0.5),
 ])
 
 with offloader as gpu_model:

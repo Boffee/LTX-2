@@ -42,23 +42,21 @@ class LoRA:
     Factors are paired, validated, and pinned to host memory at
     construction.  The raw ``state_dict`` is not retained.
 
-    ``strength`` is mutable.  Changes take effect on the next
-    ``set_loras()`` call (which is lightweight — no re-pinning).
+    Strength is extrinsic — specify it when passing the adapter to
+    :meth:`BlockOffloader.set_loras` as a ``(LoRA, strength)`` tuple.
 
     ``key_transform`` is applied to state-dict keys before pairing.
     Defaults to stripping the ``diffusion_model.`` prefix common in
     ComfyUI LoRA files.  Pass ``None`` to disable.
     """
 
-    __slots__ = ("_factors", "strength")
+    __slots__ = ("_factors",)
 
     def __init__(
         self,
         state_dict: dict[str, torch.Tensor],
-        strength: float = 1.0,
         key_transform: KeyTransformT = default_key_transform,
     ) -> None:
-        self.strength = strength
         self._factors = _pair_and_pin(state_dict, key_transform)
 
     @property

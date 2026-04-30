@@ -14,12 +14,12 @@ class ConfigBaseModel(BaseModel):
 
 
 class BaseLoraConfig(ConfigBaseModel):
-    """A pre-trained LoRA to merge into the base transformer weights.
+    """A pre-trained LoRA to apply on top of the base transformer weights.
 
-    Loaded once at startup and merged in place via
-    ``target += strength * (B @ A)`` per target layer, matching the LTX
-    inference fuse path (no alpha/rank scaling). The file is consumed --
-    the trainer holds no reference to it after the merge runs.
+    Factors are pinned once at startup and merged dynamically during DMA
+    via ``BlockOffloader.set_loras()``. Validation strength adjustment
+    is handled by deactivating the offloader, updating the strength, and
+    reactivating. Requires block offloading (``blocks_to_swap > 0``).
     """
 
     path: str | Path = Field(
