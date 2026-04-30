@@ -211,7 +211,11 @@ class LtxvTrainer:
                     output = self._training_step(batch)
                     self._accelerator.backward(output.loss.mean())
 
-                    if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
+                    if (
+                        self._accelerator.sync_gradients
+                        and cfg.optimization.max_grad_norm > 0
+                        and cfg.optimization.optimizer_type not in ("prodigy_plus",)
+                    ):
                         self._accelerator.clip_grad_norm_(
                             self._trainable_params,
                             cfg.optimization.max_grad_norm,
@@ -282,6 +286,11 @@ class LtxvTrainer:
                             "train/step_time": step_time,
                             "train/global_step": self._global_step,
                         }
+                        pg0 = self._optimizer.param_groups[0]
+                        if "d" in pg0:
+                            metrics["train/prodigy_d"] = pg0["d"]
+                        if "effective_lr" in pg0:
+                            metrics["train/effective_lr"] = pg0["effective_lr"]
                         metrics.update(self._sigma_tracker.get_metrics())
                         self._log_metrics(metrics)
 
@@ -862,12 +871,12 @@ class LtxvTrainer:
         elif opt_cfg.optimizer_type == "prodigy_plus":
             from prodigyplus import ProdigyPlusScheduleFree  # noqa: PLC0415
 
+            logger.info(f"ProdigyPlus: prodigy_steps={opt_cfg.prodigy_steps}")
             optimizer = ProdigyPlusScheduleFree(
                 param_groups,
                 lr=lr,
-                betas=(0.9, 0.99),
-                weight_decay=0.01,
-                use_bias_correction=True,
+                betas=(0.95, 0.99),
+                prodigy_steps=opt_cfg.prodigy_steps,
             )
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
@@ -876,6 +885,17 @@ class LtxvTrainer:
 
         # noinspection PyTypeChecker
         self._optimizer, self._lr_scheduler = self._accelerator.prepare(optimizer, lr_scheduler)
+
+    def _set_optimizer_mode(self, *, training: bool) -> None:
+        """Switch schedule-free optimizers between train/inference mode."""
+        opt = self._optimizer.optimizer if hasattr(self._optimizer, "optimizer") else self._optimizer
+        if not hasattr(opt, "train") or not callable(getattr(opt, "train")):
+            return
+        if training:
+            opt.train()
+        else:
+            # ProdigyPlusScheduleFree exposes .eval() for inference mode
+            opt.eval()
 
     def _cast_prodigy_states_to_bf16(self) -> None:
         """Cast Prodigy optimizer states from fp32 to bf16 after first step."""
@@ -1022,6 +1042,9 @@ class LtxvTrainer:
         self._optimizer.zero_grad(set_to_none=True)
         free_gpu_memory()
 
+        # Schedule-free optimizers need mode switching for correct param interpolation
+        self._set_optimizer_mode(training=False)
+
         base_lora_cfg = self._config.model.base_lora
         val_strength = base_lora_cfg.validation_strength if base_lora_cfg else None
         if val_strength is not None:
@@ -1041,6 +1064,8 @@ class LtxvTrainer:
             self._model_offloader.deactivate()
             self._model_offloader.set_loras([(self._base_lora, base_lora_cfg.strength)])
             self._model_offloader.activate()
+
+        self._set_optimizer_mode(training=True)
 
         return result
 

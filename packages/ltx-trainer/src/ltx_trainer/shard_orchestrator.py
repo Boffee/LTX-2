@@ -315,9 +315,6 @@ class ShardOrchestrator:
         key = _SCHEDULER_TOTAL_KEY.get(cfg.optimization.scheduler_type)
         if key is not None:
             params = dict(cfg.optimization.scheduler_params)
-            # cosine_with_warmup pins both warmup_steps and T_max so the trainer's
-            # per-shard default (steps // 20 — small under sharding) doesn't
-            # silently undercut the curve length pinned for the full run.
             if cfg.optimization.scheduler_type == "cosine_with_warmup":
                 params.setdefault("warmup_steps", min(300, max(1, total_steps // 20)))
             default = _scheduler_default_from_total(cfg.optimization.scheduler_type, total_steps, params)

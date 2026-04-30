@@ -181,6 +181,13 @@ class OptimizationConfig(ConfigBaseModel):
         description="Type of optimizer to use for training",
     )
 
+    prodigy_steps: int = Field(
+        default=1500,
+        ge=1,
+        description="Number of steps for Prodigy LR adaptation before freezing. "
+        "Only used with prodigy_plus optimizer.",
+    )
+
     scheduler_type: Literal[
         "constant",
         "linear",
