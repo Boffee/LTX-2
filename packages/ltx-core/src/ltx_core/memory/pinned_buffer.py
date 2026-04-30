@@ -42,7 +42,7 @@ def storage_key(t: torch.Tensor) -> tuple[Any, ...]:
 
     Used by :class:`~ltx_core.memory.PinnedWeights` (for handle-level
     dedup of tied frozen params) and
-    :func:`~ltx_core.memory.BlockOffloader` (for cross-region
+    :func:`~ltx_core.memory.ModelOffloader` (for cross-region
     tied-weight detection across blocks and non-block modules).
 
     Dispatches to the matching adapter so each tensor type contributes

@@ -15,7 +15,7 @@ into its own package when a second consumer appears.
 | `protocols.py` | `ModelStrategy` / `ModelStrategyComponent` plug-in contracts; `SlotOwnership` skip-filter type |
 | `pinned_weights.py` | `PinnedWeights` — whole-model bulk pinned-CPU↔GPU strategy |
 | `streamed_weights.py` | `StreamedWeights` — sharp per-block-list streaming primitive (component) |
-| `block_offloader.py` | `BlockOffloader` — unified composite: block streaming + non-block pinning + trainable params + optional LoRA merge |
+| `model_offloader.py` | `ModelOffloader` — unified composite: block streaming + non-block pinning + trainable params + optional LoRA merge |
 | `trainable_weights.py` | `TrainableWeights` — identity-preserving trainable parameter mover |
 | `lora.py` | `LoRA`, `LoRATransform` — per-weight LoRA merge transform + factor pairing/validation |
 | `pinned_buffer.py` | `PinnedParamBuffer` — per-tensor pinning primitive (handles quanto) |
@@ -50,7 +50,7 @@ This library gives you:
 | Situation | Use |
 |---|---|
 | Model fits on GPU when active; want fast eviction between calls | **`PinnedWeights`** — bulk DMA, ~200 ms for 12 GB at PCIe Gen5 x16 |
-| Model too big for GPU even when active | **`BlockOffloader`** — streams transformer blocks via forward hooks |
+| Model too big for GPU even when active | **`ModelOffloader`** — streams transformer blocks via forward hooks |
 | Multiple models swap in/out across a script | Wrap each in a strategy, hand to **`ModelCache`** |
 
 ## Quick start: PinnedWeights
@@ -89,10 +89,10 @@ and a CUDA-stream-based async prefetcher.
 
 ```python
 import torch
-from ltx_core.memory import BlockOffloader
+from ltx_core.memory import ModelOffloader
 
 # Constructor pins everything; cache_bytes is final immediately.
-offloader = BlockOffloader(
+offloader = ModelOffloader(
     model,
     target_device=torch.device("cuda"),
     layers_attr="transformer_blocks",  # path to the nn.ModuleList
@@ -112,7 +112,7 @@ component — backward through them is unaffected by the offload.
 
 ### LoRA merge
 
-`BlockOffloader` supports optional per-weight LoRA merging via
+`ModelOffloader` supports optional per-weight LoRA merging via
 `set_loras()`. LoRA factors are attached as transforms on
 `PinnedParamBuffer` objects and applied automatically after DMA —
 both block-streamed and non-block weights get merged for free.
@@ -122,10 +122,10 @@ the offloader is left in base-only mode; this avoids briefly holding
 both old and new pinned LoRA factors in host memory.
 
 ```python
-from ltx_core.memory import BlockOffloader, LoRA
+from ltx_core.memory import ModelOffloader, LoRA
 from safetensors.torch import load_file
 
-offloader = BlockOffloader(
+offloader = ModelOffloader(
     model,
     target_device=torch.device("cuda"),
     layers_attr="transformer_blocks",
@@ -157,7 +157,7 @@ streaming group with its own slot pool — no per-load `cudaMalloc`
 fallback:
 
 ```python
-offloader = BlockOffloader(
+offloader = ModelOffloader(
     model,
     target_device=torch.device("cuda"),
     layers_attr=["transformer_blocks", "single_transformer_blocks"],
@@ -227,7 +227,7 @@ with cache.use(spec) as vae:  # registers if missing, then uses
             ┌───────────────────┴────────────────────┐
             │                                        │
    ┌────────▼─────────┐                ┌─────────────▼──────────────┐
-   │  PinnedWeights   │                │      BlockOffloader        │
+   │  PinnedWeights   │                │      ModelOffloader        │
    │  whole-model DMA │                │   (composes components)    │
    └────────┬─────────┘                └─────────────┬──────────────┘
             │                                        │
@@ -324,7 +324,7 @@ Both strategies handle the standard `tie_weights()` pattern (one
 `Parameter` referenced under multiple names) plus the rarer case of
 distinct quanto wrappers around shared inner `_data` storage.
 
-`BlockOffloader` rejects (at construction) tied weights that
+`ModelOffloader` rejects (at construction) tied weights that
 span streamed regions — block↔block, block↔non-block, or mixed
 trainable/frozen across regions. Slot-local block streaming can't
 preserve cross-region tying. Use whole-model `PinnedWeights` for

@@ -7,7 +7,7 @@ retained — this object owns the only copy of the pinned factors.
 :class:`LoRATransform` holds lightweight references to LoRA-owned
 pinned factors and applies the merge via in-place ``addmm_`` after DMA.
 
-:class:`~ltx_core.memory.BlockOffloader` is the consumer-facing API:
+:class:`~ltx_core.memory.ModelOffloader` is the consumer-facing API:
 its ``set_loras`` method matches LoRA targets to model parameters and
 attaches a :class:`LoRATransform` per matched weight.  The transform
 fires automatically when the buffer copies to GPU.
@@ -43,7 +43,7 @@ class LoRA:
     construction.  The raw ``state_dict`` is not retained.
 
     Strength is extrinsic — specify it when passing the adapter to
-    :meth:`BlockOffloader.set_loras` as a ``(LoRA, strength)`` tuple.
+    :meth:`ModelOffloader.set_loras` as a ``(LoRA, strength)`` tuple.
 
     ``key_transform`` is applied to state-dict keys before pairing.
     Defaults to stripping the ``diffusion_model.`` prefix common in

@@ -113,12 +113,12 @@ def tear_down_trainer(trainer: "LtxvTrainer") -> None:
     allocations are also freed.
     """
     try:
-        offloader = getattr(trainer, "_block_offloader", None)
+        offloader = getattr(trainer, "_model_offloader", None)
         if offloader is not None:
             offloader.deactivate()  # remove hooks, return slots to pinned-CPU
         # Drop optimizer/scheduler/model refs first so their tensors are
         # freed back to the allocator before the streamer's finalizer
-        # runs ``empty_cache()`` (which fires when ``_block_offloader``
+        # runs ``empty_cache()`` (which fires when ``_model_offloader``
         # is dropped below).
         for attr in ("_optimizer", "_lr_scheduler", "_transformer",
                      "_text_encoder", "_embeddings_processor",
@@ -126,7 +126,7 @@ def tear_down_trainer(trainer: "LtxvTrainer") -> None:
             if hasattr(trainer, attr):
                 setattr(trainer, attr, None)
         if offloader is not None:
-            trainer._block_offloader = None  # triggers streamer finalize
+            trainer._model_offloader = None  # triggers streamer finalize
         gc.collect()
     except Exception as e:  # noqa: BLE001
         logger.warning(f"⚠️  Trainer teardown encountered {type(e).__name__}: {e}")

@@ -17,7 +17,7 @@ from pathlib import Path
 from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
 from safetensors.torch import load_file
 
-from ltx_core.memory import BlockOffloader
+from ltx_core.memory import ModelOffloader
 from ltx_trainer.model_loader import load_embeddings_processor, load_model, load_text_encoder
 from ltx_trainer.progress import StandaloneSamplingProgress
 from ltx_trainer.validation_sampler import (
@@ -172,7 +172,7 @@ def main() -> None:
     transformer.requires_grad_(False)
 
     print(f"Setting up block offloading ({BLOCKS_TO_SWAP} blocks on CPU)...")
-    offloader = BlockOffloader(
+    offloader = ModelOffloader(
         base_transformer,
         target_device=device,
         layers_attr="transformer_blocks",

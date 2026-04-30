@@ -160,7 +160,7 @@ def make_config(
 
 def _verify_offloader(trainer, blocks_to_swap: int) -> None:
     """Check offloader invariants after a training step."""
-    strategy = trainer._block_offloader
+    strategy = trainer._model_offloader
     assert strategy is not None, "Offloader should be active"
 
     # The new API: strategy has _components; the last component is the

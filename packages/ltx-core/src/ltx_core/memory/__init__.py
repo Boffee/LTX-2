@@ -2,7 +2,7 @@
 
 Two complementary offload strategies:
 
-- :class:`BlockOffloader` — per-block streaming with optional LoRA
+- :class:`ModelOffloader` — per-block streaming with optional LoRA
   merge and trainable-parameter support. Use for models whose
   individual blocks fit on GPU but the whole model does not.
   Hooks-based, prefetches upcoming blocks on a secondary CUDA stream,
@@ -21,7 +21,7 @@ Both classes share the underlying per-parameter pinned storage from
 + optional quanto ``WeightQBytesTensor`` decomposition), so quantized
 models work with either.
 
-Both :class:`PinnedWeights` and :class:`BlockOffloader` implement the
+Both :class:`PinnedWeights` and :class:`ModelOffloader` implement the
 :class:`ModelStrategy` Protocol — the plug-in contract for
 storage/placement strategies that :class:`ModelCache` consumes.
 
@@ -30,7 +30,7 @@ immediately and :class:`ModelCache` can admit them without a
 factory-side ``prepare()`` dance. ``activate()`` then brings
 everything to GPU; ``deactivate()`` returns to pinned CPU.
 
-:class:`BlockOffloader` composes (in order):
+:class:`ModelOffloader` composes (in order):
   1. A non-block :class:`PinnedWeights` with a :class:`SlotOwnership`
      skip filter for everything outside the block list.
   2. A :class:`TrainableWeights` for LoRA / adapter weights.
@@ -39,7 +39,7 @@ everything to GPU; ``deactivate()`` returns to pinned CPU.
 Optional LoRA merging is handled by attaching
 :class:`~ltx_core.memory.LoRATransform` objects to individual
 :class:`~ltx_core.memory.PinnedParamBuffer` instances via
-:meth:`BlockOffloader.set_loras`. The transform fires automatically
+:meth:`ModelOffloader.set_loras`. The transform fires automatically
 when the buffer copies to GPU — no separate merge strategy needed.
 
 Cross-region tied parameters (block <-> non-block, cross-block, or
@@ -58,7 +58,7 @@ Compatibility
 - **Single-thread / sequential.** No internal locking.
 """
 
-from .block_offloader import BlockOffloader, detect_streaming_region_ties
+from .model_offloader import ModelOffloader, detect_streaming_region_ties
 from .lora import LoRA, LoRATransform
 from .model_cache import (
     ActivationError,
@@ -77,7 +77,7 @@ from .trainable_weights import TrainableWeights
 
 __all__ = [
     "ActivationError",
-    "BlockOffloader",
+    "ModelOffloader",
     "DuplicateModelKeyError",
     "LoRA",
     "LoRATransform",

@@ -14,10 +14,10 @@ This is the sharp, low-level primitive. It does NOT manage:
 - Trainable parameter movement — caller handles a separate
   :class:`~ltx_core.memory.trainable_weights.TrainableWeights`.
 - Cross-region tied-weight detection — that's a composer concern
-  (see :func:`BlockOffloader` /
-  :class:`~ltx_core.memory.block_offloader.BlockOffloader`).
+  (see :func:`ModelOffloader` /
+  :class:`~ltx_core.memory.model_offloader.ModelOffloader`).
 
-Most users want :func:`BlockOffloader` (the blessed safe
+Most users want :func:`ModelOffloader` (the blessed safe
 API). Reach for :class:`StreamedWeights` directly only when you need
 bespoke composition (e.g., multiple block lists like Flux's
 ``transformer_blocks`` + ``single_transformer_blocks``).
@@ -206,7 +206,7 @@ class _BlockPinnedStore:
                         f"StreamedWeights cannot manage trainable slot {s.name!r}: "
                         "streaming swaps slot Parameters with frozen pool "
                         "wrappers, breaking optimizer identity. Use "
-                        "BlockOffloader (which partitions trainables "
+                        "ModelOffloader (which partitions trainables "
                         "into TrainableWeights automatically), or pass the "
                         "slot in skip_slots and route it to a separate "
                         "trainable mover."
@@ -434,12 +434,12 @@ class StreamedWeights:
     are the composer's responsibility.
 
     A :class:`StreamedWeights` is a *component* meant to be composed
-    inside a :class:`~ltx_core.memory.block_offloader.BlockOffloader`.
+    inside a :class:`~ltx_core.memory.model_offloader.ModelOffloader`.
     It deliberately does NOT implement
     :class:`~ltx_core.memory.protocols.ModelStrategy` (its
     :meth:`activate` returns ``None`` because it doesn't own the
     model). For top-level use, build a strategy via
-    :func:`~ltx_core.memory.block_offloader.BlockOffloader`.
+    :func:`~ltx_core.memory.model_offloader.ModelOffloader`.
 
     Lifecycle is uniform with :class:`PinnedWeights`: ``__init__``
     pins (so ``cache_bytes`` is final at construction time, ready
@@ -481,8 +481,8 @@ class StreamedWeights:
         When False, falls back to per-load ``cudaMalloc`` allocation
         — slow but works for heterogeneous configurations. Use
         multiple :class:`StreamedWeights`s (one per homogeneous group)
-        with :func:`BlockOffloader` /
-        :class:`BlockOffloader` to get the pool benefit on
+        with :func:`ModelOffloader` /
+        :class:`ModelOffloader` to get the pool benefit on
         heterogeneous models like Flux.
     skip_slots:
         Optional set of :class:`SlotOwnership` tuples identifying
@@ -537,7 +537,7 @@ class StreamedWeights:
                 "Either pass strict_homogeneous=False to opt into the "
                 "slower per-load allocation fallback, or split into "
                 "multiple StreamedWeights instances — one per homogeneous group — "
-                "and compose with BlockOffloader()."
+                "and compose with ModelOffloader()."
             )
         store.apply_slot_mutations()
         self._store: _BlockPinnedStore | None = store
@@ -575,7 +575,7 @@ class StreamedWeights:
     def param_bufs_per_block(self) -> list[list[PinnedParamBuffer]]:
         """Per-block lists of :class:`PinnedParamBuffer` objects.
 
-        Used by :class:`~ltx_core.memory.BlockOffloader` to build a
+        Used by :class:`~ltx_core.memory.ModelOffloader` to build a
         reverse index from parameter qualified names to their buffers.
         """
         assert self._store is not None

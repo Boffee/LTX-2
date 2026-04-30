@@ -1,5 +1,5 @@
 """Equivalence test: the ``LoRA`` factor pairing and key transform used by the
-trainer (via ``BlockOffloader.set_loras``) must produce the same merged
+trainer (via ``ModelOffloader.set_loras``) must produce the same merged
 weights as the inference fuse path (``ltx_core.loader.fuse_loras.apply_loras``).
 """
 

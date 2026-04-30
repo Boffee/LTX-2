@@ -44,7 +44,7 @@ class StubDiffusionStage:
         self._build_count += 1
         # Mimic the LTX shape: outer X0Model wrapping a velocity_model
         # that holds transformer_blocks. Lets streaming-mode tests
-        # exercise BlockOffloader introspection.
+        # exercise ModelOffloader introspection.
         velocity = nn.Module()
         velocity.transformer_blocks = nn.ModuleList(
             [nn.Linear(4, 4, bias=False) for _ in range(2)]

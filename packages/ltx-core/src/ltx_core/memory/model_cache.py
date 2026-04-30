@@ -11,7 +11,7 @@ Design highlights
 - **Strategy-agnostic.** The cache only talks to the
   :class:`ModelStrategy` protocol — three lifecycle methods plus
   ``cache_bytes`` accounting. Pluggable: today :class:`PinnedWeights`
-  and :func:`BlockOffloader`; future strategies (disk-mmap, NVMe-paged,
+  and :func:`ModelOffloader`; future strategies (disk-mmap, NVMe-paged,
   multi-GPU shard) just satisfy the protocol.
 - **Active-set with refcount.** Multiple keys can be active
   simultaneously (e.g. text encoder and embedding processor in the
@@ -197,7 +197,7 @@ class ActivationError(ModelCacheError):
     (drops the strategy reference, removes it from cache state) regardless
     of whether the entry was freshly built or previously cached —
     strategies with multi-step ``activate()`` (e.g.
-    :func:`BlockOffloader`) can fail mid-way after partially
+    :func:`ModelOffloader`) can fail mid-way after partially
     installing hooks/pool/composed PinnedWeights, and caching such an
     entry as "ready to retry" lies about its state. The next acquire
     rebuilds via the registered factory."""

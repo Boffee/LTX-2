@@ -2,11 +2,11 @@
 
 Composes block streaming, non-block pinning, trainable parameter
 movement, and optional per-weight LoRA transforms into a single
-:class:`BlockOffloader` class.
+:class:`ModelOffloader` class.
 
 Also provides :func:`detect_streaming_region_ties`
 (construction-time validation), used internally by
-:class:`BlockOffloader` and exported for direct use / testing.
+:class:`ModelOffloader` and exported for direct use / testing.
 """
 
 from __future__ import annotations
@@ -31,12 +31,12 @@ from .trainable_weights import TrainableWeights
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "BlockOffloader",
+    "ModelOffloader",
     "detect_streaming_region_ties",
 ]
 
 
-class BlockOffloader:
+class ModelOffloader:
     """Stream transformer blocks between pinned CPU and GPU with
     optional LoRA merge and trainable-parameter support.
 
@@ -159,7 +159,7 @@ class BlockOffloader:
         """
         if self._teardown_stack is not None:
             raise RuntimeError(
-                "BlockOffloader.set_loras() requires the offloader "
+                "ModelOffloader.set_loras() requires the offloader "
                 "to be inactive. Call deactivate() first."
             )
         for buf in self._reverse_index.values():
@@ -261,7 +261,7 @@ class BlockOffloader:
 
 
 # ---------------------------------------------------------------------------
-# Module-private helpers (used only by BlockOffloader constructor)
+# Module-private helpers (used only by ModelOffloader constructor)
 # ---------------------------------------------------------------------------
 
 

@@ -34,10 +34,10 @@ Strategy choice per component
 - **Transformer**: follows the pipeline's per-call
   ``streaming_prefetch_count`` kwarg. ``None`` →
   :class:`PinnedWeights` (whole-model bulk DMA); ``int`` →
-  :func:`BlockOffloader` (per-block streaming). Cache key includes
+  :func:`ModelOffloader` (per-block streaming). Cache key includes
   ``stream{N}`` vs ``pinned`` so toggling on the same block instance
   produces distinct entries. Streaming-mode caching relies on
-  :func:`BlockOffloader` handling direct frozen parameters on parent
+  :func:`ModelOffloader` handling direct frozen parameters on parent
   modules (e.g. LTX's ``velocity_model.scale_shift_table``) via the
   composed-PinnedWeights skip filter.
 - **Text encoder**: always :class:`PinnedWeights`. The pipeline's
@@ -90,7 +90,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from ltx_core.memory.block_offloader import BlockOffloader
+from ltx_core.memory.model_offloader import ModelOffloader
 from ltx_core.memory.model_cache import ModelCache, ModelInUseError, ModelSpec
 from ltx_core.memory.pinned_weights import PinnedWeights
 from ltx_core.memory.protocols import ModelStrategy
@@ -158,7 +158,7 @@ def install_model_cache(
     - **Transformer**: follows the pipeline's per-call
       ``streaming_prefetch_count`` kwarg. ``None`` →
       :class:`PinnedWeights` (whole-model bulk DMA); ``int`` →
-      :func:`BlockOffloader` (per-block streaming).
+      :func:`ModelOffloader` (per-block streaming).
     - **Text encoder**: always :class:`PinnedWeights`. Streaming a
       text encoder doesn't make sense — they fit on GPU, are used
       one-shot per prompt, and per-block hook overhead doesn't
@@ -457,7 +457,7 @@ def _patched_transformer_ctx(
         model = block._build_transformer(device=torch.device("cpu"))
         if streaming_prefetch_count is None:
             return PinnedWeights(model, target_device)
-        # Streaming: BlockOffloader handles direct parent params
+        # Streaming: ModelOffloader handles direct parent params
         # (e.g. LTX's velocity_model.scale_shift_table) via the
         # composed PinnedWeights with a skip filter, so streaming-mode
         # models are cacheable. Pinning happens inside the factory
@@ -465,7 +465,7 @@ def _patched_transformer_ctx(
         layers_attr = "velocity_model.transformer_blocks"
         layer_list = _resolve_block_list(model, layers_attr, cls.__name__)
         num_layers = len(layer_list)
-        return BlockOffloader(
+        return ModelOffloader(
             model,
             target_device=target_device,
             layers_attr=layers_attr,

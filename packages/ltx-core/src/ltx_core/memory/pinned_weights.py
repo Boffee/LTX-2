@@ -6,7 +6,7 @@ of re-reading the safetensors from disk (~3-5 s per call).
 
 Use case: a model that fits on GPU when active but should be evicted
 between calls — text encoder during diffusion, VAE between encode and
-decode phases, etc. Different from :func:`BlockOffloader`: no per-block
+decode phases, etc. Different from :func:`ModelOffloader`: no per-block
 streaming, no forward hooks, no LRU. The whole model goes to GPU on
 :meth:`PinnedWeights.activate` and the GPU storage is released on
 :meth:`PinnedWeights.deactivate` by repointing each module's parameter
@@ -113,7 +113,7 @@ class PinnedWeights:
 
     Buffer-only modules (only registered buffers, no frozen params)
     are valid — common for sibling tables like RoPE/positional
-    embeddings managed via :func:`BlockOffloader`'s non-block
+    embeddings managed via :func:`ModelOffloader`'s non-block
     composition. Construction raises only if there is *nothing* to
     manage — neither frozen params nor (with ``include_buffers=True``)
     registered buffers.
@@ -133,7 +133,7 @@ class PinnedWeights:
     skip_slots:
         Optional set of :class:`SlotOwnership` tuples identifying
         ``(parent_module, leaf, kind)`` slots to skip during the
-        walk. Used by composers like :class:`BlockOffloader`
+        walk. Used by composers like :class:`ModelOffloader`
         that want to hand the *outer* model to PinnedWeights but
         manage some subset of slots themselves (block-streamed slots,
         trainable slots routed to a separate mover). Skipped slots are
@@ -157,7 +157,7 @@ class PinnedWeights:
         self._skip_slots: set[SlotOwnership] = skip_slots or set()
 
         # Auto-move to CPU so pin_memory() succeeds. Matches the
-        # behavior of BlockOffloader — caller doesn't need to
+        # behavior of ModelOffloader — caller doesn't need to
         # remember the build-time device dance.
         model.to("cpu")
 
@@ -186,14 +186,14 @@ class PinnedWeights:
         # buffers. Buffer-only modules (e.g., a pure RoPE/positional
         # table sibling) are valid: PinnedWeights still gives them
         # pinned-CPU storage and the activate/deactivate round-trip,
-        # which is exactly what BlockOffloader non-block composition
+        # which is exactly what ModelOffloader non-block composition
         # needs.
         if not self._slots and not self._buffer_slots:
             raise ValueError(
                 "PinnedWeights requires at least one frozen parameter or, "
                 "when include_buffers=True, at least one registered buffer "
                 "to cache. The wrapped model has neither — for training "
-                "flows use ltx_core.memory.BlockOffloader instead, or "
+                "flows use ltx_core.memory.ModelOffloader instead, or "
                 "leave the model unwrapped."
             )
 
@@ -253,7 +253,7 @@ class PinnedWeights:
             f"PinnedWeights cannot manage trainable slot {s.name!r}: "
             "slot replacement installs a frozen Parameter wrapper, "
             "orphaning any optimizer state keyed by the user's "
-            "pre-wrap Parameter. Use BlockOffloader (which "
+            "pre-wrap Parameter. Use ModelOffloader (which "
             "partitions trainables into TrainableWeights and validates "
             "tied storage upstream), or pass the slot in skip_slots "
             "and validate ties yourself — splitting a tied group "
@@ -283,7 +283,7 @@ class PinnedWeights:
     def slots(self) -> list[tuple[PinnedParamBuffer, list[tuple[nn.Module, str]]]]:
         """Per-parameter ``(buffer, locations)`` pairs managed by this instance.
 
-        Used by :class:`~ltx_core.memory.BlockOffloader` to build a
+        Used by :class:`~ltx_core.memory.ModelOffloader` to build a
         reverse index from parameter qualified names to their buffers.
         """
         return self._slots

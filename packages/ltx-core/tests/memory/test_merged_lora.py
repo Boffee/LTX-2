@@ -1,4 +1,4 @@
-"""Tests for LoRA merge via ``BlockOffloader.set_loras()``.
+"""Tests for LoRA merge via ``ModelOffloader.set_loras()``.
 
 Covers LoRA construction validation, set_loras matching, lifecycle
 (activate/deactivate), LoRA switching, and forward-output correctness
@@ -15,7 +15,7 @@ import torch
 from torch import nn
 
 from ltx_core.memory import (
-    BlockOffloader,
+    ModelOffloader,
     LoRA,
 )
 from ltx_core.memory.lora import KeyTransformT
@@ -109,16 +109,16 @@ def _expected_merged_weight(
 
 def _make_strategy(
     model: nn.Module, device: str = "cpu", blocks_to_swap: int = 1,
-) -> BlockOffloader:
+) -> ModelOffloader:
     """Shorthand for constructing the strategy with sensible defaults."""
-    return BlockOffloader(
+    return ModelOffloader(
         model, torch.device(device),
         layers_attr="transformer_blocks",
         blocks_to_swap=blocks_to_swap,
     )
 
 
-def _has_transform(strategy: BlockOffloader, target_key: str) -> bool:
+def _has_transform(strategy: ModelOffloader, target_key: str) -> bool:
     """Check whether a transform is attached for the given target."""
     buf = strategy._reverse_index.get(target_key)
     return buf is not None and buf.transform is not None

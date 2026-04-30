@@ -44,7 +44,7 @@ from ltx_trainer.quantization import quantize_model
 from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
-from ltx_core.memory import BlockOffloader, LoRA
+from ltx_core.memory import ModelOffloader, LoRA
 from ltx_trainer.training_strategies import get_training_strategy
 from ltx_trainer.utils import open_image_as_srgb, save_image
 from ltx_trainer.validation_sampler import CachedPromptEmbeddings, GenerationConfig, ValidationSampler
@@ -711,7 +711,7 @@ class LtxvTrainer:
         # Embedding connectors are already on GPU from _load_text_encoder_and_cache_embeddings
 
         # Set up block offloading (must happen before accelerator.prepare while weights are on CPU)
-        self._block_offloader: BlockOffloader | None = None
+        self._model_offloader: ModelOffloader | None = None
         blocks_to_swap = self._config.acceleration.blocks_to_swap
         if blocks_to_swap is not None and blocks_to_swap > 0:
             if self._accelerator.distributed_type == DistributedType.FSDP or self._accelerator.num_processes > 1:
@@ -727,17 +727,17 @@ class LtxvTrainer:
                 if hasattr(self._transformer, "get_base_model")
                 else self._transformer
             )
-            self._block_offloader = BlockOffloader(
+            self._model_offloader = ModelOffloader(
                 base_transformer,
                 target_device=self._accelerator.device,
                 layers_attr="transformer_blocks",
                 blocks_to_swap=blocks_to_swap,
             )
             if self._base_lora is not None:
-                self._block_offloader.set_loras([(self._base_lora, self._config.model.base_lora.strength)])
-            self._block_offloader.activate()
+                self._model_offloader.set_loras([(self._base_lora, self._config.model.base_lora.strength)])
+            self._model_offloader.activate()
 
-        if self._block_offloader is not None:
+        if self._model_offloader is not None:
             # noinspection PyTypeChecker
             self._transformer = self._accelerator.prepare(self._transformer, device_placement=[False])
         else:
@@ -844,6 +844,17 @@ class LtxvTrainer:
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
             optimizer = AdamW8bit(param_groups, lr=lr)
+        elif opt_cfg.optimizer_type == "prodigy":
+            from prodigyopt import Prodigy  # noqa: PLC0415
+
+            optimizer = Prodigy(
+                param_groups,
+                lr=lr,
+                betas=(0.9, 0.99),
+                weight_decay=0.01,
+                safeguard_warmup=True,
+                use_bias_correction=True,
+            )
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 
@@ -986,11 +997,11 @@ class LtxvTrainer:
         base_lora_cfg = self._config.model.base_lora
         val_strength = base_lora_cfg.validation_strength if base_lora_cfg else None
         if val_strength is not None:
-            self._block_offloader.deactivate()
-            self._block_offloader.set_loras([(self._base_lora, val_strength)])
-            self._block_offloader.activate()
+            self._model_offloader.deactivate()
+            self._model_offloader.set_loras([(self._base_lora, val_strength)])
+            self._model_offloader.activate()
 
-        offload_active = self._block_offloader is not None
+        offload_active = self._model_offloader is not None
 
         result = self._run_validation_sampling(
             progress, use_images, use_reference_videos, generate_audio, inference_steps,
@@ -998,9 +1009,9 @@ class LtxvTrainer:
         )
 
         if val_strength is not None:
-            self._block_offloader.deactivate()
-            self._block_offloader.set_loras([(self._base_lora, base_lora_cfg.strength)])
-            self._block_offloader.activate()
+            self._model_offloader.deactivate()
+            self._model_offloader.set_loras([(self._base_lora, base_lora_cfg.strength)])
+            self._model_offloader.activate()
 
         return result
 
