@@ -60,6 +60,7 @@ Compatibility
 
 from .model_offloader import ModelOffloader, detect_streaming_region_ties
 from .lora import LoRA, LoRATransform
+from .merge import merge_lora
 from .model_cache import (
     ActivationError,
     DuplicateModelKeyError,
@@ -81,6 +82,7 @@ __all__ = [
     "DuplicateModelKeyError",
     "LoRA",
     "LoRATransform",
+    "merge_lora",
     "ModelCache",
     "ModelCacheError",
     "ModelInUseError",
