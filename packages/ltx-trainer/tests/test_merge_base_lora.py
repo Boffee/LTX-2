@@ -13,7 +13,7 @@ from torch import nn
 
 from ltx_core.loader.fuse_loras import apply_loras
 from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
-from ltx_core.memory import LoRA
+from torch_offload import LoRA
 
 
 class _Tiny(nn.Module):

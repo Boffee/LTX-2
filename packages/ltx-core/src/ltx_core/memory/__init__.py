@@ -1,10 +1,6 @@
-"""Backward-compatible re-export shim.
+"""LTX-specific memory integration — pipeline_install only.
 
-The memory management library has been extracted to the standalone
-``torch-offload`` package (import name ``torch_offload``). This module
-re-exports everything so existing ``from ltx_core.memory import ...``
-imports continue to work without changes.
+The generic memory management library lives in the standalone
+``torch-offload`` package (import name ``torch_offload``).
+This sub-package contains only the LTX-pipelines integration shim.
 """
-
-from torch_offload import *  # noqa: F401, F403
-from torch_offload import __all__

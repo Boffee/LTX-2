@@ -18,7 +18,7 @@ import pytest
 import torch
 from torch import nn
 
-from ltx_core.memory import ModelCache, ModelSpec
+from torch_offload import ModelCache, ModelSpec
 from ltx_core.memory import pipeline_install as pi
 
 CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

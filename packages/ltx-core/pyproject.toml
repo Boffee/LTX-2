@@ -33,7 +33,7 @@ conflicts = [
 ]
 
 [tool.uv.sources]
-torch-offload = { path = "../../../torch-offload", editable = true }
+torch-offload = { git = "https://github.com/Boffee/torch-offload.git" }
 xformers = { index = "pytorch" }
 tensorrt-llm = { index = "nvidia" }
 

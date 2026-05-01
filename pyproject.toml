@@ -61,4 +61,4 @@ ignore = [
 max-args = 10
 
 [tool.ruff.lint.isort]
-known-first-party = ["ltx_core", "ltx_pipelines", "ltx_trainer"]
+known-first-party = ["ltx_core", "ltx_pipelines", "ltx_trainer", "torch_offload"]
