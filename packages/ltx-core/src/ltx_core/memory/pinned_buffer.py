@@ -22,12 +22,15 @@ from typing import Any
 import torch
 from torch import nn
 
-# Importing quanto_adapter has the side effect of registering
-# QuantoAdapter when optimum-quanto is installed, so it precedes the
-# RegularAdapter fallback in select_adapter. The import must come after
-# tensor_adapters defines register_adapter / select_adapter.
-from . import quanto_adapter  # noqa: F401 (registration side effect)
+from . import (
+    gguf_adapter,  # noqa: F401 — registration side effect
+    quanto_adapter,  # noqa: F401 — registration side effect
+)
 from .tensor_adapters import TensorAdapter, select_adapter
+
+
+def _is_subclass_tensor(t: torch.Tensor) -> bool:
+    return type(t) is not torch.Tensor
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +82,14 @@ class PinnedParamBuffer:
         self.pinned_state = self.adapter.clone_pin(param.data)
         self.cpu_param: nn.Parameter = self.adapter.cpu_param(self.pinned_state)
         self.transform: Any = None
+        # Release the original (non-pinned) storage by repointing the
+        # model parameter at the pinned cpu_param data. Without this,
+        # both the original and the pinned clone coexist until
+        # activate() — doubling peak CPU memory for the model.
+        # Only safe for plain tensors; quanto uses a subclass wrapper
+        # that .data= would strip, so those skip this optimization.
+        if not _is_subclass_tensor(param.data):
+            param.data = self.cpu_param.data
 
     def allocate_gpu_storage(self, device: torch.device) -> object:
         """Allocate empty GPU storage mirroring this buffer's layout.

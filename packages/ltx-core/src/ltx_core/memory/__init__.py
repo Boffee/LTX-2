@@ -58,7 +58,7 @@ Compatibility
 - **Single-thread / sequential.** No internal locking.
 """
 
-from .model_offloader import ModelOffloader, detect_streaming_region_ties
+from .gguf_adapter import GGUFWeight
 from .lora import LoRA, LoRATransform
 from .merge import merge_lora
 from .model_cache import (
@@ -71,6 +71,7 @@ from .model_cache import (
     ModelSpec,
     ModelTooLargeError,
 )
+from .model_offloader import ModelOffloader, detect_streaming_region_ties
 from .pinned_weights import PinnedWeights
 from .protocols import ModelStrategy, ModelStrategyComponent, SlotOwnership
 from .streamed_weights import StreamedWeights
@@ -78,15 +79,15 @@ from .trainable_weights import TrainableWeights
 
 __all__ = [
     "ActivationError",
-    "ModelOffloader",
     "DuplicateModelKeyError",
+    "GGUFWeight",
     "LoRA",
     "LoRATransform",
-    "merge_lora",
     "ModelCache",
     "ModelCacheError",
     "ModelInUseError",
     "ModelNotRegisteredError",
+    "ModelOffloader",
     "ModelSpec",
     "ModelStrategy",
     "ModelStrategyComponent",
@@ -96,4 +97,5 @@ __all__ = [
     "StreamedWeights",
     "TrainableWeights",
     "detect_streaming_region_ties",
+    "merge_lora",
 ]
