@@ -90,10 +90,10 @@ from typing import Any
 import torch
 from torch import nn
 
-from ltx_core.memory.model_offloader import ModelOffloader
-from ltx_core.memory.model_cache import ModelCache, ModelInUseError, ModelSpec
-from ltx_core.memory.pinned_weights import PinnedWeights
-from ltx_core.memory.protocols import ModelStrategy
+from torch_offload.model_offloader import ModelOffloader
+from torch_offload.model_cache import ModelCache, ModelInUseError, ModelSpec
+from torch_offload.pinned_weights import PinnedWeights
+from torch_offload.protocols import ModelStrategy
 
 logger = logging.getLogger(__name__)
 

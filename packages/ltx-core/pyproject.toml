@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "torch~=2.7",
+    "torch-offload",
     "torchaudio",
     "einops",
     "numpy",
@@ -32,6 +33,7 @@ conflicts = [
 ]
 
 [tool.uv.sources]
+torch-offload = { path = "../../../torch-offload", editable = true }
 xformers = { index = "pytorch" }
 tensorrt-llm = { index = "nvidia" }
 
