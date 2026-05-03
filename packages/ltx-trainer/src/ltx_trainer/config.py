@@ -292,6 +292,27 @@ class DataConfig(ConfigBaseModel):
         "configs are portable across hosts.",
     )
 
+    vae_tiling: bool = Field(
+        default=False,
+        description="Enable spatial tiling in the VAE encoder during shard preprocessing. "
+        "Required at high resolutions (e.g. 640x384) where a single conv3d over the full "
+        "frame exceeds GPU memory; produces near-identical latents at the cost of small "
+        "tile-boundary effects.",
+    )
+
+    vae_tile_size: int | None = Field(
+        default=None,
+        description="Spatial tile size in pixels (must be divisible by 32) used when "
+        "vae_tiling is enabled. None uses the script default (512). Lower this (e.g. 256) "
+        "if encoding still OOMs at high resolutions.",
+    )
+
+    vae_tile_overlap: int | None = Field(
+        default=None,
+        description="Spatial tile overlap in pixels (must be divisible by 32 and < tile_size) "
+        "used when vae_tiling is enabled. None uses the script default (128).",
+    )
+
     @field_validator("dataset_metadata_file")
     @classmethod
     def validate_dataset_metadata_file(cls, v: str | Path | None) -> str | Path | None:

@@ -442,6 +442,8 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     batch_size: int = 1,
     device: str = "cuda",
     vae_tiling: bool = False,
+    vae_tile_size: int = DEFAULT_TILE_SIZE,
+    vae_tile_overlap: int = DEFAULT_TILE_OVERLAP,
     with_audio: bool = False,
     audio_output_dir: str | None = None,
 ) -> None:
@@ -562,7 +564,13 @@ def compute_latents(  # noqa: PLR0913, PLR0915
 
             # Encode video
             with torch.inference_mode():
-                video_latent_data = encode_video(vae=vae, video=video, use_tiling=vae_tiling)
+                video_latent_data = encode_video(
+                    vae=vae,
+                    video=video,
+                    use_tiling=vae_tiling,
+                    tile_size=vae_tile_size,
+                    tile_overlap=vae_tile_overlap,
+                )
 
             # Save latents for each item in batch
             for i in range(len(batch["relative_path"])):

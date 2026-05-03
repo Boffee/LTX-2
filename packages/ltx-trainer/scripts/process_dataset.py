@@ -50,6 +50,8 @@ def preprocess_dataset(  # noqa: PLR0913
     reference_downscale_factor: int = 1,
     with_audio: bool = False,
     load_text_encoder_in_8bit: bool = False,
+    vae_tile_size: int | None = None,
+    vae_tile_overlap: int | None = None,
 ) -> None:
     """Run the preprocessing pipeline with the given arguments."""
     # Validate dataset file
@@ -85,6 +87,12 @@ def preprocess_dataset(  # noqa: PLR0913
         logger.info("Audio preprocessing enabled - will extract and encode audio from videos")
         audio_latents_dir = output_base / "audio_latents"
 
+    tile_kwargs: dict[str, int] = {}
+    if vae_tile_size is not None:
+        tile_kwargs["vae_tile_size"] = vae_tile_size
+    if vae_tile_overlap is not None:
+        tile_kwargs["vae_tile_overlap"] = vae_tile_overlap
+
     with free_gpu_memory_context():
         compute_latents(
             dataset_file=dataset_file,
@@ -97,6 +105,7 @@ def preprocess_dataset(  # noqa: PLR0913
             vae_tiling=vae_tiling,
             with_audio=with_audio,
             audio_output_dir=str(audio_latents_dir) if audio_latents_dir else None,
+            **tile_kwargs,
         )
 
         # Process reference videos if reference_column is provided
@@ -133,6 +142,7 @@ def preprocess_dataset(  # noqa: PLR0913
                 batch_size=batch_size,
                 device=device,
                 vae_tiling=vae_tiling,
+                **tile_kwargs,
             )
 
     # Handle decoding if requested (for verification)
