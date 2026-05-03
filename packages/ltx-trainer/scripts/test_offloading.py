@@ -90,6 +90,7 @@ def make_config(
     steps: int = 3,
     with_audio: bool = False,
     optimizer_type: str = "adamw",
+    gradient_accumulation_steps: int = 1,
 ) -> dict:
     cfg = {
         "model": {
@@ -119,7 +120,7 @@ def make_config(
             "learning_rate": 1e-4,
             "steps": steps,
             "batch_size": 1,
-            "gradient_accumulation_steps": 1,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
             "optimizer_type": optimizer_type,
             "scheduler_type": "constant",
             "enable_gradient_checkpointing": True,
@@ -331,6 +332,14 @@ def main() -> None:
         choices=["adamw", "adamw8bit"],
         help="Optimizer to use (adamw8bit matches the real audio-video LoRA config)",
     )
+    parser.add_argument(
+        "--grad-accum",
+        type=int,
+        default=1,
+        help="Gradient accumulation steps. >1 means each step does N micro-batches "
+        "before optim.step(); .grad buffers persist across micro-batches and bump "
+        "peak memory. Set to 4 to mirror production config.",
+    )
     args = parser.parse_args()
     w, h, f = (int(x) for x in args.video_dims.split("x"))
     video_dims = (w, h, f)
@@ -340,7 +349,10 @@ def main() -> None:
     print(f"Working directory: {tmp_dir}")
 
     try:
-        num_samples = max(1, args.steps)
+        # Need enough samples to cover steps × grad_accum micro-batches; the
+        # dataloader does cycle on StopIteration but cycling silently re-uses
+        # one sample, which can hide shape-dependent OOM.
+        num_samples = max(1, args.steps * args.grad_accum)
         create_dummy_data(data_dir, num_samples=num_samples, video_dims=video_dims, with_audio=args.with_audio)
 
         base_kwargs = {
@@ -363,6 +375,7 @@ def main() -> None:
             steps=args.steps,
             with_audio=args.with_audio,
             optimizer_type=args.optimizer,
+            gradient_accumulation_steps=args.grad_accum,
         )
         results["offloading"] = run_test(
             f"block offloading (blocks_to_swap={args.blocks_to_swap})", cfg, tmp_dir
@@ -381,6 +394,7 @@ def main() -> None:
             steps=args.steps,
             with_audio=args.with_audio,
             optimizer_type=args.optimizer,
+            gradient_accumulation_steps=args.grad_accum,
         )
         results["both"] = run_test("offloading + audio LR", cfg, tmp_dir)
 
