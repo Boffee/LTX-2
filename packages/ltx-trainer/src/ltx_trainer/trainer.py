@@ -546,6 +546,19 @@ class LtxvTrainer:
         sampler_cls = SAMPLERS[self._config.flow_matching.timestep_sampling_mode]
         self._timestep_sampler = sampler_cls(**self._config.flow_matching.timestep_sampling_params)
 
+    def _set_base_lora_strength(self, strength: float) -> None:
+        """Attach the base LoRA at the given strength, or detach when strength is 0.
+
+        Detaching avoids the per-DMA addmm_ kernel and pinned→GPU factor copy
+        that would otherwise run as a no-op multiply.
+        """
+        if self._base_lora is None or self._model_offloader is None:
+            return
+        if strength == 0:
+            self._model_offloader.set_loras([])
+        else:
+            self._model_offloader.set_loras([(self._base_lora, strength)])
+
     def _setup_lora(self) -> None:
         """Configure LoRA adapters for the transformer. Only called in LoRA training mode."""
         logger.debug(f"Adding LoRA adapter with rank {self._config.lora.rank}")
@@ -744,8 +757,9 @@ class LtxvTrainer:
                 layers_attr="transformer_blocks",
                 blocks_to_swap=blocks_to_swap,
             )
-            if self._base_lora is not None:
-                self._model_offloader.set_loras([(self._base_lora, self._config.model.base_lora.strength)])
+            self._set_base_lora_strength(
+                self._config.model.base_lora.strength if self._base_lora is not None else 0.0
+            )
             self._model_offloader.activate()
 
         if self._model_offloader is not None:
@@ -1050,7 +1064,7 @@ class LtxvTrainer:
         if val_strength is not None:
             logger.info(f"Switching base LoRA strength to {val_strength} for validation")
             self._model_offloader.deactivate()
-            self._model_offloader.set_loras([(self._base_lora, val_strength)])
+            self._set_base_lora_strength(val_strength)
             self._model_offloader.activate()
 
         offload_active = self._model_offloader is not None
@@ -1062,7 +1076,7 @@ class LtxvTrainer:
 
         if val_strength is not None:
             self._model_offloader.deactivate()
-            self._model_offloader.set_loras([(self._base_lora, base_lora_cfg.strength)])
+            self._set_base_lora_strength(base_lora_cfg.strength)
             self._model_offloader.activate()
 
         self._set_optimizer_mode(training=True)
