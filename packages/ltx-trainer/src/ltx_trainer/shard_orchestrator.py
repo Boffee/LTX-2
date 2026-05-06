@@ -122,7 +122,7 @@ def tear_down_trainer(trainer: "LtxvTrainer") -> None:
         # is dropped below).
         for attr in ("_optimizer", "_lr_scheduler", "_transformer",
                      "_text_encoder", "_embeddings_processor",
-                     "_vae_decoder", "_vae_encoder"):
+                     "_processor_weights", "_vae_decoder", "_vae_encoder"):
             if hasattr(trainer, attr):
                 setattr(trainer, attr, None)
         if offloader is not None:

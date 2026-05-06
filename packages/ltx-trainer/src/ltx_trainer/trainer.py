@@ -31,6 +31,7 @@ from torch.utils.data import DataLoader
 from torchvision.transforms import functional as F  # noqa: N812
 
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
+from torch_offload import PinnedWeights
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.config_display import print_config
@@ -377,12 +378,23 @@ class LtxvTrainer:
 
         mask = conditions["prompt_attention_mask"]
         additive_mask = convert_to_additive_mask(mask, video_features.dtype)
-        video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
-            video_features, audio_features, additive_mask
-        )
+        self._processor_weights.activate()
+        with torch.no_grad():
+            video_embeds, audio_embeds, attention_mask = self._embeddings_processor.create_embeddings(
+                video_features, audio_features, additive_mask
+            )
+        self._processor_weights.deactivate()
 
         conditions["video_prompt_embeds"] = video_embeds
         conditions["audio_prompt_embeds"] = audio_embeds
+        # When the connector uses learnable registers, it replaces all padding
+        # tokens and returns an all-ones mask. An all-ones mask produces an
+        # all-zeros additive bias in SDPA (no masking effect), but being
+        # non-None prevents the flash_sdp backend from being selected. Pass
+        # None instead to enable flash attention — saves significant VRAM on
+        # long sequences.
+        if attention_mask.all():
+            attention_mask = None
         conditions["prompt_attention_mask"] = attention_mask
 
         # Use strategy to prepare training inputs (returns ModelInputs with Modality objects)
@@ -452,9 +464,21 @@ class LtxvTrainer:
                         )
                     )
 
-        # Unload Gemma model and feature extractor, keep only connectors for training
+        # Unload Gemma model and feature extractor, keep only connectors for training.
         del text_encoder
         self._embeddings_processor.feature_extractor = None
+        free_gpu_memory()
+
+        # Wrap the remaining connectors in PinnedWeights for fast
+        # activate/deactivate cycling. The connectors are only needed
+        # briefly at the start of each training step; pinning allows
+        # DMA transfer (~25 GB/s) and frees ~3.75 GB of GPU during the
+        # transformer forward/backward pass.
+        self._embeddings_processor.requires_grad_(False)
+        self._processor_weights = PinnedWeights(
+            self._embeddings_processor,
+            target_device=torch.device("cuda"),
+        )
 
         logger.debug("Validation prompt embeddings cached. Gemma model unloaded")
         return cached_embeddings
@@ -732,7 +756,7 @@ class LtxvTrainer:
         if self._vae_encoder is not None:
             self._vae_encoder = self._vae_encoder.to("cpu")
 
-        # Embedding connectors are already on GPU from _load_text_encoder_and_cache_embeddings
+        # Embedding connectors are managed by PinnedWeights (activate/deactivate per step)
 
         # Set up block offloading (must happen before accelerator.prepare while weights are on CPU)
         self._model_offloader: ModelOffloader | None = None
