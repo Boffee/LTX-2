@@ -8,8 +8,8 @@ Creates dummy preprocessed data and runs a short training loop to verify:
 
 Usage:
     uv run python scripts/test_offloading.py \
-        --model_path /data/models/lightricks/LTX-2.3/ltx-2.3-22b-dev.safetensors \
-        --text_encoder_path /data/models/google/gemma-3-12b-it-qat-q4_0-unquantized
+        --model_path ~/models/lightricks/LTX-2.3/ltx-2.3-22b-dev.safetensors \
+        --text_encoder_path ~/models/google/gemma-3-12b-it-qat-q4_0-unquantized
 """
 
 import argparse
@@ -26,6 +26,7 @@ def create_dummy_data(
     data_dir: Path,
     num_samples: int = 2,
     video_dims: tuple[int, int, int] = (640, 352, 25),
+    prompt_sequence_length: int = 1024,
     with_audio: bool = False,
     fps: int = 24,
 ) -> None:
@@ -60,9 +61,9 @@ def create_dummy_data(
         torch.save(latent_data, latents_dir / f"sample_{i:04d}.pt")
 
         condition_data = {
-            "video_prompt_embeds": torch.randn(256, 4096, dtype=torch.bfloat16),
-            "audio_prompt_embeds": torch.randn(256, 2048, dtype=torch.bfloat16),
-            "prompt_attention_mask": torch.ones(256, dtype=torch.bool),
+            "video_prompt_embeds": torch.randn(prompt_sequence_length, 4096, dtype=torch.bfloat16),
+            "audio_prompt_embeds": torch.randn(prompt_sequence_length, 2048, dtype=torch.bfloat16),
+            "prompt_attention_mask": torch.ones(prompt_sequence_length, dtype=torch.bool),
         }
         torch.save(condition_data, conditions_dir / f"sample_{i:04d}.pt")
 
@@ -91,6 +92,10 @@ def make_config(
     with_audio: bool = False,
     optimizer_type: str = "adamw",
     gradient_accumulation_steps: int = 1,
+    first_frame_conditioning_p: float = 0.1,
+    base_lora_path: str | None = None,
+    base_lora_strength: float = 1.0,
+    base_lora_validation_strength: float | None = None,
 ) -> dict:
     cfg = {
         "model": {
@@ -114,6 +119,7 @@ def make_config(
         },
         "training_strategy": {
             "name": "text_to_video",
+            "first_frame_conditioning_p": first_frame_conditioning_p,
             "with_audio": with_audio,
         },
         "optimization": {
@@ -152,6 +158,14 @@ def make_config(
 
     if blocks_to_swap is not None:
         cfg["acceleration"]["blocks_to_swap"] = blocks_to_swap
+
+    if base_lora_path is not None:
+        cfg["model"]["base_lora"] = {
+            "path": base_lora_path,
+            "strength": base_lora_strength,
+        }
+        if base_lora_validation_strength is not None:
+            cfg["model"]["base_lora"]["validation_strength"] = base_lora_validation_strength
 
     if audio_learning_rate is not None:
         cfg["optimization"]["audio_learning_rate"] = audio_learning_rate
@@ -326,6 +340,18 @@ def main() -> None:
         help="Enable audio modality (generates dummy audio_latents and exercises video↔audio cross-attention)",
     )
     parser.add_argument(
+        "--prompt-len",
+        type=int,
+        default=1024,
+        help="Prompt feature sequence length. 1024 matches the Gemma tokenizer used by preprocessing.",
+    )
+    parser.add_argument(
+        "--first-frame-conditioning-p",
+        type=float,
+        default=0.1,
+        help="First-frame conditioning probability for text_to_video training.",
+    )
+    parser.add_argument(
         "--optimizer",
         type=str,
         default="adamw",
@@ -340,6 +366,24 @@ def main() -> None:
         "before optim.step(); .grad buffers persist across micro-batches and bump "
         "peak memory. Set to 4 to mirror production config.",
     )
+    parser.add_argument(
+        "--base-lora-path",
+        type=str,
+        default=None,
+        help="Optional base LoRA path to attach via ModelOffloader, matching model.base_lora.path.",
+    )
+    parser.add_argument(
+        "--base-lora-strength",
+        type=float,
+        default=1.0,
+        help="Base LoRA training strength, used only with --base-lora-path.",
+    )
+    parser.add_argument(
+        "--base-lora-validation-strength",
+        type=float,
+        default=None,
+        help="Optional base LoRA validation strength, used only with --base-lora-path.",
+    )
     args = parser.parse_args()
     w, h, f = (int(x) for x in args.video_dims.split("x"))
     video_dims = (w, h, f)
@@ -353,7 +397,13 @@ def main() -> None:
         # dataloader does cycle on StopIteration but cycling silently re-uses
         # one sample, which can hide shape-dependent OOM.
         num_samples = max(1, args.steps * args.grad_accum)
-        create_dummy_data(data_dir, num_samples=num_samples, video_dims=video_dims, with_audio=args.with_audio)
+        create_dummy_data(
+            data_dir,
+            num_samples=num_samples,
+            video_dims=video_dims,
+            prompt_sequence_length=args.prompt_len,
+            with_audio=args.with_audio,
+        )
 
         base_kwargs = {
             "model_path": args.model_path,
@@ -376,6 +426,10 @@ def main() -> None:
             with_audio=args.with_audio,
             optimizer_type=args.optimizer,
             gradient_accumulation_steps=args.grad_accum,
+            first_frame_conditioning_p=args.first_frame_conditioning_p,
+            base_lora_path=args.base_lora_path,
+            base_lora_strength=args.base_lora_strength,
+            base_lora_validation_strength=args.base_lora_validation_strength,
         )
         results["offloading"] = run_test(
             f"block offloading (blocks_to_swap={args.blocks_to_swap})", cfg, tmp_dir
@@ -395,6 +449,10 @@ def main() -> None:
             with_audio=args.with_audio,
             optimizer_type=args.optimizer,
             gradient_accumulation_steps=args.grad_accum,
+            first_frame_conditioning_p=args.first_frame_conditioning_p,
+            base_lora_path=args.base_lora_path,
+            base_lora_strength=args.base_lora_strength,
+            base_lora_validation_strength=args.base_lora_validation_strength,
         )
         results["both"] = run_test("offloading + audio LR", cfg, tmp_dir)
 

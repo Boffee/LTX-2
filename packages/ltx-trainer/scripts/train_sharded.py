@@ -17,6 +17,24 @@ For a standard preprocessed dataset (``data.preprocessed_data_root``),
 use ``scripts/train.py`` instead.
 """
 
+import os
+
+# Must run before any torch-touching import — the allocator config is read
+# at first CUDA init and ignored thereafter. Reduces fragmentation OOMs at
+# high-resolution VAE preprocessing (e.g. 640x384x385). setdefault preserves
+# a user override exported in the shell. Both names set: PYTORCH_ALLOC_CONF
+# is the new name (PyTorch ≥ recent), PYTORCH_CUDA_ALLOC_CONF is the
+# deprecated alias kept for older PyTorch builds.
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+# Optional memory-history recording for diagnosing OOMs. Off by default
+# (per-allocation stack capture has measurable overhead). When set, every
+# alloc/free is recorded with a Python stack trace; on uncaught exception
+# we dump a snapshot to the path for later inspection in PyTorch's memory
+# viz: https://docs.pytorch.org/memory_viz
+LTX_MEMORY_SNAPSHOT_PATH = os.environ.get("LTX_MEMORY_SNAPSHOT_PATH")
+
 from pathlib import Path
 
 import typer
@@ -24,6 +42,15 @@ import yaml
 
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.shard_orchestrator import ShardOrchestrator
+
+if LTX_MEMORY_SNAPSHOT_PATH:
+    import torch
+    torch.cuda.memory._record_memory_history(
+        enabled="all",
+        context="all",
+        stacks="python",
+        max_entries=200_000,
+    )
 
 app = typer.Typer(
     pretty_exceptions_enable=False,
@@ -63,7 +90,17 @@ def main(
         )
         raise typer.Exit(code=1)
 
-    ShardOrchestrator(trainer_config).run(disable_progress_bars=disable_progress_bars)
+    try:
+        ShardOrchestrator(trainer_config).run(disable_progress_bars=disable_progress_bars)
+    except (Exception, KeyboardInterrupt):
+        if LTX_MEMORY_SNAPSHOT_PATH:
+            import torch
+            try:
+                torch.cuda.memory._dump_snapshot(LTX_MEMORY_SNAPSHOT_PATH)
+                typer.echo(f"Memory snapshot written to {LTX_MEMORY_SNAPSHOT_PATH}")
+            except Exception as snap_err:
+                typer.echo(f"Failed to dump memory snapshot: {snap_err}")
+        raise
 
 
 if __name__ == "__main__":
