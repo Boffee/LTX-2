@@ -176,7 +176,7 @@ class OptimizationConfig(ConfigBaseModel):
         description="Maximum gradient norm for clipping",
     )
 
-    optimizer_type: Literal["adamw", "adamw8bit", "prodigy", "prodigy_plus"] = Field(
+    optimizer_type: Literal["adamw", "adamw8bit", "paged_adamw8bit", "prodigy", "prodigy_plus"] = Field(
         default="adamw",
         description="Type of optimizer to use for training",
     )
@@ -236,6 +236,21 @@ class AccelerationConfig(ConfigBaseModel):
         "Frozen block weights are streamed between CPU pinned memory and GPU on demand. "
         "Only supported in LoRA training mode on a single GPU. Higher values save more VRAM but slow training.",
         ge=0,
+    )
+
+    prefetch_count: int = Field(
+        default=2,
+        description="Number of upcoming transformer blocks to prefetch to GPU "
+        "while the current block is computing. Lower values save VRAM "
+        "(~916 MB per block at bf16) but reduce CPU↔GPU transfer overlap.",
+        ge=1,
+    )
+
+    stream_trainable_weights: bool = Field(
+        default=False,
+        description="Whether ModelOffloader streams in-block trainable parameter weights with each block. "
+        "When false, LoRA/trainable params stay GPU-resident while frozen block weights are offloaded. "
+        "When true, gradient checkpointing and an optimizer-step materialization boundary are required.",
     )
 
 
@@ -692,6 +707,16 @@ class LtxTrainerConfig(ConfigBaseModel):
                     "blocks_to_swap requires training_mode='lora'. "
                     "Block offloading only works with frozen base weights."
                 )
+        elif self.acceleration.stream_trainable_weights:
+            raise ValueError("stream_trainable_weights=true requires blocks_to_swap > 0")
+
+        if (
+            self.acceleration.stream_trainable_weights
+            and not self.optimization.enable_gradient_checkpointing
+        ):
+            raise ValueError(
+                "stream_trainable_weights=true requires optimization.enable_gradient_checkpointing=true"
+            )
 
         # Data source: exactly one of preprocessed_data_root or dataset_metadata_file
         has_precomputed = self.data.preprocessed_data_root is not None

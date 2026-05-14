@@ -85,6 +85,9 @@ def print_config(config: LtxTrainerConfig) -> None:
                     ("Mixed Precision", accel.mixed_precision_mode or "[dim]—[/]"),
                     ("Quantization", str(accel.quantization) if accel.quantization else "[dim]—[/]"),
                     ("Text Encoder 8bit", fmt(accel.load_text_encoder_in_8bit)),
+                    ("Blocks To Swap", str(accel.blocks_to_swap) if accel.blocks_to_swap else "[dim]—[/]"),
+                    ("Prefetch Count", str(accel.prefetch_count) if accel.blocks_to_swap else "[dim]—[/]"),
+                    ("Stream Trainables", fmt(accel.stream_trainable_weights)),
                 ],
             ),
             (

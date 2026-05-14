@@ -96,6 +96,8 @@ def make_config(
     base_lora_path: str | None = None,
     base_lora_strength: float = 1.0,
     base_lora_validation_strength: float | None = None,
+    prefetch_count: int = 2,
+    stream_trainable_weights: bool = False,
 ) -> dict:
     cfg = {
         "model": {
@@ -158,6 +160,8 @@ def make_config(
 
     if blocks_to_swap is not None:
         cfg["acceleration"]["blocks_to_swap"] = blocks_to_swap
+        cfg["acceleration"]["prefetch_count"] = prefetch_count
+        cfg["acceleration"]["stream_trainable_weights"] = stream_trainable_weights
 
     if base_lora_path is not None:
         cfg["model"]["base_lora"] = {
@@ -195,14 +199,22 @@ def _verify_offloader(trainer, blocks_to_swap: int) -> None:
     )
     assert peak > 0, "No blocks were ever on GPU — offloader may not be active"
 
-    # Verify LoRA params stayed on GPU
+    stream_trainables = getattr(strategy, "_stream_trainable_weights", False)
+    trainable_params = 0
+    trainable_cuda = 0
     for layer in streamer._blocks:
         for name, p in layer.named_parameters():
             if p.requires_grad:
-                assert p.data.is_cuda, f"LoRA param {name} should be on GPU"
+                trainable_params += 1
+                trainable_cuda += int(p.data.is_cuda)
+                if not stream_trainables:
+                    assert p.data.is_cuda, f"LoRA param {name} should be on GPU"
 
     streamer.reset_peak()
-    print(f"    offloader OK: peak {peak} blocks on GPU (max allowed: {expected_max})")
+    print(
+        f"    offloader OK: peak {peak} blocks on GPU (max allowed: {expected_max}); "
+        f"trainable params on GPU now: {trainable_cuda}/{trainable_params}"
+    )
 
 
 def _verify_audio_lr(trainer, expected_audio_lr: float) -> None:
@@ -304,6 +316,17 @@ def main() -> None:
         help="Blocks to swap for offloading test",
     )
     parser.add_argument(
+        "--prefetch-count",
+        type=int,
+        default=2,
+        help="Block prefetch count. Lower saves ~916 MB per dropped block.",
+    )
+    parser.add_argument(
+        "--stream-trainable-weights",
+        action="store_true",
+        help="Stream in-block trainable LoRA weights with offloaded blocks.",
+    )
+    parser.add_argument(
         "--quantization",
         type=str,
         default="int8-quanto",
@@ -355,7 +378,7 @@ def main() -> None:
         "--optimizer",
         type=str,
         default="adamw",
-        choices=["adamw", "adamw8bit"],
+        choices=["adamw", "adamw8bit", "paged_adamw8bit"],
         help="Optimizer to use (adamw8bit matches the real audio-video LoRA config)",
     )
     parser.add_argument(
@@ -384,9 +407,15 @@ def main() -> None:
         default=None,
         help="Optional base LoRA validation strength, used only with --base-lora-path.",
     )
+    parser.add_argument(
+        "--skip-audio-lr-test",
+        action="store_true",
+        help="Only run the main offloading test and skip the duplicate audio-LR test.",
+    )
     args = parser.parse_args()
     w, h, f = (int(x) for x in args.video_dims.split("x"))
     video_dims = (w, h, f)
+    stream_trainable_weights = args.stream_trainable_weights
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="offload_test_"))
     data_dir = tmp_dir / "data"
@@ -430,31 +459,40 @@ def main() -> None:
             base_lora_path=args.base_lora_path,
             base_lora_strength=args.base_lora_strength,
             base_lora_validation_strength=args.base_lora_validation_strength,
+            prefetch_count=args.prefetch_count,
+            stream_trainable_weights=stream_trainable_weights,
         )
         results["offloading"] = run_test(
-            f"block offloading (blocks_to_swap={args.blocks_to_swap})", cfg, tmp_dir
+            "block offloading "
+            f"(blocks_to_swap={args.blocks_to_swap}, "
+            f"stream_trainable_weights={stream_trainable_weights})",
+            cfg,
+            tmp_dir,
         )
 
-        # Test 2: Both features together
-        cfg = make_config(
-            **base_kwargs,
-            output_dir=str(tmp_dir / "both"),
-            blocks_to_swap=args.blocks_to_swap,
-            audio_learning_rate=5e-5,
-            quantization=args.quantization,
-            video_dims=video_dims,
-            lora_rank=args.lora_rank,
-            lora_alpha=args.lora_alpha,
-            steps=args.steps,
-            with_audio=args.with_audio,
-            optimizer_type=args.optimizer,
-            gradient_accumulation_steps=args.grad_accum,
-            first_frame_conditioning_p=args.first_frame_conditioning_p,
-            base_lora_path=args.base_lora_path,
-            base_lora_strength=args.base_lora_strength,
-            base_lora_validation_strength=args.base_lora_validation_strength,
-        )
-        results["both"] = run_test("offloading + audio LR", cfg, tmp_dir)
+        if not args.skip_audio_lr_test:
+            # Test 2: Both features together
+            cfg = make_config(
+                **base_kwargs,
+                output_dir=str(tmp_dir / "both"),
+                blocks_to_swap=args.blocks_to_swap,
+                audio_learning_rate=5e-5,
+                quantization=args.quantization,
+                video_dims=video_dims,
+                lora_rank=args.lora_rank,
+                lora_alpha=args.lora_alpha,
+                steps=args.steps,
+                with_audio=args.with_audio,
+                optimizer_type=args.optimizer,
+                gradient_accumulation_steps=args.grad_accum,
+                first_frame_conditioning_p=args.first_frame_conditioning_p,
+                base_lora_path=args.base_lora_path,
+                base_lora_strength=args.base_lora_strength,
+                base_lora_validation_strength=args.base_lora_validation_strength,
+                prefetch_count=args.prefetch_count,
+                stream_trainable_weights=stream_trainable_weights,
+            )
+            results["both"] = run_test("offloading + audio LR", cfg, tmp_dir)
 
         print(f"\n{'=' * 60}")
         print("RESULTS")

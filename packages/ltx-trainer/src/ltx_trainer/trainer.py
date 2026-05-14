@@ -222,7 +222,17 @@ class LtxvTrainer:
                             cfg.optimization.max_grad_norm,
                         )
 
-                    self._optimizer.step()
+                    if (
+                        self._model_offloader is not None
+                        and self._config.acceleration.stream_trainable_weights
+                        and self._accelerator.sync_gradients
+                    ):
+                        # Accelerate's optimizer wrapper skips step() while accumulating gradients.
+                        # Avoid materializing streamed trainable weights for those no-op calls.
+                        with self._model_offloader.optimizer_step():
+                            self._optimizer.step()
+                    else:
+                        self._optimizer.step()
                     if not getattr(self, "_prodigy_states_cast", True):
                         self._cast_prodigy_states_to_bf16()
                     self._optimizer.zero_grad()
@@ -780,6 +790,11 @@ class LtxvTrainer:
                 target_device=self._accelerator.device,
                 layers_attr="transformer_blocks",
                 blocks_to_swap=blocks_to_swap,
+                prefetch_count=self._config.acceleration.prefetch_count,
+                stream_trainable_weights=self._config.acceleration.stream_trainable_weights,
+                # LTX checkpoints blocks in the parent transformer loop via
+                # set_gradient_checkpointing(), not per-block HF flags.
+                skip_checkpointing_check=self._config.acceleration.stream_trainable_weights,
             )
             self._set_base_lora_strength(
                 self._config.model.base_lora.strength if self._base_lora is not None else 0.0
@@ -893,6 +908,14 @@ class LtxvTrainer:
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
             optimizer = AdamW8bit(param_groups, lr=lr)
+        elif opt_cfg.optimizer_type == "paged_adamw8bit":
+            # Paged AdamW8bit can use CUDA unified memory paging for optimizer
+            # state under memory pressure. This helps tight LoRA runs where
+            # regular AdamW8bit state allocation can OOM during optimizer.step().
+            # noinspection PyUnresolvedReferences
+            from bitsandbytes.optim import PagedAdamW8bit  # noqa: PLC0415
+
+            optimizer = PagedAdamW8bit(param_groups, lr=lr)
         elif opt_cfg.optimizer_type == "prodigy":
             from prodigyopt import Prodigy  # noqa: PLC0415
 
